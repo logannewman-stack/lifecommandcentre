@@ -1,0 +1,10 @@
+node_modules
+dist
+.env
+.env.local
+.env.*.local
+.DS_Store
+# Your personal data. Never commit it, even to a private repo.
+seed/
+*.backup.json
+lcc-backup-*.json
