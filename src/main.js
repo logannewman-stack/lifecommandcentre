@@ -30,11 +30,12 @@ const THEMES = ['auto','light','dark'];
 const REST_SUNDAY = [
   {key:'checkin', start:'08:30', end:'08:35', tag:'CHECK IN', text:'Weight, sleep, energy and your top 3. Two minutes.', kind:'checkin'},
   {key:'mobility', start:'08:35', end:'08:50', tag:'MOBILITY', text:'15 min of easy mobility.', kind:'mobility', minutes:15},
-  {key:'church', start:'09:30', end:'11:30', tag:'CHURCH', text:'Phone away. Be there.', kind:'marker'},
-  {key:'lunch', start:'11:30', end:'13:00', tag:'', text:'Lunch with people you like.', kind:'marker'},
-  {key:'rest', start:'13:00', end:'14:30', tag:'', text:'Rest: nap, walk, read. No laptop.', kind:'marker'},
-  {key:'play', start:'14:30', end:'16:30', tag:'PLAY', text:'Open play for fun. No drilling, no scorekeeping unless you want to.', kind:'session', sessionType:'Rec play', hours:2},
-  {key:'free', start:'16:30', end:'18:30', tag:'', text:"Free: girlfriend, family, friends. Grab the week's groceries if you need them.", kind:'marker'},
+  {key:'morning', start:'08:50', end:'10:15', tag:'', text:'Easy morning: breakfast, coffee, get ready.', kind:'marker'},
+  {key:'church', start:'10:30', end:'13:00', tag:'CHURCH', text:'Phone away. Be there.', kind:'marker'},
+  {key:'lunch', start:'13:00', end:'14:00', tag:'', text:'Lunch with people you like.', kind:'marker'},
+  {key:'rest', start:'14:00', end:'15:00', tag:'', text:'Rest: nap, walk, read. No laptop.', kind:'marker'},
+  {key:'play', start:'15:00', end:'17:00', tag:'PLAY', text:'Open play for fun. No drilling, no scorekeeping unless you want to.', kind:'session', sessionType:'Rec play', hours:2},
+  {key:'free', start:'17:00', end:'18:30', tag:'', text:"Free: girlfriend, family, friends. Grab the week's groceries if you need them.", kind:'marker'},
   {key:'dinner', start:'18:30', end:'19:30', tag:'', text:'Dinner. Then easy.', kind:'marker'},
   {key:'review', start:'19:30', end:'19:50', tag:'REVIEW + PLAN', text:"20 min: biggest leak + one fix (Week tab), read next week in the Roadmap, glance at Monday's calls.", kind:'task'},
   {key:'watch', start:'20:30', end:'21:00', tag:'WATCH', text:'30 min of pro pickleball, only if you feel like it.', kind:'watch', minutes:30},
@@ -64,7 +65,7 @@ const S = {
   callFilter:'due', search:'', leadForm:null,
   weekOffset:0, weekDay:null, modal:null, toast:null, lastUndo:null, confirm:null,
   sync:null, email:'', installEvt:null, installDismissed:undefined, updateApp:null,
-  connectBusy:false, connectErr:null, loginBusy:false, loginErr:null, notif:null, notifBusy:false
+  connectBusy:false, connectErr:null, loginBusy:false, loginErr:null, notif:null, notifBusy:false, callMode:null
 };
 let db = null;
 let theme = 'auto';
@@ -200,11 +201,45 @@ function delDoc(col, id) {
 }
 const patchDay = (d, patch) => patchDoc('days', d, deepMerge({date:d}, patch));
 
+/* ---------- fresh start ---------- */
+// The Monday the app went live. The first load after this version applies a fresh start
+// once by itself, so nothing from before shows as late and Sundays rest, without a tap.
+const AUTO_FRESH_DATE = '2026-10-05';
+function applyFreshStart(date, sun) {
+  const t = todayISO();
+  let moved = 0, dropped = 0, leadsMoved = 0;
+  for (const x of liveTasks()) {
+    if (x.done || x.dropped) continue;
+    const {id, ...body} = x;
+    if (['makeup','top3'].includes(x.kind)) { setDoc('tasks', id, {...body, dropped:true, droppedOn:t}); dropped++; }
+    else if (x.due && x.due < date) { setDoc('tasks', id, {...body, due:date, origDue:x.origDue || x.due}); moved++; }
+  }
+  for (const [id, l] of Object.entries(S.data.leads)) {
+    if (l.stage !== 'Lost' && l.nextDate && l.nextDate < date) { setDoc('leads', id, {...l, nextDate:date, updatedAt:Date.now()}); leadsMoved++; }
+  }
+  setDoc('meta', 'rollover', {through:addDays(date, -1), at:new Date().toISOString(), created:0, freshStart:date});
+  const prof = {startDate:date}; if (sun) prof.restDays = ['Sun'];
+  patchDoc('config', 'profile', prof);
+  if (sun) patchDoc('config', 'schedule', {days:{Sun:REST_SUNDAY}});
+  return {moved, dropped, leadsMoved};
+}
+function maybeAutoFreshStart() {
+  const setup = S.data.meta.setup || {}, roll = S.data.meta.rollover || {};
+  if (setup.freshStart || roll.freshStart) return false;
+  if ((profile().startDate || '') >= AUTO_FRESH_DATE) return false;
+  const t = todayISO(), date = t > AUTO_FRESH_DATE ? t : AUTO_FRESH_DATE;
+  const r = applyFreshStart(date, true);
+  setDoc('meta', 'setup', {freshStart:date, at:new Date().toISOString(), version:APP_VERSION});
+  toast(`Fresh start: the plan begins ${fmtDay(date)}. ${plural(r.moved,'to-do')} and ${plural(r.leadsMoved,'follow-up')} moved there. Sundays are rest days.`);
+  return true;
+}
+
 /* ---------- rollover automation ---------- */
 let rollTimer = null, rolling = false;
 const allLoaded = () => COLS.every(c => S.got[c]);
 function maybeRollover() {
   if (!db || !allLoaded() || rolling || !cfg().schedule || !db.status().loaded) return;
+  maybeAutoFreshStart();
   const y = addDays(todayISO(), -1);
   const through = (S.data.meta.rollover || {}).through;
   if (through && through >= y) return;
@@ -315,7 +350,13 @@ function viewToday() {
     </section>`,
     pmCard(t, day)
   ];
-  return installBanner() + `<div class="two"><div class="main">${main.join('')}</div><div class="side">${side.join('')}</div></div>`;
+  return installBanner() + tipBanner() + `<div class="two"><div class="main">${main.join('')}</div><div class="side">${side.join('')}</div></div>`;
+}
+function tipBanner() {
+  let done = false; try { done = !!localStorage.getItem('lcc-tip-done'); } catch(e) {}
+  if (done) return '';
+  const desktop = window.matchMedia && matchMedia('(min-width: 980px)').matches;
+  return `<div class="tip"><span><b>Tap any block, to-do or number</b> for the story behind it.${desktop ? ' Keys: <kbd>1</kbd>–<kbd>5</kbd> tabs, <kbd>/</kbd> search leads, <kbd>n</kbd> new to-do, <kbd>c</kbd> start calling.' : ' During a call block, tap <b>Start calling</b> and work one lead at a time.'}</span><button class="btn sm ghost" data-act="tip-done">Got it</button></div>`;
 }
 function nowCard(items, t) {
   const m = nowMin();
@@ -339,7 +380,7 @@ function actionFor(i, t, big) {
   const cls = big ? 'btn' : 'btn sm';
   if (i.kind === 'checkin') return isDone(i,t) ? '' : `<button class="${cls}" data-act="goto" data-id="am-card">Start check-in</button>`;
   if (i.kind === 'checkout') return isDone(i,t) ? '' : `<button class="${cls}" data-act="goto" data-id="pm-card">Start check-out</button>`;
-  if (i.kind === 'calls') return `<button class="${cls}" data-act="view" data-v="calls">Open calls</button>`;
+  if (i.kind === 'calls') return `<button class="${cls}" data-act="call-start" data-region="${esc(i.region || '')}">Start calling</button>${big ? `<button class="${cls} ghost" data-act="view" data-v="calls">Open calls</button>` : ''}`;
   if (i.kind === 'dupr') return isDone(i,t) ? '' : `<button class="${cls}" data-act="view" data-v="log">Log DUPR</button>`;
   if (i.kind === 'marker') return '';
   if (!big) return '';
@@ -481,7 +522,7 @@ function viewCalls() {
       </div>
       <div class="meta">${stageCounts} · Signed monthly <b>${money(monthly)}</b></div>
     </section>
-    <div class="btnrow"><input class="in" id="lead-search" placeholder="Search all leads" value="${esc(S.search)}" style="flex:1 1 200px"><button class="btn primary" data-act="lead-add">Add lead</button></div>
+    <div class="btnrow"><input class="in" id="lead-search" placeholder="Search all leads" value="${esc(S.search)}" style="flex:1 1 200px"><button class="btn primary" data-act="call-start">Start calling</button><button class="btn" data-act="lead-add">Add lead</button></div>
     ${q ? '' : `<div class="chips">${[['due',`Due now ${due.length}`],['warm',`Warm + clients ${n(l => l.type !== 'Cold')}`],['IA',`Iowa ${n(l => l.type === 'Cold' && l.region === 'IA')}`],['AZ',`Arizona ${n(l => l.type === 'Cold' && l.region === 'AZ')}`],['all',`All leads ${all.length}`]].map(([k,l]) => `<button class="chip ${S.callFilter === k ? 'on' : ''}" data-act="call-filter" data-f="${k}">${l}</button>`).join('')}</div>`}
     ${list.length ? `<div class="leads">${list.map(l => leadCard(l, t)).join('')}</div>` : `<div class="card empty">${q ? 'No leads match that search.' : 'No calls due here. Add new leads on Monday, or switch filters.'}</div>`}`;
 }
@@ -956,7 +997,8 @@ function settingsCard() {
       <div class="btnrow"><button class="btn sm" data-act="export">Download</button>${importControl('btn sm')}</div></div>
     <div class="srow"><div class="lbl">Account<small>${esc(S.email || '')}</small></div>
       <div class="btnrow"><button class="btn sm ghost" data-act="signout">Sign out</button>${configSource === 'device' ? '<button class="btn sm ghost" data-act="disconnect">Disconnect</button>' : ''}</div></div>
-    <div class="meta" style="margin-top:10px">Version ${esc(APP_VERSION)}${S.updateApp ? ' · <a data-act="update-app">Update ready, tap to reload</a>' : ''}</div>
+    <div class="meta" style="margin-top:10px">Laptop keys: <span class="kbd">1</span>–<span class="kbd">5</span> tabs · <span class="kbd">/</span> search leads · <span class="kbd">n</span> new to-do · <span class="kbd">c</span> start calling · <span class="kbd">Esc</span> close</div>
+    <div class="meta" style="margin-top:6px">Version ${esc(APP_VERSION)}${S.updateApp ? ' · <a data-act="update-app">Update ready, tap to reload</a>' : ''}</div>
   </section>`;
 }
 /* ----- detail sheets: tap anything for the story behind it ----- */
@@ -1126,6 +1168,25 @@ function notifSheet() {
     ${st.msg && st.fn !== 'error' ? `<div class="${st.kind === 'ok' ? 'ok-box' : 'err'}">${esc(st.msg)}</div>` : ''}
     <div class="meta">Calendar alarms are the no-setup alternative: <a data-act="calendar">Add to calendar</a> gives you a weekly calendar with an alarm before every block.</div>`;
 }
+/* ----- calling mode: one lead at a time ----- */
+function callSheet() {
+  const t = todayISO(), cm = S.callMode || {}, m = nowMin();
+  const blocks = scheduleFor(t).filter(i => i.kind === 'calls');
+  const block = (cm.region ? blocks.find(i => i.region === cm.region) : null) || blocks.find(i => toMin(i.start) <= m && m < toMin(i.end)) || blocks.find(i => toMin(i.start) > m) || blocks[0] || null;
+  const region = cm.region || (block ? block.region : '') || '';
+  const due = leadsDue(t).sort(leadSortDue).filter(l => l.type !== 'Cold' || !region || l.region === region);
+  const skipped = cm.skipped || [];
+  const list = [...due.filter(l => !skipped.includes(l.id)), ...due.filter(l => skipped.includes(l.id))];
+  const cur = list[0];
+  const dials = dialsFor(t, region), quota = block && block.region === region ? block.quota : 0;
+  const pct = quota ? Math.min(100, Math.round(dials / quota * 100)) : 0;
+  const head = `<div class="card-h"><h2>Calling${region ? ' · ' + regionName(region) : ''}</h2><button class="btn sm ghost" data-act="modal-close">Done</button></div>
+    <div class="progress"><div class="bar ${quota && dials >= quota ? 'good' : ''}"><i style="width:${pct}%"></i></div><span class="meta mono">${dials}${quota ? '/' + quota : ''} ${esc(regionName(region) || '')} dials · ${callsCount(t,'dial')} today</span><span class="meta">${plural(list.length,'lead')} up</span></div>`;
+  if (!cur) return head + `<div class="card empty"><b>All caught up here.</b><br>${quota && dials < quota ? `${quota - dials} more dials to hit the block. Open calls and switch the filter to All leads to keep going.` : 'Nice work. Go hit the next block.'}</div><div class="btnrow"><button class="btn" data-act="view" data-v="calls">Open calls</button></div>`;
+  return head + `<div class="callcard">${leadCard(cur, t)}</div>
+    <div class="btnrow"><button class="btn ghost" data-act="call-skip" data-id="${esc(cur.id)}">Skip for now</button><span class="meta">Tap a result and the next lead comes up.</span></div>`;
+}
+function closeModal() { S.modal = null; S.confirm = null; S.callMode = null; }
 async function signOut() {
   if (db) {
     if (db.status().pending) {
@@ -1144,7 +1205,7 @@ function renderModal() {
   const el = document.getElementById('modal');
   if (!S.modal) { el.hidden = true; el.innerHTML = ''; return; }
   el.hidden = false;
-  el.innerHTML = `<div class="sheet" role="dialog" aria-modal="true">${S.modal.type === 'session' ? sessionForm() : S.modal.type === 'fresh' ? freshForm() : S.modal.type === 'block' ? blockSheet(S.modal.key) : S.modal.type === 'task' ? taskSheet(S.modal.id) : S.modal.type === 'mile' ? mileSheet(S.modal.id) : S.modal.type === 'stat' ? statSheet(S.modal.id) : S.modal.type === 'notif' ? notifSheet() : leadEditForm()}</div>`;
+  el.innerHTML = `<div class="sheet" role="dialog" aria-modal="true">${S.modal.type === 'session' ? sessionForm() : S.modal.type === 'fresh' ? freshForm() : S.modal.type === 'block' ? blockSheet(S.modal.key) : S.modal.type === 'task' ? taskSheet(S.modal.id) : S.modal.type === 'mile' ? mileSheet(S.modal.id) : S.modal.type === 'stat' ? statSheet(S.modal.id) : S.modal.type === 'notif' ? notifSheet() : S.modal.type === 'call' ? callSheet() : leadEditForm()}</div>`;
 }
 function sessionForm() {
   const id = S.modal.id, s = S.data.sessions[id] || {date:todayISO(), type:'Drill', hours:2};
@@ -1265,7 +1326,10 @@ function handle(act, el, ev) {
     case 'session-delete': delDoc('sessions', S.modal.id); S.modal = null; S.confirm = null; toast('Session deleted.'); render(); break;
     case 'ss-rated': { const s = S.data.sessions[S.modal.id] || {}; const cur = S.drafts['ss-rated'] !== undefined ? S.drafts['ss-rated'] : !!s.rated; S.drafts['ss-rated'] = !cur; render(); break; }
     case 'confirm': S.confirm = d.c; render(); break;
-    case 'modal-close': S.modal = null; S.confirm = null; render(); break;
+    case 'modal-close': closeModal(); render(); break;
+    case 'call-start': S.leadForm = null; S.callMode = {region:d.region || null, skipped:[]}; S.modal = {type:'call'}; render(); break;
+    case 'call-skip': if (S.callMode) S.callMode.skipped = [...(S.callMode.skipped || []), d.id]; render(); break;
+    case 'tip-done': try { localStorage.setItem('lcc-tip-done', '1'); } catch(e) {} render(); break;
     case 'undo': undo(); render(); break;
     case 'fresh-start': clearDrafts('fs-'); S.modal = {type:'fresh'}; render(); break;
     case 'block': S.openItem = null; S.modal = {type:'block', key:d.key}; render(); break;
@@ -1379,21 +1443,7 @@ function submit(form) {
       const date = v('fs-date');
       if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) { toast('Pick a start date.'); return; }
       const sun = S.drafts['fs-sunday'] !== undefined ? S.drafts['fs-sunday'] : true;
-      let moved = 0, dropped = 0;
-      let leadsMoved = 0;
-      for (const x of liveTasks()) {
-        if (x.done || x.dropped) continue;
-        const {id, ...body} = x;
-        if (['makeup','top3'].includes(x.kind)) { setDoc('tasks', id, {...body, dropped:true, droppedOn:t}); dropped++; }
-        else if (x.due && x.due < date) { setDoc('tasks', id, {...body, due:date, origDue:x.origDue || x.due}); moved++; }
-      }
-      for (const [id, l] of Object.entries(S.data.leads)) {
-        if (l.stage !== 'Lost' && l.nextDate && l.nextDate < date) { setDoc('leads', id, {...l, nextDate:date, updatedAt:Date.now()}); leadsMoved++; }
-      }
-      setDoc('meta', 'rollover', {through:addDays(date, -1), at:new Date().toISOString(), created:0, freshStart:date});
-      const prof = {startDate:date}; if (sun) prof.restDays = ['Sun'];
-      patchDoc('config', 'profile', prof);
-      if (sun) patchDoc('config', 'schedule', {days:{Sun:REST_SUNDAY}});
+      const {moved, dropped, leadsMoved} = applyFreshStart(date, sun);
       S.modal = null; clearDrafts('fs-');
       toast(`Fresh start on ${fmtDay(date)}. ${plural(moved,'to-do')} and ${plural(leadsMoved,'follow-up')} moved, ${plural(dropped,'make-up')} dropped.`); render(); break;
     }
@@ -1414,7 +1464,7 @@ function submit(form) {
 /* ---------- events ---------- */
 document.addEventListener('click', ev => {
   const el = ev.target.closest('[data-act]');
-  if (!el) { if (ev.target.id === 'modal') { S.modal = null; S.confirm = null; render(); } return; }
+  if (!el) { if (ev.target.id === 'modal') { closeModal(); render(); } return; }
   if (el.tagName === 'INPUT') return;
   ev.preventDefault();
   handle(el.dataset.act, el, ev);
@@ -1434,7 +1484,17 @@ document.addEventListener('change', ev => {
   if (el.dataset && el.dataset.act === 'task-date' && el.value) { const x = S.data.tasks[el.dataset.id]; if (x) patchDoc('tasks', el.dataset.id, {due:el.value, origDue:x.origDue || x.due}); toast('Moved to ' + fmtDay(el.value) + '.'); return; }
   if (el.hasAttribute && el.hasAttribute('data-draft') && el.id) S.drafts[el.id] = el.value;
 });
-document.addEventListener('keydown', ev => { if (ev.key === 'Escape' && S.modal) { S.modal = null; S.confirm = null; render(); } });
+document.addEventListener('keydown', ev => {
+  if (ev.key === 'Escape' && S.modal) { closeModal(); render(); return; }
+  if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+  const a = document.activeElement;
+  const typing = a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT' || a.isContentEditable);
+  if (typing || S.modal || S.dbState !== 'ok' || !allLoaded()) return;
+  if (ev.key >= '1' && ev.key <= '5') { ev.preventDefault(); setView(VIEWS[+ev.key - 1][0]); }
+  else if (ev.key === '/') { ev.preventDefault(); setView('calls'); setTimeout(() => { const s = document.getElementById('lead-search'); if (s) s.focus(); }, 0); }
+  else if (ev.key === 'n') { ev.preventDefault(); if (!['today','plan'].includes(S.view)) setView('today'); setTimeout(() => { const f = document.getElementById(S.view === 'plan' ? 'pt-title' : 'qt-title'); if (f) { f.scrollIntoView({block:'center'}); f.focus(); } }, 0); }
+  else if (ev.key === 'c') { ev.preventDefault(); handle('call-start', {dataset:{}}, ev); render(); }
+});
 // Drop a backup file anywhere on the page to import it.
 const dragHasFiles = ev => !!(ev.dataTransfer && Array.from(ev.dataTransfer.types || []).includes('Files'));
 let dragDepth = 0;
