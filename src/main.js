@@ -1,6 +1,13 @@
-import { supabase } from './supabase.js';
-import { createDb } from './db.js';
+import '@fontsource/barlow-condensed/latin-600.css';
+import '@fontsource/barlow-condensed/latin-700.css';
+import '@fontsource/ibm-plex-mono/latin-500.css';
+import '@fontsource/source-sans-3/latin-400.css';
+import '@fontsource/source-sans-3/latin-600.css';
+import '@fontsource/source-sans-3/latin-700.css';
 import './styles.css';
+import { registerSW } from 'virtual:pwa-register';
+import { supabase, config as sbConfig, configSource, saveConfig, clearConfig } from './supabase.js';
+import { createDb } from './db.js';
 
 (() => {
 'use strict';
@@ -8,6 +15,30 @@ import './styles.css';
 /* ---------- constants ---------- */
 const COLS = ['config','days','tasks','leads','sessions','dupr','weeks','meta'];
 const VIEWS = [['today','Today'],['calls','Calls'],['week','Week'],['log','Log'],['plan','Plan']];
+const ICONS = {
+  today: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15.5" rx="2.5"/><path d="M3.5 10h17M8 3v4M16 3v4"/><path d="m9.5 15 2 2 3.5-3.5"/></svg>',
+  calls: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h3.5l1.8 4.5-2.3 1.4a11.5 11.5 0 0 0 6.1 6.1l1.4-2.3L20 15.5V19a2 2 0 0 1-2 2A15 15 0 0 1 3 6a2 2 0 0 1 2-2z"/></svg>',
+  week: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V11M10 20V4M16 20v-6M3 20h18"/></svg>',
+  log: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 17l5.5-5.5 4 4L21 7"/><path d="M15 7h6v6"/></svg>',
+  plan: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6h12M9 12h12M9 18h12"/><path d="M4 6h.01M4 12h.01M4 18h.01" stroke-width="2.6"/></svg>',
+};
+const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : 'dev';
+const THEMES = ['auto','light','dark'];
+// The Sunday that Fresh start installs when "Sundays are rest days" is on.
+const REST_SUNDAY = [
+  {key:'checkin', start:'08:30', end:'08:35', tag:'CHECK IN', text:'Weight, sleep, energy and your top 3. Two minutes.', kind:'checkin'},
+  {key:'mobility', start:'08:35', end:'08:50', tag:'MOBILITY', text:'15 min of easy mobility.', kind:'mobility', minutes:15},
+  {key:'church', start:'09:30', end:'11:30', tag:'', text:'Church. Phone away.', kind:'marker'},
+  {key:'lunch', start:'11:30', end:'13:00', tag:'', text:'Lunch with people you like.', kind:'marker'},
+  {key:'rest', start:'13:00', end:'14:30', tag:'', text:'Rest: nap, walk, read. No laptop.', kind:'marker'},
+  {key:'play', start:'14:30', end:'16:30', tag:'PLAY', text:'Open play for fun. No drilling, no scorekeeping unless you want to.', kind:'session', sessionType:'Rec play', hours:2},
+  {key:'free', start:'16:30', end:'18:30', tag:'', text:"Free: girlfriend, family, friends. Grab the week's groceries if you need them.", kind:'marker'},
+  {key:'dinner', start:'18:30', end:'19:30', tag:'', text:'Dinner. Then easy.', kind:'marker'},
+  {key:'review', start:'19:30', end:'19:50', tag:'REVIEW + PLAN', text:"20 min: biggest leak + one fix (Week tab), read next week in the Roadmap, glance at Monday's calls.", kind:'task'},
+  {key:'watch', start:'20:30', end:'21:00', tag:'WATCH', text:'30 min of pro pickleball, only if you feel like it.', kind:'watch', minutes:30},
+  {key:'checkout', start:'21:00', end:'21:15', tag:'CHECK OUT', text:'Your numbers fill in by themselves. Add your win, tomorrow\'s fix and notes.', kind:'checkout'},
+  {key:'bed', start:'22:30', end:'23:59', tag:'', text:'Bed. Alarm 6:30.', kind:'marker'},
+];
 const STAGES = ['New lead','Contacted','Talking','Demo booked','Proposal sent','Won','Not now','Lost'];
 const STAGE_RANK = {'New lead':0,'Contacted':1,'Talking':2,'Demo booked':3,'Proposal sent':4,'Won':5};
 const SESSION_TYPES = ['Drill','Competitive','Rec play','Tournament','Lesson'];
@@ -29,9 +60,23 @@ const S = {
   got:{},
   view:'today', drafts:{}, openItem:null, editAM:false, editPM:false,
   callFilter:'due', search:'', leadForm:null,
-  weekOffset:0, weekDay:null, modal:null, toast:null, lastUndo:null, confirm:null
+  weekOffset:0, weekDay:null, modal:null, toast:null, lastUndo:null, confirm:null,
+  sync:null, email:'', installEvt:null, installDismissed:undefined, updateApp:null,
+  connectBusy:false, connectErr:null, loginBusy:false, loginErr:null
 };
 let db = null;
+let theme = 'auto';
+try { const v = localStorage.getItem('lcc-theme'); if (THEMES.includes(v)) theme = v; } catch(e) {}
+function applyTheme() {
+  const root = document.documentElement;
+  if (theme === 'auto') root.removeAttribute('data-theme'); else root.setAttribute('data-theme', theme);
+  try { localStorage.setItem('lcc-theme', theme); } catch(e) {}
+  const bg = getComputedStyle(root).getPropertyValue('--bg').trim();
+  document.querySelectorAll('meta[name="theme-color"]').forEach(m => {
+    if (theme === 'auto') m.content = (m.media || '').includes('dark') ? '#0E1320' : '#F2F4F7';
+    else m.content = bg;
+  });
+}
 try { const v = localStorage.getItem('lcc-view'); if (v && VIEWS.some(x => x[0] === v)) S.view = v; } catch(e) {}
 if (location.hash && VIEWS.some(x => '#' + x[0] === location.hash)) S.view = location.hash.slice(1);
 
@@ -76,6 +121,8 @@ const scheduleFor = d => ((cfg().schedule || {}).days || {})[dowOf(d)] || [];
 const roadmap = () => ((cfg().roadmap || {}).weeks || []).slice().sort((a,b) => a.start < b.start ? -1 : 1);
 const roadmapFor = d => { let cur = null; roadmap().forEach(w => { if (w.start <= d) cur = w; }); return cur; };
 const dayOf = d => S.data.days[d] || {};
+const restDays = () => { const r = profile().restDays; return Array.isArray(r) ? r : ['Sun']; };
+const isRestDay = d => restDays().includes(dowOf(d));
 const isCheckable = i => i.kind !== 'marker';
 const dialsFor = (d, region) => (dayOf(d).calls || []).filter(c => c.dial && (!region || c.region === region)).length;
 const callsCount = (d, f) => (dayOf(d).calls || []).filter(c => c[f]).length;
@@ -140,17 +187,8 @@ function setDoc(col, id, data) {
 }
 function patchDoc(col, id, patch) {
   if (!db) return Promise.resolve();
-  const existed = !!(S.data[col] && S.data[col][id] !== undefined);
   S.data[col] = {...S.data[col], [id]: deepMerge((S.data[col] || {})[id] || {}, patch)};
-  return enqueue(col + '/' + id, async () => {
-    const ref = db.collection(col).doc(id);
-    if (existed) {
-      try { await ref.update(patch); return; } catch (e) { if (!e || e.code !== 'invalid_argument') throw e; }
-    }
-    const snap = await ref.get();
-    const base = snap.exists ? clone(snap.data()) : {};
-    await ref.set(deepMerge(base, patch));
-  });
+  return enqueue(col + '/' + id, () => db.collection(col).doc(id).update(patch));
 }
 function delDoc(col, id) {
   if (!db) return Promise.resolve();
@@ -163,7 +201,7 @@ const patchDay = (d, patch) => patchDoc('days', d, deepMerge({date:d}, patch));
 let rollTimer = null, rolling = false;
 const allLoaded = () => COLS.every(c => S.got[c]);
 function maybeRollover() {
-  if (!db || !allLoaded() || rolling || !cfg().schedule) return;
+  if (!db || !allLoaded() || rolling || !cfg().schedule || !db.status().loaded) return;
   const y = addDays(todayISO(), -1);
   const through = (S.data.meta.rollover || {}).through;
   if (through && through >= y) return;
@@ -183,7 +221,7 @@ async function runRollover() {
     const made = [];
     for (let d = start; d <= y; d = addDays(d, 1)) {
       const day = dayOf(d), next = addDays(d, 1), dw = dowOf(d);
-      for (const i of scheduleFor(d)) {
+      for (const i of isRestDay(d) ? [] : scheduleFor(d)) {
         if (isSkipped(i, d)) continue;
         if (i.kind === 'calls') {
           const short = (i.quota || 0) - dialsFor(d, i.region);
@@ -224,10 +262,10 @@ function render() {
   renderHeader();
   const app = document.getElementById('app');
   let html;
-  if (S.dbState === 'config') html = `<div class="card empty"><b>Supabase isn't connected yet.</b><br>Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to .env.local (or to your Vercel project's environment variables) and reload.</div>`;
+  if (S.dbState === 'config') html = connectView();
   else if (S.dbState === 'auth') html = loginView();
-  else if (S.dbState === 'error') html = `<div class="card empty"><b>Couldn't load your data.</b><br>${esc(S.err || 'Check your connection and reload.')}</div>`;
-  else if (!allLoaded()) html = `<div class="card empty">Loading your plan, calls and to-dos…</div>`;
+  else if (S.dbState === 'error') html = `<div class="card empty"><b>Couldn't load your data.</b><br>${esc(S.err || 'Check your connection and try again.')}<div class="btnrow" style="justify-content:center;margin-top:12px"><button class="btn primary" data-act="retry">Try again</button><button class="btn ghost" data-act="signout">Sign out</button></div></div>`;
+  else if (!allLoaded()) html = `<div class="skel"><div class="skel-line w40"></div><div class="skel-box"></div><div class="skel-box tall"></div></div>`;
   else if (!cfg().schedule) html = importView();
   else html = ({today:viewToday, calls:viewCalls, week:viewWeek, log:viewLog, plan:viewPlan})[S.view]();
   app.innerHTML = html;
@@ -236,52 +274,58 @@ function render() {
 function renderHeader() {
   const t = todayISO(), p = profile();
   const days = p.moveDate ? Math.max(0, daysBetween(t, p.moveDate)) : null;
-  document.getElementById('hdr').innerHTML = `<div class="min0"><div class="eyebrow">Life Command Center</div><h1>${esc(fmtLong(t))}</h1></div>` +
+  document.getElementById('hdr').innerHTML = `<div class="min0"><div class="eyebrow">Life Command Center${syncChip()}</div><h1>${esc(fmtLong(t))}</h1></div>` +
     (days !== null ? `<div class="count"><b>${days}</b><span>days to<br>Scottsdale</span></div>` : '');
 }
 function renderTabs() {
   if (S.dbState !== 'ok') { document.getElementById('tabs').innerHTML = ''; return; }
-  const due = allLoaded() ? leadsDue(todayISO()).length : 0;
+  const due = allLoaded() && !isRestDay(todayISO()) ? leadsDue(todayISO()).length : 0;
   document.getElementById('tabs').innerHTML = VIEWS.map(([k,l]) =>
-    `<button data-act="view" data-v="${k}" class="${S.view === k ? 'on' : ''}" aria-current="${S.view === k ? 'page' : 'false'}">${l}${k === 'calls' && due ? `<span class="badge">${due}</span>` : ''}</button>`).join('');
+    `<button data-act="view" data-v="${k}" class="${S.view === k ? 'on' : ''}" aria-current="${S.view === k ? 'page' : 'false'}">${ICONS[k]}<span>${l}</span>${k === 'calls' && due ? `<span class="badge">${due}</span>` : ''}</button>`).join('');
 }
 
 /* ----- TODAY ----- */
 function viewToday() {
-  const t = todayISO(), day = dayOf(t), items = scheduleFor(t);
+  const t = todayISO(), day = dayOf(t), items = scheduleFor(t), rest = isRestDay(t);
   const checkable = items.filter(isCheckable);
   const doneN = checkable.filter(i => isDone(i, t)).length;
   const carried = tasksCarried(t), due = tasksDue(t), doneTasks = tasksDoneOn(t);
   const wk = roadmapFor(t);
   const pct = checkable.length ? Math.round(doneN / checkable.length * 100) : 0;
-  const behind = checkable.filter(i => !isDone(i,t) && toMin(i.end || i.start) <= nowMin()).length;
-  return [
-    wk ? `<div class="week-banner"><div class="eyebrow">This week</div><b>${esc(wk.focus)}</b>${wk.musts ? `<details><summary>Must-dos this week</summary><div class="meta" style="margin-top:4px;color:var(--ink-2)">${esc(wk.musts)}</div></details>` : ''}</div>` : '',
-    `<div class="progress ${pct === 100 ? 'good' : ''}"><div class="bar"><i style="width:${pct}%"></i></div><span class="meta mono">${doneN}/${checkable.length} blocks</span>${behind ? `<span class="pill warn">${behind} behind</span>` : ''}${carried.length ? `<span class="pill bad">${carried.length} carried over</span>` : ''}</div>`,
+  const behind = rest ? 0 : checkable.filter(i => !isDone(i,t) && toMin(i.end || i.start) <= nowMin()).length;
+  // On a laptop the main column holds the plan and the side column the forms; on a phone
+  // the ord-* classes put everything back in one sensible order.
+  const main = [
+    wk ? `<div class="week-banner ord-1"><div class="eyebrow">This week</div><b>${esc(wk.focus)}</b>${wk.musts ? `<details><summary>Must-dos this week</summary><div class="meta" style="margin-top:4px;color:var(--ink-2)">${esc(wk.musts)}</div></details>` : ''}</div>` : '',
+    rest ? `<div class="rest-banner ord-2"><div class="eyebrow">Rest day</div><b>Church, rest and pickleball.</b><div class="meta">Nothing counts as late today.${carried.length ? ` ${plural(carried.length,'to-do')} will be waiting for you tomorrow.` : ''}</div></div>` : '',
+    `<div class="progress ord-3 ${pct === 100 ? 'good' : ''}"><div class="bar"><i style="width:${pct}%"></i></div><span class="meta mono">${doneN}/${checkable.length} blocks</span>${behind ? `<span class="pill warn">${behind} behind</span>` : ''}${carried.length && !rest ? `<span class="pill bad">${carried.length} carried over</span>` : ''}</div>`,
     nowCard(items, t),
+    `<section class="card ord-7"><div class="card-h"><h2>Today's plan</h2><span class="meta">${esc(dowOf(t))} schedule</span></div>${items.map(i => planRow(i, t, day)).join('')}</section>`,
+  ];
+  const side = [
     amCard(t, day),
-    carried.length ? `<section class="card"><div class="card-h"><h2>Carried over</h2><span class="meta">Not done yet, so they moved to today</span></div>${carried.map(x => taskRow(x, t)).join('')}</section>` : '',
-    `<section class="card"><div class="card-h"><h2>Today's plan</h2><span class="meta">${esc(dowOf(t))} schedule</span></div>${items.map(i => planRow(i, t, day)).join('')}</section>`,
-    `<section class="card"><div class="card-h"><h2>To-dos due today</h2><span class="meta">${due.length ? plural(due.length,'item') : 'All clear'}</span></div>
+    carried.length && !rest ? `<section class="card ord-6"><div class="card-h"><h2>Carried over</h2><span class="meta">Not done yet, so they moved to today</span></div>${carried.map(x => taskRow(x, t)).join('')}</section>` : '',
+    `<section class="card ord-8"><div class="card-h"><h2>To-dos due today</h2><span class="meta">${due.length ? plural(due.length,'item') : 'All clear'}</span></div>
       ${due.map(x => taskRow(x, t)).join('') || '<div class="meta">Nothing else due today.</div>'}
       ${addTaskForm('qt', t)}
       ${doneTasks.length ? `<details style="margin-top:8px"><summary>Done today (${doneTasks.length})</summary>${doneTasks.map(x => taskRow(x, t)).join('')}</details>` : ''}
     </section>`,
     pmCard(t, day)
-  ].join('');
+  ];
+  return installBanner() + `<div class="two"><div class="main">${main.join('')}</div><div class="side">${side.join('')}</div></div>`;
 }
 function nowCard(items, t) {
   const m = nowMin();
   const cur = items.find(i => toMin(i.start) <= m && m < toMin(i.end || i.start));
   const nextI = items.find(i => toMin(i.start) > m);
   const focus = cur && !(isCheckable(cur) && isDone(cur, t)) ? cur : (nextI || cur);
-  if (!focus) return `<div class="now"><div class="eyebrow">Day's done</div><div class="what">${dayOf(t).pm && dayOf(t).pm.savedAt ? 'Checked out. Rest up.' : 'Do your evening check-out, then you are off.'}</div></div>`;
+  if (!focus) return `<div class="now ord-4"><div class="eyebrow">Day's done</div><div class="what">${dayOf(t).pm && dayOf(t).pm.savedAt ? 'Checked out. Rest up.' : 'Do your evening check-out, then you are off.'}</div></div>`;
   const live = focus === cur;
   let extra = '';
   if (focus.kind === 'calls') extra = `<div class="nextline mono">${dialsFor(t, focus.region)}/${focus.quota} ${regionName(focus.region)} dials · ${callsCount(t,'convo')} conversations today</div>`;
   const act = actionFor(focus, t, true);
   const after = items.find(i => toMin(i.start) > toMin(focus.start));
-  return `<div class="now"><div class="eyebrow">${live ? '<span class="live">Now</span>' : 'Up next'} <span class="mono">${fmtTap(focus.start)}${focus.end && focus.end !== focus.start ? '–' + fmtTap(focus.end) : ''}</span></div>
+  return `<div class="now ord-4"><div class="eyebrow">${live ? '<span class="live">Now</span>' : 'Up next'} <span class="mono">${fmtTap(focus.start)}${focus.end && focus.end !== focus.start ? '–' + fmtTap(focus.end) : ''}</span></div>
     <div class="what">${focus.tag ? `<span class="tag">${esc(focus.tag)}</span>` : ''}${esc(focus.text)}</div>${extra}
     ${act ? `<div class="acts">${act}</div>` : ''}
     ${after ? `<div class="nextline">Then ${esc(fmtTap(after.start))}: ${esc(after.tag ? after.tag.toLowerCase() : after.text)}</div>` : ''}</div>`;
@@ -299,7 +343,7 @@ function actionFor(i, t, big) {
 function planRow(i, t, day) {
   const m = nowMin(), done = isCheckable(i) && isDone(i, t), skipped = isSkipped(i, t);
   const isNow = toMin(i.start) <= m && m < toMin(i.end || i.start);
-  const late = isCheckable(i) && !done && toMin(i.end || i.start) <= m;
+  const late = isCheckable(i) && !done && toMin(i.end || i.start) <= m && !isRestDay(t);
   let box;
   if (!isCheckable(i)) box = `<span class="dot" aria-hidden="true"></span>`;
   else if (i.kind === 'checkin' || i.kind === 'checkout') box = `<button class="ck ${done ? 'on' : ''}" data-act="goto" data-id="${i.kind === 'checkin' ? 'am-card' : 'pm-card'}" aria-label="${esc(i.tag || i.text)}"></button>`;
@@ -325,7 +369,7 @@ function planRow(i, t, day) {
     ${menu}</div>`;
 }
 function taskRow(x, t) {
-  const late = !x.done && x.due && x.due < t ? daysBetween(x.due, t) : 0;
+  const late = !x.done && x.due && x.due < t && !isRestDay(t) ? daysBetween(x.due, t) : 0;
   const bits = [];
   if (late) bits.push(`<span class="pill bad">${late === 1 ? '1 day late' : late + ' days late'}</span>`);
   if (x.kind === 'makeup') bits.push('<span class="pill warn">Make-up</span>');
@@ -345,14 +389,14 @@ function amCard(t, day) {
   const am = day.am || {};
   if (am.savedAt && !S.editAM) {
     const top = (am.top3 || []).map((x,n) => ({...x, n})).filter(x => x.t);
-    return `<section class="card" id="am-card"><div class="card-h"><h2>Morning check-in</h2><button class="btn sm ghost" data-act="am-edit">Edit</button></div>
+    return `<section class="card ord-5" id="am-card"><div class="card-h"><h2>Morning check-in</h2><button class="btn sm ghost" data-act="am-edit">Edit</button></div>
       <div class="kv">${num(am.weight) ? `<span><b>${num(am.weight).toFixed(1)}</b> lb</span>` : ''}${num(am.sleep) ? `<span><b>${num(am.sleep)}</b> h sleep</span>` : ''}${num(am.energy) ? `<span><b>${num(am.energy)}</b>/10 energy</span>` : ''}</div>
       ${top.length ? `<h3>Top 3 today</h3>${top.map(x => `<div class="trow ${x.done ? 'done' : ''}"><button class="ck ${x.done ? 'on' : ''}" data-act="top3" data-i="${x.n}" aria-pressed="${!!x.done}" aria-label="Done: ${esc(x.t)}"></button><div class="txt">${esc(x.t)}</div></div>`).join('')}<div class="meta">Anything left unchecked moves to tomorrow.</div>` : ''}
       ${am.note ? `<p class="note">${esc(am.note)}</p>` : ''}</section>`;
   }
   const top = am.top3 || [];
   const e = S.drafts['am-energy'] !== undefined ? S.drafts['am-energy'] : (am.energy ?? '');
-  return `<section class="card" id="am-card"><div class="card-h"><h2>Morning check-in</h2><span class="meta">2 minutes</span></div>
+  return `<section class="card ord-5" id="am-card"><div class="card-h"><h2>Morning check-in</h2><span class="meta">2 minutes</span></div>
     <form class="stack" data-form="am">
       <div class="grid2"><div class="fld"><label for="am-weight">Weight (lb)</label><input class="in" id="am-weight" data-draft inputmode="decimal" value="${esc(draft('am-weight', am.weight))}" placeholder="219.0"></div>
       <div class="fld"><label for="am-sleep">Sleep (hours)</label><input class="in" id="am-sleep" data-draft inputmode="decimal" value="${esc(draft('am-sleep', am.sleep))}" placeholder="8"></div></div>
@@ -382,14 +426,14 @@ function pmCard(t, day) {
     <div><b>${a.dials}</b><span>dials</span></div><div><b>${a.convos}</b><span>owner talks</span></div><div><b>${a.demos}</b><span>demos booked</span></div>
     <div><b>${a.drill + a.comp}</b><span>sessions</span></div><div><b>${a.gym ? 'Yes' : 'No'}</b><span>gym</span></div><div><b>${a.top}/${a.topN || 3}</b><span>top 3 done</span></div></div>`;
   if (pm.savedAt && !S.editPM) {
-    return `<section class="card" id="pm-card"><div class="card-h"><h2>Evening check-out</h2><button class="btn sm ghost" data-act="pm-edit">Edit</button></div>${autoGrid}
+    return `<section class="card ord-9" id="pm-card"><div class="card-h"><h2>Evening check-out</h2><button class="btn sm ghost" data-act="pm-edit">Edit</button></div>${autoGrid}
       <div class="kv"><span>Proposals <b>${num(pm.proposals)||0}</b></span><span>Deals <b>${num(pm.deals)||0}</b></span><span>Cash in <b>${money(num(pm.cash))}</b></span><span>Protein ${pm.protein ? '<b>hit</b>' : '<b>missed</b>'}</span></div>
       ${pm.win ? `<p class="note"><b>Win:</b> ${esc(pm.win)}</p>` : ''}${pm.fix ? `<p class="note"><b>Fix tomorrow:</b> ${esc(pm.fix)} <span class="meta">(on tomorrow's to-dos)</span></p>` : ''}
       ${pm.biz ? `<p class="note"><b>Business:</b> ${esc(pm.biz)}</p>` : ''}${pm.pb ? `<p class="note"><b>Pickleball:</b> ${esc(pm.pb)}</p>` : ''}</section>`;
   }
   const f = (id, label, def, ph, mode) => `<div class="fld"><label for="${id}">${label}</label><input class="in" id="${id}" data-draft ${mode ? `inputmode="${mode}"` : ''} value="${esc(draft(id, def))}" placeholder="${ph || ''}"></div>`;
   const prot = S.drafts['pm-protein'] !== undefined ? S.drafts['pm-protein'] : !!pm.protein;
-  return `<section class="card" id="pm-card"><div class="card-h"><h2>Evening check-out</h2><span class="meta">5 minutes · counts fill in by themselves</span></div>${autoGrid}
+  return `<section class="card ord-9" id="pm-card"><div class="card-h"><h2>Evening check-out</h2><span class="meta">5 minutes · counts fill in by themselves</span></div>${autoGrid}
     <form class="stack" data-form="pm">
       <div class="grid3">${f('pm-proposals','Proposals sent',pm.proposals,'0','numeric')}${f('pm-deals','Deals won',pm.deals,'0','numeric')}${f('pm-cash','Cash in ($)',pm.cash,'0','decimal')}</div>
       <div class="grid3">${f('pm-mockups','Mockups sent',pm.mockups,'0','numeric')}${f('pm-dms','Extra DMs',pm.dms,'0','numeric')}${f('pm-pro','Extra pro video (min)',pm.proExtra,'0','numeric')}</div>
@@ -434,11 +478,11 @@ function viewCalls() {
     </section>
     <div class="btnrow"><input class="in" id="lead-search" placeholder="Search all leads" value="${esc(S.search)}" style="flex:1 1 200px"><button class="btn primary" data-act="lead-add">Add lead</button></div>
     ${q ? '' : `<div class="chips">${[['due',`Due now ${due.length}`],['warm',`Warm + clients ${n(l => l.type !== 'Cold')}`],['IA',`Iowa ${n(l => l.type === 'Cold' && l.region === 'IA')}`],['AZ',`Arizona ${n(l => l.type === 'Cold' && l.region === 'AZ')}`],['all',`All leads ${all.length}`]].map(([k,l]) => `<button class="chip ${S.callFilter === k ? 'on' : ''}" data-act="call-filter" data-f="${k}">${l}</button>`).join('')}</div>`}
-    ${list.length ? list.map(l => leadCard(l, t)).join('') : `<div class="card empty">${q ? 'No leads match that search.' : 'No calls due here. Add new leads on Monday, or switch filters.'}</div>`}`;
+    ${list.length ? `<div class="leads">${list.map(l => leadCard(l, t)).join('')}</div>` : `<div class="card empty">${q ? 'No leads match that search.' : 'No calls due here. Add new leads on Monday, or switch filters.'}</div>`}`;
 }
 function leadCard(l, t) {
   const id = l.id, step = inCadence(l) ? cadenceStep(l) : null;
-  const late = l.nextDate && l.nextDate < t ? daysBetween(l.nextDate, t) : 0;
+  const late = l.nextDate && l.nextDate < t && !isRestDay(t) ? daysBetween(l.nextDate, t) : 0;
   const isDue = l.nextDate && l.nextDate <= t;
   let btns;
   if (step && step.type === 'call') btns = [['noanswer','No answer'],['talked','Talked'],['demo','Demo booked'],['notint','Not interested'],['bad','Bad number']];
@@ -566,19 +610,20 @@ function viewWeek() {
   return `
     <div class="weeknav"><button class="btn sm" data-act="week-nav" data-d="-1" aria-label="Previous week">‹ Prev</button><h2>Week of ${esc(fmtShort(ws))}</h2><button class="btn sm" data-act="week-nav" data-d="1" aria-label="Next week">Next ›</button></div>
     ${wk ? `<div class="week-banner"><div class="eyebrow">Focus</div><b>${esc(wk.focus)}</b>${wk.musts ? `<div class="meta" style="margin-top:4px;color:var(--ink-2)">${esc(wk.musts)}</div>` : ''}</div>` : ''}
+    <div class="two-eq">
     <section class="card"><div class="card-h"><h2>Business</h2><span class="meta">Counted from your calls + check-outs</span></div><div class="stats">
       ${stat('Dials', st.dials, T.dials)}${stat('Owner conversations', st.convos, T.convos)}${stat('Demos booked', st.demos, T.demos)}${stat('Proposals sent', st.proposals, T.proposals)}
       ${stat('Deals won', st.deals, T.deals)}${stat('Mockups sent', st.mockups, T.mockups)}${stat('DMs sent', st.dms, T.dms)}${stat('Cash in', st.cash, 0, money)}</div></section>
     <section class="card"><div class="card-h"><h2>Pickleball + body</h2><span class="meta">Counted from your checkoffs + sessions</span></div><div class="stats">
       ${stat('Drill sessions', st.drill, T.drill)}${stat('Competitive sessions', st.competitive, T.competitive)}${stat('Gym sessions', st.gym, T.gym)}${stat('Mobility (min)', st.mobility, T.mobility)}
       ${stat('Pro video (hrs)', Math.round(st.pro/6)/10, (T.proMinutes||210)/60)}${stat('Check-ins', st.checkins, 7)}${stat('Check-outs', st.checkouts, 7)}${stat(`Rated games in ${parseISO(month+'-01').toLocaleDateString('en-US',{month:'long'})}`, ratedGames, 0)}</div>
-      <div class="meta" style="margin-top:8px">Rated DUPR games only happen at events, so they're counted by month, not week.</div></section>
-    ${moneyCard(t)}
+      <div class="meta" style="margin-top:8px">Rated DUPR games only happen at events, so they're counted by month, not week.</div></section></div>
+    <div class="two-eq">${moneyCard(t)}
     <section class="card"><div class="card-h"><h2>Sunday review</h2><span class="meta">Biggest leak + one fix</span></div>
       <form class="stack" data-form="review" data-ws="${ws}">
         <div class="fld"><label for="rv-leak">Biggest leak this week</label><input class="in" id="rv-leak" data-draft value="${esc(draft('rv-leak', review.leak))}" placeholder="e.g. popping up resets from the transition zone"></div>
         <div class="fld"><label for="rv-fix">One fix for next week</label><input class="in" id="rv-fix" data-draft value="${esc(draft('rv-fix', review.fix))}" placeholder="Shows on every drill block next week"></div>
-        <div class="btnrow"><button class="btn primary" type="submit">Save review</button>${review.savedAt ? '<span class="meta">Saved</span>' : ''}</div></form></section>
+        <div class="btnrow"><button class="btn primary" type="submit">Save review</button>${review.savedAt ? '<span class="meta">Saved</span>' : ''}</div></form></section></div>
     <section class="card"><div class="card-h"><h2>Exact schedule</h2><span class="meta">Same every week</span></div>
       <div class="daychips">${WEEK_ORDER.map(d => `<button class="${d === sel ? 'on' : ''}" data-act="week-day" data-d="${d}">${d}</button>`).join('')}</div>
       <div style="margin-top:6px">${scheduleFor(selDate).map(i => `<div class="row ${!isCheckable(i) ? 'marker' : ''}"><div class="time">${fmtT(i.start)}</div>${isCheckable(i) ? `<span class="ck ${isDone(i, selDate) ? 'on' : ''}" aria-hidden="true" style="cursor:default"></span>` : '<span class="dot"></span>'}<div class="txt">${i.tag ? `<span class="tag">${esc(i.tag)}</span>` : ''}${esc(i.text)}${i.carry ? '<div class="sub">Moves to the next day if missed.</div>' : ''}</div><span></span></div>`).join('')}</div></section>`;
@@ -621,6 +666,7 @@ function viewLog() {
   const ratedM = Object.values(S.data.sessions).filter(s => s.rated && s.date && s.date.slice(0,7) === month);
   return `
     <div class="btnrow"><button class="btn primary" data-act="session-new">Log a session</button><span class="meta">Drill and play blocks you check off log themselves. Add your record + notes.</span></div>
+    <div class="two-eq">
     <section class="card"><div class="card-h"><h2>DUPR doubles</h2>${nextCp ? `<span class="meta">Next: ${nextCp.target.toFixed(1)} by ${esc(fmtShort(nextCp.date))}</span>` : ''}</div>
       <div class="kv"><span><b>${latest ? num(latest.rating).toFixed(3) : '–'}</b> now</span>${p.duprStart ? `<span>started at <b>${num(p.duprStart).toFixed(2)}</b></span>` : ''}<span>goal <b>5.50</b> by Jun 30</span></div>
       ${sparkline(dl.map(x => num(x.rating)))}
@@ -630,7 +676,7 @@ function viewLog() {
       <div class="kv"><span><b>${a7 ? a7.toFixed(1) : '–'}</b> lb 7-day avg</span>${start ? `<span>start <b>${start.toFixed(1)}</b></span>` : ''}${start && a7 ? `<span>lost <b>${(start - a7).toFixed(1)}</b> lb</span>` : ''}${goal ? `<span>protein <b>${Math.round(goal*0.8)}</b> g/day</span>` : ''}</div>
       ${sparkline(ws.slice(-30).map(x => x.w))}
       <form class="btnrow" data-form="goal" style="margin-top:8px"><div class="fld" style="flex:1 1 140px"><label for="goal-in">Goal weight (lb)</label><input class="in" id="goal-in" data-draft inputmode="decimal" value="${esc(draft('goal-in', p.goalWeight))}" placeholder="${start ? Math.round(start - 15) : ''}"></div><button class="btn primary" type="submit" style="align-self:flex-end">Save goal</button></form>
-      <div class="meta" style="margin-top:6px">Aim for about 1 lb a week. Losing more than 1.5 lb a week or feeling flat on court: eat about 200 more a day.</div></section>
+      <div class="meta" style="margin-top:6px">Aim for about 1 lb a week. Losing more than 1.5 lb a week or feeling flat on court: eat about 200 more a day.</div></section></div>
     <section class="card"><div class="card-h"><h2>Sessions</h2><span class="meta">${plural(ratedM.length,'rated session')} this month</span></div>
       ${sessions.length ? sessions.map(s => {
         const g = num(s.games), w = num(s.won) || 0;
@@ -642,21 +688,34 @@ function viewLog() {
 
 /* ----- SIGN IN + IMPORT ----- */
 function loginView() {
-  return `<section class="card" style="max-width:420px;margin:24px auto 0;width:100%"><div class="card-h"><h2>Sign in</h2></div>
+  let saved = ''; try { saved = localStorage.getItem('lcc-email') || ''; } catch(e) {}
+  return `<section class="card login"><div class="logo"><img src="/icon-192.png" alt="" width="52" height="52"><div><div class="eyebrow">Life Command Center</div><h1>Sign in</h1></div></div>
     <form class="stack" data-form="login">
-      <div class="fld"><label for="lg-email">Email</label><input class="in" type="email" id="lg-email" data-draft autocomplete="username" value="${esc(draft('lg-email'))}"></div>
-      <div class="fld"><label for="lg-pass">Password</label><input class="in" type="password" id="lg-pass" autocomplete="current-password"></div>
-      <button class="btn primary" type="submit">Sign in</button>
-      <div class="meta">Use the user you created in Supabase. You stay signed in on this device.</div>
+      <div class="fld"><label for="lg-email">Email</label><input class="in" type="email" id="lg-email" data-draft autocomplete="username" inputmode="email" autocapitalize="off" value="${esc(draft('lg-email', saved))}"></div>
+      <div class="fld"><label for="lg-pass">Password</label><input class="in" type="password" id="lg-pass" data-draft autocomplete="current-password" value="${esc(draft('lg-pass'))}"></div>
+      ${S.loginErr ? `<div class="err">${esc(S.loginErr)}</div>` : ''}
+      <button class="btn primary" type="submit" ${S.loginBusy ? 'disabled' : ''}>${S.loginBusy ? 'Signing in…' : 'Sign in'}</button>
+      <div class="meta">Use the account you created in Supabase. You stay signed in on this device.${configSource === 'device' ? ' <a data-act="disconnect">Use a different project</a>' : ''}</div>
+    </form></section>`;
+}
+function connectView() {
+  return `<section class="card login"><div class="logo"><img src="/icon-192.png" alt="" width="52" height="52"><div><div class="eyebrow">Life Command Center</div><h1>Connect your database</h1></div></div>
+    <p style="margin:0 0 10px;color:var(--ink-2)">Your data lives in your own free Supabase project, which is what keeps your phone and laptop in sync. Paste the two values from <b>Supabase › Project Settings › API Keys</b>. They are kept on this device only.</p>
+    <form class="stack" data-form="connect">
+      <div class="fld"><label for="cn-url">Project URL</label><input class="in" id="cn-url" data-draft inputmode="url" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="https://abcdefgh.supabase.co" value="${esc(draft('cn-url'))}"></div>
+      <div class="fld"><label for="cn-key">Publishable key (or anon key)</label><input class="in" id="cn-key" data-draft autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="sb_publishable_…" value="${esc(draft('cn-key'))}"></div>
+      ${S.connectErr ? `<div class="err">${esc(S.connectErr)}</div>` : ''}
+      <button class="btn primary" type="submit" ${S.connectBusy ? 'disabled' : ''}>${S.connectBusy ? 'Checking…' : 'Connect'}</button>
+      <div class="meta">Deploying on Vercel? Set <span class="kbd">VITE_SUPABASE_URL</span> and <span class="kbd">VITE_SUPABASE_ANON_KEY</span> there instead and this screen never appears on any device. The README walks through it.</div>
     </form></section>`;
 }
 function importView() {
   return `<section class="card"><div class="card-h"><h2>Load your plan</h2></div>
     <p style="margin:0 0 10px">Your database is empty. Choose <b>seed/data.json</b> from the project folder (or any backup you exported) to load your schedule, roadmap, leads and to-dos.</p>
-    ${importControl()}</section>`;
+    <div class="btnrow">${importControl()}</div><div class="meta" style="margin-top:8px">Or drag the file anywhere onto this page.</div></section>`;
 }
-function importControl() {
-  return `<div class="btnrow"><label class="btn primary" for="import-file" style="cursor:pointer">Choose backup file</label><input type="file" id="import-file" accept="application/json,.json" hidden></div>`;
+function importControl(cls = 'btn primary') {
+  return `<label class="${cls}" for="import-file" style="cursor:pointer">Choose backup file</label><input type="file" id="import-file" accept="application/json,.json" hidden>`;
 }
 async function importFile(file) {
   try {
@@ -665,7 +724,7 @@ async function importFile(file) {
     if (!data || typeof data !== 'object' || (!data.config && !data.leads && !data.tasks)) { toast("That file doesn't look like a Life Command Center backup."); return; }
     toast('Importing…');
     const n = await db.importAll(data);
-    toast(`Imported ${n} items.`);
+    toast(db.status().pending ? `Imported ${n} items here. They'll sync once you're back online.` : `Imported ${n} items.`);
     render();
   } catch (e) { toast("Couldn't import: " + ((e && e.message) || 'unknown error')); }
 }
@@ -684,12 +743,17 @@ function viewPlan() {
   const groups = {}; upcoming.forEach(x => { (groups[x.due] = groups[x.due] || []).push(x); });
   const recent = liveTasks().filter(x => x.done && x.doneOn && x.doneOn >= addDays(t,-14)).sort((a,b) => a.doneOn < b.doneOn ? 1 : -1);
   const cur = roadmapFor(t);
+  const rm = roadmap(), curIdx = cur ? rm.findIndex(w => w.start === cur.start) : 0;
+  const past = rm.slice(0, Math.max(0, curIdx)), ahead = rm.slice(Math.max(0, curIdx));
+  const roadRow = w => `<div class="road ${cur && w.start === cur.start ? 'cur' : ''}"><div class="d">${esc(fmtShort(w.start))}${w.start.slice(0,4) !== t.slice(0,4) ? '<br>' + w.start.slice(0,4) : ''}</div><div class="min0"><b>${esc(w.focus)}</b>${w.musts ? `<div class="meta">${esc(w.musts)}</div>` : ''}</div></div>`;
   return `
+    ${planOverview(t)}
+    <div class="two-eq"><div class="col">
     <section class="card"><div class="card-h"><h2>Add a to-do</h2></div>${addTaskForm('pt', t)}</section>
     <section class="card"><div class="card-h"><h2>Coming up</h2><span class="meta">${plural(upcoming.length,'to-do')}</span></div>
-      ${Object.keys(groups).length ? Object.entries(groups).map(([d, xs]) => `<h3>${d === t ? 'Today' : esc(fmtDay(d))}</h3>${xs.map(x => `<div class="trow"><button class="ck" data-act="task-toggle" data-id="${esc(x.id)}" aria-label="Done: ${esc(x.title)}"></button><div class="min0"><div class="txt">${esc(x.title)}</div><div class="btnrow" style="margin-top:6px">${x.area ? `<span class="pill">${esc(x.area)}</span>` : ''}<input class="in" type="date" value="${esc(x.due)}" data-act="task-date" data-id="${esc(x.id)}" aria-label="Move date" style="width:auto;padding:4px 8px;font-size:14px"><button class="btn sm ghost" data-act="task-drop" data-id="${esc(x.id)}">Drop</button></div></div></div>`).join('')}`).join('') : '<div class="meta">Nothing scheduled.</div>'}</section>
+      ${Object.keys(groups).length ? Object.entries(groups).map(([d, xs]) => `<h3>${d === t ? 'Today' : esc(fmtDay(d))}</h3>${xs.map(x => `<div class="trow"><button class="ck" data-act="task-toggle" data-id="${esc(x.id)}" aria-label="Done: ${esc(x.title)}"></button><div class="min0"><div class="txt">${esc(x.title)}</div><div class="btnrow" style="margin-top:6px">${x.area ? `<span class="pill">${esc(x.area)}</span>` : ''}<input class="in" type="date" value="${esc(x.due)}" data-act="task-date" data-id="${esc(x.id)}" aria-label="Move date" style="width:auto;padding:4px 8px;font-size:14px"><button class="btn sm ghost" data-act="task-drop" data-id="${esc(x.id)}">Drop</button></div></div></div>`).join('')}`).join('') : '<div class="meta">Nothing scheduled.</div>'}</section></div>
     <section class="card"><div class="card-h"><h2>Roadmap</h2><span class="meta">To the move, then DUPR 5.5</span></div>
-      ${roadmap().map(w => `<div class="road ${cur && w.start === cur.start ? 'cur' : ''}"><div class="d">${esc(fmtShort(w.start))}${w.start.slice(0,4) !== t.slice(0,4) ? '<br>' + w.start.slice(0,4) : ''}</div><div class="min0"><b>${esc(w.focus)}</b>${w.musts ? `<div class="meta">${esc(w.musts)}</div>` : ''}</div></div>`).join('')}</section>
+      ${past.length ? `<details><summary>Earlier weeks (${past.length})</summary>${past.map(roadRow).join('')}</details>` : ''}${ahead.map(roadRow).join('')}</section></div>
     ${recent.length ? `<section class="card"><details><summary>Done in the last 2 weeks (${recent.length})</summary>${recent.map(x => taskRow(x, t)).join('')}</details></section>` : ''}
     <section class="card"><div class="card-h"><h2>What runs by itself</h2></div><ul class="howto meta" style="margin:0;padding-left:18px;color:var(--ink-2)">
       <li>Unchecked to-dos and top-3 items move to the next day and show how many days late they are.</li>
@@ -698,11 +762,151 @@ function viewPlan() {
       <li>Tapping a call result counts the dial, conversation or demo and schedules the next touch (day 1, 3, 5, 8, 14).</li>
       <li>Booking a demo adds the demo and a same-day proposal to your to-dos.</li>
       <li>Checking off a drill or play block logs the session. Your check-out "fix" becomes tomorrow's first to-do.</li>
-      <li>Your Sunday fix shows on every drill block the next week.</li></ul>
+      <li>Your Sunday fix shows on every drill block the next week.</li>
+      <li>Rest days (Sundays): nothing counts as late, no carried-over list, and no make-ups are created for them.</li>
+      <li>Fresh start, in This device below, moves older to-dos to a day you choose and drops make-ups. Use it after a break.</li></ul>
       <div class="btnrow" style="margin-top:10px">${p.links && p.links.playbook ? `<a class="btn sm" href="${esc(p.links.playbook)}" target="_blank" rel="noopener">Playbook (scripts, workouts)</a>` : ''}${p.links && p.links.sheet ? `<a class="btn sm ghost" href="${esc(p.links.sheet)}" target="_blank" rel="noopener">Old Google Sheet</a>` : ''}</div></section>
-    <section class="card"><div class="card-h"><h2>Backup + account</h2></div>
-      <div class="btnrow"><button class="btn" data-act="export">Download backup</button>${importControl()}<button class="btn ghost" data-act="signout">Sign out</button></div>
-      <div class="meta" style="margin-top:8px">Importing adds or replaces items with the same IDs. It never deletes anything.</div></section>`;
+    ${settingsCard()}`;
+}
+
+/* ----- this device: sync status, install, appearance, backup, account ----- */
+function syncChip() {
+  if (S.dbState !== 'ok' || !S.sync) return '';
+  const s = S.sync;
+  let cls = 'ok', txt = 'Synced';
+  if (!s.online) { cls = 'warn'; txt = s.pending ? `Offline · ${plural(s.pending,'change')} waiting` : 'Offline · saved copy'; }
+  else if (s.syncing) { cls = 'busy'; txt = s.pending ? 'Saving…' : 'Syncing…'; }
+  else if (s.pending) { cls = 'warn'; txt = `${plural(s.pending,'change')} waiting`; }
+  else if (s.error) { cls = 'bad'; txt = 'Sync problem'; }
+  else if (!s.loaded) { cls = ''; txt = 'Saved copy'; }
+  const when = s.lastSync ? new Date(s.lastSync).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'}) : '';
+  const title = (when ? 'Last synced ' + when + '. ' : '') + 'Tap to sync now.';
+  return `<button class="sync ${cls}" data-act="sync-now" title="${esc(title)}" aria-label="Sync status: ${esc(txt)}. ${esc(title)}"><i></i>${esc(txt)}</button>`;
+}
+function installInfo() {
+  const ua = navigator.userAgent || '';
+  const standalone = (window.matchMedia && matchMedia('(display-mode: standalone)').matches) || navigator.standalone === true;
+  if (standalone) return {installed:true, canPrompt:false, hint:'', steps:[]};
+  const iOS = /iPhone|iPad|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const android = /Android/.test(ua);
+  const safari = /Safari/.test(ua) && !/Chrome|CriOS|FxiOS|EdgiOS|Edg\//.test(ua);
+  const firefox = /Firefox|FxiOS/.test(ua);
+  const mac = /Macintosh/.test(ua) && !iOS;
+  const canPrompt = !!S.installEvt;
+  let hint = '', steps = [];
+  if (iOS) {
+    hint = 'Put it on your Home Screen. It opens full screen, like any other app.';
+    steps = ['Tap the <b>Share</b> button in Safari.', 'Scroll down and tap <b>Add to Home Screen</b>.', 'Tap <b>Add</b>, then open Command from your Home Screen.'];
+    if (!safari) steps.unshift('Open this page in <b>Safari</b> first.');
+  } else if (android) {
+    hint = canPrompt ? 'One tap adds it to your home screen and app drawer.' : 'Add it from the browser menu.';
+    if (!canPrompt) steps = ['Tap the <b>⋮</b> menu in Chrome.', 'Tap <b>Install app</b> (or <b>Add to Home screen</b>).'];
+  } else if (firefox) {
+    hint = "Firefox can't install web apps. Open this page in Chrome or Edge to install it.";
+  } else if (mac && safari) {
+    hint = 'Add it to your Dock from Safari.';
+    steps = ['In the menu bar choose <b>File</b> › <b>Add to Dock</b>.', 'Click <b>Add</b>, then open Command from your Dock or Launchpad.'];
+  } else {
+    hint = canPrompt ? 'One click puts it in your dock or Start menu and opens it in its own window.' : "Install it from the browser's address bar.";
+    if (!canPrompt) steps = ['Click the <b>install icon</b> at the right end of the address bar, or open the <b>⋮</b> menu › <b>Cast, save and share</b> › <b>Install page as app</b>.'];
+  }
+  return {installed:false, canPrompt, hint, steps};
+}
+function installBanner() {
+  if (S.installDismissed === undefined) { try { S.installDismissed = !!localStorage.getItem('lcc-install-dismissed'); } catch(e) { S.installDismissed = false; } }
+  const inst = installInfo();
+  if (inst.installed || S.installDismissed) return '';
+  return `<div class="install"><img src="/icon-192.png" alt="" width="44" height="44"><div class="min0"><b>Put Command on your home screen</b><div class="meta">${esc(inst.hint)}</div></div><button class="x" data-act="install-dismiss" aria-label="Dismiss">×</button>
+    <div class="acts">${inst.canPrompt ? '<button class="btn primary sm" data-act="install">Install app</button>' : ''}<button class="btn sm ghost" data-act="goto-settings">${inst.canPrompt ? 'Other ways' : 'Show me how'}</button></div></div>`;
+}
+function planOverview(t) {
+  const p = profile(), gate = p.gate || {saved:10000, monthly:3000, date:'2026-12-01'}, m = cfg().money || {}, T = targets();
+  const sc = num(m.scottsdale) || 0;
+  const monthly = Object.values(S.data.leads).filter(l => l.stage === 'Won').reduce((a,l) => a + (num(l.monthly)||0), 0);
+  const dl = duprList(), latest = dl.length ? num(dl[dl.length-1].rating) : null, dStart = num(p.duprStart);
+  const a7 = avg7(t), start = num(p.startWeight), goal = num(p.goalWeight);
+  const clamp = v => Math.max(0, Math.min(100, Math.round(v)));
+  const ms = [];
+  if (gate.date) ms.push({date:gate.date, title:'The gate', sub:`${money(gate.saved)} saved and ${money(gate.monthly)} a month signed`, now:`${money(sc)} saved · ${money(monthly)} a month`, pct:clamp((Math.min(sc / gate.saved, 1) + Math.min(monthly / gate.monthly, 1)) / 2 * 100)});
+  (p.duprCheckpoints || []).forEach(c => ms.push({date:c.date, title:`DUPR ${Number(c.target).toFixed(1)}`, sub:'Doubles rating checkpoint', now:latest ? `now ${latest.toFixed(3)}` : 'no rating logged yet', pct:latest && dStart && c.target > dStart ? clamp((latest - dStart) / (c.target - dStart) * 100) : 0}));
+  if (start) {
+    ms.push({date:'2026-12-31', title:`Body: ${Math.round(start - 10)} lb`, sub:'Start weight minus 10', now:a7 ? `7-day average ${a7.toFixed(1)} lb` : 'weigh in to start the trend', pct:a7 ? clamp((start - a7) / 10 * 100) : 0});
+    if (goal && goal < start) ms.push({date:'2027-03-31', title:`Goal weight ${goal} lb`, sub:'By the March checkpoint', now:a7 ? `7-day average ${a7.toFixed(1)} lb` : '', pct:a7 ? clamp((start - a7) / (start - goal) * 100) : 0});
+  }
+  if (p.moveDate) ms.push({date:p.moveDate, title:'Move to Scottsdale', sub:'Lease signed, truck booked, new routine locked in', now:'', pct:null});
+  ms.sort((a,b) => a.date < b.date ? -1 : 1);
+  const row = x => {
+    const days = daysBetween(t, x.date);
+    const when = days < 0 ? 'passed' : days === 0 ? 'today' : days === 1 ? 'tomorrow' : `${days} days`;
+    return `<div class="mile ${days < 0 ? 'past' : ''}"><div class="d">${esc(fmtShort(x.date))}<br><span>${x.date.slice(0,4)}</span></div>
+      <div class="min0"><b>${esc(x.title)}</b><div class="meta">${esc(x.sub)}${x.now ? ' · ' + esc(x.now) : ''}</div>${x.pct !== null && x.pct !== undefined ? `<div class="bar ${x.pct >= 100 ? 'good' : ''}" style="margin-top:6px"><i style="width:${x.pct}%"></i></div>` : ''}</div>
+      <span class="pill ${days < 0 ? '' : days <= 14 ? 'warn' : 'acc'}">${when}</span></div>`;
+  };
+  const chips = [['Dials',T.dials],['Owner talks',T.convos],['Demos',T.demos],['Proposals',T.proposals],['Deals',T.deals],['Mockups',T.mockups],['DMs',T.dms],['Drill sessions',T.drill],['Competitive',T.competitive],['Gym',T.gym],['Mobility min',T.mobility],['Pro video min',T.proMinutes]].filter(x => x[1]);
+  return `<section class="card plan-top"><div class="card-h"><h2>The plan</h2><span class="meta">${esc(fmtShort(t))} to Jun 30, 2027</span></div>
+    <div class="miles">${ms.map(row).join('')}</div>
+    ${chips.length ? `<h3>Every week</h3><div class="targets">${chips.map(([l,v]) => `<span class="pill">${esc(l)} <b>${v}</b></span>`).join('')}</div>` : ''}
+    <div class="meta" style="margin-top:8px">Every payment: 25% Taxes, 50% Scottsdale, 25% bills. ${restDays().length ? `Rest days: ${restDays().join(', ')}.` : ''}</div></section>`;
+}
+function freshDefault(t) {
+  if (dowOf(t) === 'Mon') return t;
+  let d = addDays(t, 1); while (dowOf(d) !== 'Mon') d = addDays(d, 1); return d;
+}
+function freshForm() {
+  const t = todayISO(), def = freshDefault(t);
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(draft('fs-date', def)) ? draft('fs-date', def) : def;
+  const sun = S.drafts['fs-sunday'] !== undefined ? S.drafts['fs-sunday'] : true;
+  const live = liveTasks().filter(x => !x.done && !x.dropped);
+  const moving = live.filter(x => !['makeup','top3'].includes(x.kind) && x.due && x.due < date).length;
+  const dropping = live.filter(x => ['makeup','top3'].includes(x.kind)).length;
+  const leadsMoving = Object.values(S.data.leads).filter(l => l.stage !== 'Lost' && l.nextDate && l.nextDate < date).length;
+  return `<div class="card-h"><h2>Fresh start</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
+    <form class="stack" data-form="fresh">
+      <p class="meta" style="margin:0;color:var(--ink-2)">For when you want the plan to begin on a clean day, like after a break. Nothing is deleted.</p>
+      <div class="fld"><label for="fs-date">Start the plan on</label><input class="in" type="date" id="fs-date" data-draft value="${esc(date)}"></div>
+      <div class="btnrow"><button type="button" class="ck ${sun ? 'on' : ''}" data-act="fs-sunday" aria-pressed="${sun}" aria-label="Sundays are rest days"></button><span>Sundays are rest days: church, rest and pickleball</span></div>
+      <ul class="howto meta" style="margin:0;padding-left:18px;color:var(--ink-2)">
+        <li>${plural(moving,'older to-do')} move to ${esc(fmtDay(date))}. Nothing shows as late before then.</li>
+        <li>${plural(leadsMoving,'call follow-up')} due before then move to that day too.</li>
+        <li>${plural(dropping,'make-up to-do')} the app created ${dropping === 1 ? 'gets' : 'get'} dropped.</li>
+        <li>The catch-up automation starts counting from that day.</li>
+        ${sun ? '<li>Sunday gets the rest-day schedule, and nothing counts as late on Sundays.</li>' : ''}
+      </ul>
+      <div class="btnrow"><button class="btn primary" type="submit">Start fresh</button></div>
+    </form>`;
+}
+function settingsCard() {
+  const inst = installInfo(), s = S.sync || {};
+  const last = s.lastSync ? new Date(s.lastSync).toLocaleString('en-US',{weekday:'short',hour:'numeric',minute:'2-digit'}) : 'not yet';
+  let host = ''; try { host = sbConfig ? new URL(sbConfig.url).host : ''; } catch(e) { host = ''; }
+  return `<section class="card" id="settings"><div class="card-h"><h2>This device</h2></div>
+    <div class="srow"><div class="lbl">Install as an app<small>${inst.installed ? 'Installed. It opens full screen from your home screen or dock.' : esc(inst.hint)}</small></div>
+      ${inst.installed ? '<span class="pill good">Installed</span>' : inst.canPrompt ? '<button class="btn primary sm" data-act="install">Install</button>' : ''}</div>
+    ${!inst.installed && inst.steps.length ? `<ol class="steps">${inst.steps.map(x => `<li>${x}</li>`).join('')}</ol>` : ''}
+    <div class="srow"><div class="lbl">Appearance<small>Auto follows your phone or laptop setting.</small></div>
+      <div class="seg">${THEMES.map(x => `<button type="button" class="${theme === x ? 'on' : ''}" data-act="theme" data-t="${x}">${x[0].toUpperCase() + x.slice(1)}</button>`).join('')}</div></div>
+    <div class="srow"><div class="lbl">Sync<small>Last synced ${esc(last)}${s.pending ? ` · ${plural(s.pending,'change')} waiting to send` : ''}${host ? ` · ${esc(host)}` : ''}</small></div>
+      <button class="btn sm" data-act="sync-now">Sync now</button></div>
+    <div class="srow"><div class="lbl">Fresh start<small>Begin the plan on a clean day: older to-dos move there, make-ups are dropped, Sundays rest.</small></div>
+      <button class="btn sm" data-act="fresh-start">Set up</button></div>
+    <div class="srow"><div class="lbl">Backup<small>Importing adds or replaces items with the same IDs. It never deletes anything. You can also drag a backup file onto the page.</small></div>
+      <div class="btnrow"><button class="btn sm" data-act="export">Download</button>${importControl('btn sm')}</div></div>
+    <div class="srow"><div class="lbl">Account<small>${esc(S.email || '')}</small></div>
+      <div class="btnrow"><button class="btn sm ghost" data-act="signout">Sign out</button>${configSource === 'device' ? '<button class="btn sm ghost" data-act="disconnect">Disconnect</button>' : ''}</div></div>
+    <div class="meta" style="margin-top:10px">Version ${esc(APP_VERSION)}${S.updateApp ? ' · <a data-act="update-app">Update ready, tap to reload</a>' : ''}</div>
+  </section>`;
+}
+async function signOut() {
+  if (db) {
+    if (db.status().pending) {
+      try { await db.flush(); } catch(e) {}
+      const n = db.status().pending;
+      if (n && !confirm(`${plural(n,'change')} on this device haven't synced yet. Sign out anyway and lose them?`)) return;
+    }
+    db.destroy({wipe:true});
+  }
+  try { await supabase.auth.signOut(); } catch(e) {}
+  location.reload();
 }
 
 /* ----- modals ----- */
@@ -710,7 +914,7 @@ function renderModal() {
   const el = document.getElementById('modal');
   if (!S.modal) { el.hidden = true; el.innerHTML = ''; return; }
   el.hidden = false;
-  el.innerHTML = `<div class="sheet" role="dialog" aria-modal="true">${S.modal.type === 'session' ? sessionForm() : leadEditForm()}</div>`;
+  el.innerHTML = `<div class="sheet" role="dialog" aria-modal="true">${S.modal.type === 'session' ? sessionForm() : S.modal.type === 'fresh' ? freshForm() : leadEditForm()}</div>`;
 }
 function sessionForm() {
   const id = S.modal.id, s = S.data.sessions[id] || {date:todayISO(), type:'Drill', hours:2};
@@ -756,17 +960,19 @@ function leadEditForm() {
 
 /* ----- toast ----- */
 let toastTimer = null;
-function toast(msg, withUndo) {
-  S.toast = {msg, undo:!!withUndo};
+function toast(msg, withUndo, action) {
+  S.toast = {msg, undo:!!withUndo, action:action || null};
   renderToast();
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { S.toast = null; if (withUndo) S.lastUndo = null; renderToast(); }, withUndo ? 7000 : 4000);
+  const ms = action && action.sticky ? 0 : withUndo ? 7000 : 4000;
+  if (ms) toastTimer = setTimeout(() => { S.toast = null; if (withUndo) S.lastUndo = null; renderToast(); }, ms);
 }
 function renderToast() {
   const el = document.getElementById('toast');
   if (!S.toast) { el.hidden = true; return; }
   el.hidden = false;
-  el.innerHTML = `<span>${esc(S.toast.msg)}</span>${S.toast.undo && S.lastUndo ? '<button data-act="undo">Undo</button>' : ''}`;
+  const a = S.toast.action;
+  el.innerHTML = `<span>${esc(S.toast.msg)}</span>${S.toast.undo && S.lastUndo ? '<button data-act="undo">Undo</button>' : ''}${a ? `<button data-act="${esc(a.act)}">${esc(a.label)}</button>` : ''}`;
 }
 
 /* ---------- actions ---------- */
@@ -831,17 +1037,44 @@ function handle(act, el, ev) {
     case 'confirm': S.confirm = d.c; render(); break;
     case 'modal-close': S.modal = null; S.confirm = null; render(); break;
     case 'undo': undo(); render(); break;
+    case 'fresh-start': clearDrafts('fs-'); S.modal = {type:'fresh'}; render(); break;
+    case 'fs-sunday': { const cur = S.drafts['fs-sunday'] !== undefined ? S.drafts['fs-sunday'] : true; S.drafts['fs-sunday'] = !cur; render(); break; }
     case 'export': exportBackup(); break;
-    case 'signout': supabase.auth.signOut().then(() => location.reload()); break;
+    case 'signout': signOut(); break;
+    case 'retry': S.dbState = 'ok'; S.err = null; render(); if (db) db.refresh().catch(e => { S.dbState = 'error'; S.err = e && e.message; render(); }); break;
+    case 'sync-now': if (db) { toast('Syncing…'); db.refresh().then(() => toast(db.status().pending ? "Still offline. Your changes are saved on this device and will send when you're back online." : 'Up to date.')).catch(() => toast("Couldn't reach the server. Your changes are saved on this device.")); } break;
+    case 'install': { const e = S.installEvt; if (!e) break; S.installEvt = null; render(); e.prompt(); e.userChoice.then(r => { if (!r || r.outcome !== 'accepted') { S.installEvt = e; render(); } }).catch(() => {}); break; }
+    case 'install-dismiss': S.installDismissed = true; try { localStorage.setItem('lcc-install-dismissed', '1'); } catch(e) {} render(); break;
+    case 'goto-settings': setView('plan'); setTimeout(() => { const el = document.getElementById('settings'); if (el) el.scrollIntoView({behavior:'smooth', block:'start'}); }, 60); break;
+    case 'theme': theme = THEMES.includes(d.t) ? d.t : 'auto'; applyTheme(); render(); break;
+    case 'update-app': if (S.updateApp) { S.toast = null; renderToast(); S.updateApp(); } break;
+    case 'disconnect': if (confirm('Disconnect this device from your Supabase project? You will need to paste the URL and key again.')) { clearConfig(); if (db) db.destroy({wipe:true}); Promise.resolve(supabase && supabase.auth.signOut()).catch(() => {}).then(() => location.reload()); } break;
   }
 }
 function submit(form) {
   const t = todayISO(), kind = form.dataset.form, v = id => (S.drafts[id] !== undefined ? S.drafts[id] : (document.getElementById(id) || {}).value || '');
   switch (kind) {
     case 'login': {
-      const email = String(v('lg-email')).trim(), password = (document.getElementById('lg-pass') || {}).value || '';
-      if (!email || !password) { toast('Enter your email and password.'); return; }
-      supabase.auth.signInWithPassword({email, password}).then(({error}) => { if (error) toast(error.message); });
+      const email = String(v('lg-email')).trim(), password = (document.getElementById('lg-pass') || {}).value || v('lg-pass') || '';
+      if (!email || !password) { S.loginErr = 'Enter your email and password.'; render(); return; }
+      S.loginBusy = true; S.loginErr = null; render();
+      supabase.auth.signInWithPassword({email, password}).then(({error}) => {
+        S.loginBusy = false;
+        if (error) { S.loginErr = /invalid login/i.test(error.message) ? 'Wrong email or password.' : error.message; render(); return; }
+        try { localStorage.setItem('lcc-email', email); } catch(e) {}
+        clearDrafts('lg-');
+      }).catch(() => { S.loginBusy = false; S.loginErr = "Couldn't reach the server. Check your connection and try again."; render(); });
+      break;
+    }
+    case 'connect': {
+      const url = String(v('cn-url')).trim().replace(/\/+$/, ''), key = String(v('cn-key')).trim();
+      if (!/^https:\/\/[^\s/]+$/.test(url)) { S.connectErr = 'The URL should look like https://abcdefgh.supabase.co'; render(); return; }
+      if (key.length < 20) { S.connectErr = 'Paste the whole publishable (anon) key.'; render(); return; }
+      S.connectBusy = true; S.connectErr = null; render();
+      fetch(url + '/auth/v1/settings', {headers:{apikey:key}}).then(r => {
+        if (!r.ok) throw new Error(r.status === 401 || r.status === 403 ? 'That key was not accepted. Copy the publishable (anon) key again.' : `That URL did not answer like a Supabase project (HTTP ${r.status}).`);
+        saveConfig(url, key); clearDrafts('cn-'); location.reload();
+      }).catch(e => { S.connectBusy = false; S.connectErr = (e && e.message) || "Couldn't reach that URL."; render(); });
       break;
     }
     case 'task': {
@@ -899,6 +1132,28 @@ function submit(form) {
       const hist = (m.history || []).filter(h => h.date !== t).concat([{date:t, scottsdale:sc, taxes:tx}]);
       patchDoc('config', 'money', {scottsdale:sc, taxes:tx, updated:t, history:hist}); clearDrafts('mn-'); toast('Balances saved.'); render(); break;
     }
+    case 'fresh': {
+      const date = v('fs-date');
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) { toast('Pick a start date.'); return; }
+      const sun = S.drafts['fs-sunday'] !== undefined ? S.drafts['fs-sunday'] : true;
+      let moved = 0, dropped = 0;
+      let leadsMoved = 0;
+      for (const x of liveTasks()) {
+        if (x.done || x.dropped) continue;
+        const {id, ...body} = x;
+        if (['makeup','top3'].includes(x.kind)) { setDoc('tasks', id, {...body, dropped:true, droppedOn:t}); dropped++; }
+        else if (x.due && x.due < date) { setDoc('tasks', id, {...body, due:date, origDue:x.origDue || x.due}); moved++; }
+      }
+      for (const [id, l] of Object.entries(S.data.leads)) {
+        if (l.stage !== 'Lost' && l.nextDate && l.nextDate < date) { setDoc('leads', id, {...l, nextDate:date, updatedAt:Date.now()}); leadsMoved++; }
+      }
+      setDoc('meta', 'rollover', {through:addDays(date, -1), at:new Date().toISOString(), created:0, freshStart:date});
+      const prof = {startDate:date}; if (sun) prof.restDays = ['Sun'];
+      patchDoc('config', 'profile', prof);
+      if (sun) patchDoc('config', 'schedule', {days:{Sun:REST_SUNDAY}});
+      S.modal = null; clearDrafts('fs-');
+      toast(`Fresh start on ${fmtDay(date)}. ${plural(moved,'to-do')} and ${plural(leadsMoved,'follow-up')} moved, ${plural(dropped,'make-up')} dropped.`); render(); break;
+    }
     case 'review': {
       const ws = form.dataset.ws;
       setDoc('weeks', ws, {...(S.data.weeks[ws] || {}), leak:String(v('rv-leak')).trim(), fix:String(v('rv-fix')).trim(), savedAt:new Date().toISOString()});
@@ -914,7 +1169,7 @@ document.addEventListener('click', ev => {
   if (el.tagName === 'INPUT') return;
   ev.preventDefault();
   handle(el.dataset.act, el, ev);
-  if (!['goto','copy','view','undo','export','signout'].includes(el.dataset.act)) render();
+  if (!['goto','copy','view','undo','export','signout','retry','sync-now','install','update-app','disconnect','goto-settings'].includes(el.dataset.act)) render();
 });
 document.addEventListener('submit', ev => { const f = ev.target.closest('form[data-form]'); if (!f) return; ev.preventDefault(); submit(f); });
 document.addEventListener('input', ev => {
@@ -924,11 +1179,26 @@ document.addEventListener('input', ev => {
 });
 document.addEventListener('change', ev => {
   const el = ev.target;
+  if (el.id === 'fs-date') { S.drafts['fs-date'] = el.value; render(); return; }
   if (el.id === 'import-file' && el.files && el.files[0]) { importFile(el.files[0]); el.value = ''; return; }
   if (el.dataset && el.dataset.act === 'task-date' && el.value) { const x = S.data.tasks[el.dataset.id]; if (x) patchDoc('tasks', el.dataset.id, {due:el.value, origDue:x.origDue || x.due}); toast('Moved to ' + fmtDay(el.value) + '.'); return; }
   if (el.hasAttribute && el.hasAttribute('data-draft') && el.id) S.drafts[el.id] = el.value;
 });
 document.addEventListener('keydown', ev => { if (ev.key === 'Escape' && S.modal) { S.modal = null; S.confirm = null; render(); } });
+// Drop a backup file anywhere on the page to import it.
+const dragHasFiles = ev => !!(ev.dataTransfer && Array.from(ev.dataTransfer.types || []).includes('Files'));
+let dragDepth = 0;
+document.addEventListener('dragenter', ev => { if (!db || !dragHasFiles(ev)) return; ev.preventDefault(); dragDepth++; document.body.classList.add('dropping'); });
+document.addEventListener('dragover', ev => { if (!db || !dragHasFiles(ev)) return; ev.preventDefault(); });
+document.addEventListener('dragleave', ev => { if (!db) return; dragDepth = Math.max(0, dragDepth - 1); if (!dragDepth) document.body.classList.remove('dropping'); });
+document.addEventListener('drop', ev => {
+  if (!db) return;
+  ev.preventDefault(); dragDepth = 0; document.body.classList.remove('dropping');
+  const f = ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files[0];
+  if (!f) return;
+  if (!/\.json$/i.test(f.name) && f.type !== 'application/json') { toast('Drop a backup .json file.'); return; }
+  importFile(f);
+});
 
 let lastDate = todayISO();
 setInterval(() => {
@@ -941,7 +1211,16 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) { sc
 /* ---------- boot ---------- */
 function startDb(session) {
   if (db) return;
-  db = createDb(supabase, session.user.id);
+  S.email = (session.user && session.user.email) || '';
+  let lastErr = null;
+  db = createDb(supabase, session.user.id, {onStatus: s => {
+    S.sync = s;
+    if (s.error && s.error !== lastErr) {
+      lastErr = s.error;
+      toast(/row-level security|permission|policy/i.test(s.error) ? "A change couldn't be saved: this account isn't allowed to write it. Sign in with your own account." : "A change couldn't be saved: " + s.error);
+    } else if (!s.error) lastErr = null;
+    if (S.dbState === 'ok') { renderHeader(); if (S.view === 'plan' && allLoaded()) scheduleRender(); }
+  }});
   S.dbState = 'ok'; S.got = {};
   db.ready.catch(e => { S.dbState = 'error'; S.err = e && e.message; render(); });
   COLS.forEach(c => {
@@ -953,7 +1232,22 @@ function startDb(session) {
   });
   render();
 }
+applyTheme();
 render();
+window.__lcc = { status: () => db && db.status(), state: S, version: APP_VERSION };
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); S.installEvt = e; if (S.dbState === 'ok') scheduleRender(); });
+window.addEventListener('appinstalled', () => { S.installEvt = null; toast('Installed. Open Command from your home screen or dock.'); scheduleRender(); });
+const updateSW = registerSW({
+  onNeedRefresh() {
+    S.updateApp = () => updateSW(true);
+    toast('A new version is ready.', false, {label:'Reload', act:'update-app', sticky:true});
+  },
+  onRegisteredSW(url, reg) {
+    if (!reg) return;
+    setInterval(() => reg.update().catch(() => {}), 60 * 60 * 1000);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) reg.update().catch(() => {}); });
+  },
+});
 (async () => {
   if (!supabase) { S.dbState = 'config'; render(); return; }
   const { data } = await supabase.auth.getSession();
