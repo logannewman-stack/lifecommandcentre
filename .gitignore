@@ -8,3 +8,6 @@ dist
 seed/
 *.backup.json
 lcc-backup-*.json
+
+# Deno writes this when type-checking the Edge Function locally
+deno.lock
