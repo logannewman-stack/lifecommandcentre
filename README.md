@@ -48,6 +48,14 @@ The app also shows a banner with the right steps for the device you are on, and 
 - **A milestone on the Plan tab**: what it means, how it is counted, and the to-dos on the way there.
 - **A number on the Week tab**: the day-by-day bars and how that number is counted.
 
+## Calling mode
+
+During a call block the NOW card offers **Start calling** (also on the Calls tab, or press `c` on a laptop). It serves one lead at a time with a big Call button and the result buttons; each result counts the dial, books the next touch and brings up the next lead. **Skip for now** sends a lead to the back of the list. The bar at the top shows the block's dials and today's total.
+
+## Laptop keys
+
+`1` to `5` switch tabs, `/` opens Calls with the search focused, `n` jumps to the new to-do box, `c` starts calling, `Esc` closes any sheet.
+
 ## Reminders
 
 Two ways, pick either or both:
@@ -58,7 +66,8 @@ Two ways, pick either or both:
 ## Rest days and fresh starts
 
 - **Sundays are rest days**: nothing counts as late, the carried-over list is hidden, and the catch-up automation never creates make-ups for them. The Plan tab lists the current rest days.
-- **Fresh start** (Plan tab → This device → Fresh start) begins the plan on a day you choose: older unfinished to-dos and call follow-ups move to that day, make-ups the app created are dropped, the catch-up automation starts counting from there, and Sunday gets the church / rest / pickleball schedule. Use it the first time you set up and after any break.
+- **The first load after the October 2026 update runs a fresh start by itself**, once, so the plan begins on Monday October 5 (or today, if later) with Sundays as rest days. It records that in `meta/setup` and never repeats.
+- **Fresh start** (Plan tab → This device → Fresh start) begins the plan on a day you choose: older unfinished to-dos and call follow-ups move to that day, make-ups the app created are dropped, the catch-up automation starts counting from there, and Sunday gets the church (10:30 to 1), rest and pickleball schedule. Use it after any break.
 
 ## Updates
 
