@@ -271,6 +271,27 @@ body.dropping::after{content:"Drop your backup file to import it";position:fixed
   .leads{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
 }
 
+/* detail sheets */
+.row .txt,.row .time,.trow .txt,.mile,.stat.tap,.now .what{cursor:pointer}
+.row .txt:hover,.trow .txt:hover{color:var(--accent)}
+.mile:hover,.stat.tap:hover{background:var(--surface-2);border-radius:10px}
+.stat.tap{padding:4px 6px;margin:-4px -6px}
+.now .when{font:600 12px var(--f-body);letter-spacing:0;text-transform:none;opacity:.9}
+.hist{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.hdot{width:12px;height:12px;border-radius:99px;background:var(--surface-2);border:1px solid var(--line)}
+.hdot.on{background:var(--good);border-color:var(--good)}
+.hdot.skip{border-style:dashed}
+.bars{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:6px;align-items:end}
+.bcol{display:flex;flex-direction:column;align-items:center;gap:3px;font-size:12px;min-width:0}
+.bwrap{width:100%;height:90px;background:var(--surface-2);border-radius:8px;display:flex;align-items:flex-end;overflow:hidden}
+.bwrap i{display:block;width:100%;background:var(--accent);border-radius:8px 8px 0 0;min-height:0}
+.bcol.today .bwrap i{background:var(--good)}
+.bcol.future{opacity:.5}
+.step{display:grid;grid-template-columns:28px minmax(0,1fr);gap:10px;padding-block:9px;border-top:1px solid var(--line)}
+.step:first-of-type{border-top:0}
+.step .num{width:26px;height:26px;border-radius:99px;background:var(--surface-2);display:flex;align-items:center;justify-content:center;font:700 13px var(--f-display);color:var(--ink-2)}
+.step.ok .num{background:var(--good);color:#fff}
+
 /* small phones */
 @media (max-width:420px){.row{grid-template-columns:46px 28px minmax(0,1fr) auto;gap:7px}.auto{grid-template-columns:repeat(2,minmax(0,1fr))}.stats{grid-template-columns:1fr}.grid3{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media (prefers-reduced-motion:no-preference){.bar>i{transition:width .3s ease}}

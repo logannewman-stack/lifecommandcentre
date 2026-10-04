@@ -8,12 +8,14 @@ import './styles.css';
 import { registerSW } from 'virtual:pwa-register';
 import { supabase, config as sbConfig, configSource, saveConfig, clearConfig } from './supabase.js';
 import { createDb } from './db.js';
+import REMINDERS_FN from '../supabase/functions/reminders/index.ts?raw';
+import CRON_SQL from '../supabase/functions/reminders/cron.sql?raw';
 
 (() => {
 'use strict';
 
 /* ---------- constants ---------- */
-const COLS = ['config','days','tasks','leads','sessions','dupr','weeks','meta'];
+const COLS = ['config','days','tasks','leads','sessions','dupr','weeks','meta','push'];
 const VIEWS = [['today','Today'],['calls','Calls'],['week','Week'],['log','Log'],['plan','Plan']];
 const ICONS = {
   today: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15.5" rx="2.5"/><path d="M3.5 10h17M8 3v4M16 3v4"/><path d="m9.5 15 2 2 3.5-3.5"/></svg>',
@@ -28,7 +30,7 @@ const THEMES = ['auto','light','dark'];
 const REST_SUNDAY = [
   {key:'checkin', start:'08:30', end:'08:35', tag:'CHECK IN', text:'Weight, sleep, energy and your top 3. Two minutes.', kind:'checkin'},
   {key:'mobility', start:'08:35', end:'08:50', tag:'MOBILITY', text:'15 min of easy mobility.', kind:'mobility', minutes:15},
-  {key:'church', start:'09:30', end:'11:30', tag:'', text:'Church. Phone away.', kind:'marker'},
+  {key:'church', start:'09:30', end:'11:30', tag:'CHURCH', text:'Phone away. Be there.', kind:'marker'},
   {key:'lunch', start:'11:30', end:'13:00', tag:'', text:'Lunch with people you like.', kind:'marker'},
   {key:'rest', start:'13:00', end:'14:30', tag:'', text:'Rest: nap, walk, read. No laptop.', kind:'marker'},
   {key:'play', start:'14:30', end:'16:30', tag:'PLAY', text:'Open play for fun. No drilling, no scorekeeping unless you want to.', kind:'session', sessionType:'Rec play', hours:2},
@@ -56,13 +58,13 @@ const WEEK_ORDER = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
 /* ---------- state ---------- */
 const S = {
   dbState:'loading', err:null,
-  data:{config:{},days:{},tasks:{},leads:{},sessions:{},dupr:{},weeks:{},meta:{}},
+  data:{config:{},days:{},tasks:{},leads:{},sessions:{},dupr:{},weeks:{},meta:{},push:{}},
   got:{},
   view:'today', drafts:{}, openItem:null, editAM:false, editPM:false,
   callFilter:'due', search:'', leadForm:null,
   weekOffset:0, weekDay:null, modal:null, toast:null, lastUndo:null, confirm:null,
   sync:null, email:'', installEvt:null, installDismissed:undefined, updateApp:null,
-  connectBusy:false, connectErr:null, loginBusy:false, loginErr:null
+  connectBusy:false, connectErr:null, loginBusy:false, loginErr:null, notif:null, notifBusy:false
 };
 let db = null;
 let theme = 'auto';
@@ -103,6 +105,7 @@ const clone = o => JSON.parse(JSON.stringify(o ?? {}));
 const nextWeekday = s => { let d = addDays(s,1); while (['Sat','Sun'].includes(dowOf(d))) d = addDays(d,1); return d; };
 const regionName = r => r === 'IA' ? 'Iowa' : r === 'AZ' ? 'Arizona' : '';
 const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+const fmtMins = n => n >= 60 ? `${Math.floor(n/60)} h${n % 60 ? ' ' + (n % 60) + ' min' : ''}` : `${n} min`;
 function deepMerge(a, b) {
   const out = (a && typeof a === 'object' && !Array.isArray(a)) ? {...a} : {};
   for (const [k,v] of Object.entries(b || {})) {
@@ -325,8 +328,10 @@ function nowCard(items, t) {
   if (focus.kind === 'calls') extra = `<div class="nextline mono">${dialsFor(t, focus.region)}/${focus.quota} ${regionName(focus.region)} dials · ${callsCount(t,'convo')} conversations today</div>`;
   const act = actionFor(focus, t, true);
   const after = items.find(i => toMin(i.start) > toMin(focus.start));
-  return `<div class="now ord-4"><div class="eyebrow">${live ? '<span class="live">Now</span>' : 'Up next'} <span class="mono">${fmtTap(focus.start)}${focus.end && focus.end !== focus.start ? '–' + fmtTap(focus.end) : ''}</span></div>
-    <div class="what">${focus.tag ? `<span class="tag">${esc(focus.tag)}</span>` : ''}${esc(focus.text)}</div>${extra}
+  const mins = live ? toMin(focus.end || focus.start) - m : toMin(focus.start) - m;
+  const when = live ? (mins > 0 ? `${fmtMins(mins)} left` : '') : (mins > 0 && mins <= 240 ? `in ${fmtMins(mins)}` : '');
+  return `<div class="now ord-4"><div class="eyebrow">${live ? '<span class="live">Now</span>' : 'Up next'} <span class="mono">${fmtTap(focus.start)}${focus.end && focus.end !== focus.start ? '–' + fmtTap(focus.end) : ''}</span>${when ? `<span class="when">· ${when}</span>` : ''}</div>
+    <div class="what" data-act="block" data-key="${esc(focus.key)}" role="button" tabindex="0">${focus.tag ? `<span class="tag">${esc(focus.tag)}</span>` : ''}${esc(focus.text)}</div>${extra}
     ${act ? `<div class="acts">${act}</div>` : ''}
     ${after ? `<div class="nextline">Then ${esc(fmtTap(after.start))}: ${esc(after.tag ? after.tag.toLowerCase() : after.text)}</div>` : ''}</div>`;
 }
@@ -363,8 +368,8 @@ function planRow(i, t, day) {
       ? `<button class="btn sm" data-act="skip" data-key="${esc(i.key)}" data-on="0">Unskip</button>`
       : `<button class="btn sm" data-act="skip" data-key="${esc(i.key)}" data-on="1">Skip today (no make-up)</button>`}</div>` : '';
   return `<div class="row ${!isCheckable(i) ? 'marker' : ''} ${done ? 'done' : ''} ${isNow ? 'is-now' : ''} ${late ? 'late' : ''}">
-    <div class="time">${fmtT(i.start)}</div>${box}
-    <div class="txt">${i.tag ? `<span class="tag">${esc(i.tag)}</span>` : ''}${esc(i.text)}${subs.map(s => `<div class="sub">${s}</div>`).join('')}</div>
+    <div class="time" data-act="block" data-key="${esc(i.key)}">${fmtT(i.start)}</div>${box}
+    <div class="txt" data-act="block" data-key="${esc(i.key)}" role="button" tabindex="0">${i.tag ? `<span class="tag">${esc(i.tag)}</span>` : ''}${esc(i.text)}${subs.map(s => `<div class="sub">${s}</div>`).join('')}</div>
     ${isCheckable(i) && !['checkin','checkout'].includes(i.kind) ? `<button class="more" data-act="item-menu" data-key="${esc(i.key)}" aria-label="More options">⋯</button>` : '<span></span>'}
     ${menu}</div>`;
 }
@@ -376,7 +381,7 @@ function taskRow(x, t) {
   if (x.area) bits.push(`<span class="pill">${esc(x.area)}</span>`);
   if (x.notes) bits.push(esc(x.notes));
   return `<div class="trow ${x.done ? 'done' : ''}"><button class="ck ${x.done ? 'on' : ''}" data-act="task-toggle" data-id="${esc(x.id)}" aria-pressed="${!!x.done}" aria-label="Done: ${esc(x.title)}"></button>
-    <div class="min0"><div class="txt">${esc(x.title)}</div>${bits.length ? `<div class="meta">${bits.join(' ')}</div>` : ''}</div>
+    <div class="min0"><div class="txt" data-act="task-open" data-id="${esc(x.id)}" role="button" tabindex="0">${esc(x.title)}</div>${bits.length ? `<div class="meta">${bits.join(' ')}</div>` : ''}</div>
     ${!x.done ? `<div class="acts"><button class="btn sm" data-act="task-tomorrow" data-id="${esc(x.id)}">Tomorrow</button><button class="btn sm ghost" data-act="task-drop" data-id="${esc(x.id)}">Drop</button></div>` : ''}</div>`;
 }
 function addTaskForm(p, defDate) {
@@ -580,23 +585,42 @@ function undo() {
 }
 
 /* ----- WEEK ----- */
-function weekStats(ws) {
-  const dates = [0,1,2,3,4,5,6].map(i => addDays(ws, i)), end = dates[6];
+function dayStatsFor(d) {
+  const day = dayOf(d), pm = day.pm || {}, ch = day.checks || {};
   const st = {dials:0,convos:0,demos:0,dms:0,proposals:0,deals:0,mockups:0,cash:0,gym:0,mobility:0,pro:0,checkins:0,checkouts:0,drill:0,competitive:0};
-  dates.forEach(d => {
-    const day = dayOf(d), pm = day.pm || {}, ch = day.checks || {};
-    (day.calls || []).forEach(c => { if (c.dial) st.dials++; if (c.convo) st.convos++; if (c.demo) st.demos++; if (c.dm) st.dms++; });
-    st.proposals += num(pm.proposals)||0; st.deals += num(pm.deals)||0; st.mockups += num(pm.mockups)||0; st.dms += num(pm.dms)||0; st.cash += num(pm.cash)||0; st.pro += num(pm.proExtra)||0;
-    if (day.am && day.am.savedAt) st.checkins++; if (pm.savedAt) st.checkouts++;
-    scheduleFor(d).forEach(i => { if (!ch[i.key]) return; if (i.kind === 'gym') st.gym++; if (i.kind === 'mobility') st.mobility += i.minutes||15; if (i.kind === 'watch') st.pro += i.minutes||30; });
-  });
-  Object.values(S.data.sessions).forEach(s => { if (s.date >= ws && s.date <= end) { if (s.type === 'Drill') st.drill++; if (['Competitive','Tournament'].includes(s.type)) st.competitive++; } });
+  (day.calls || []).forEach(c => { if (c.dial) st.dials++; if (c.convo) st.convos++; if (c.demo) st.demos++; if (c.dm) st.dms++; });
+  st.proposals += num(pm.proposals)||0; st.deals += num(pm.deals)||0; st.mockups += num(pm.mockups)||0; st.dms += num(pm.dms)||0; st.cash += num(pm.cash)||0; st.pro += num(pm.proExtra)||0;
+  if (day.am && day.am.savedAt) st.checkins++; if (pm.savedAt) st.checkouts++;
+  scheduleFor(d).forEach(i => { if (!ch[i.key]) return; if (i.kind === 'gym') st.gym++; if (i.kind === 'mobility') st.mobility += i.minutes||15; if (i.kind === 'watch') st.pro += i.minutes||30; });
+  Object.values(S.data.sessions).forEach(s => { if (s.date === d) { if (s.type === 'Drill') st.drill++; if (['Competitive','Tournament'].includes(s.type)) st.competitive++; } });
   return st;
 }
-function stat(label, val, target, fmt) {
+function weekStats(ws) {
+  const st = dayStatsFor(ws);
+  for (let i = 1; i < 7; i++) { const d = dayStatsFor(addDays(ws, i)); for (const k of Object.keys(st)) st[k] += d[k]; }
+  return st;
+}
+const STAT_INFO = {
+  dials:['Dials','Every call result you tap on the Calls tab counts one dial.'],
+  convos:['Owner conversations','Talked, Demo booked, Not interested and They replied each count as a conversation.'],
+  demos:['Demos booked','Tap Demo booked on a lead.'],
+  proposals:['Proposals sent','Typed in the evening check-out.'],
+  deals:['Deals won','Typed in the evening check-out.'],
+  mockups:['Mockups sent','Typed in the evening check-out.'],
+  dms:['DMs sent','DM sent on a lead, plus the extra DMs you type in the check-out.'],
+  cash:['Cash in','Typed in the evening check-out.'],
+  drill:['Drill sessions','Logged when you check off a drill block, or when you add a Drill session on the Log tab.'],
+  competitive:['Competitive sessions','Competitive and Tournament sessions on the Log tab.'],
+  gym:['Gym sessions','Checked-off gym blocks.'],
+  mobility:['Mobility minutes','Checked-off mobility blocks, 15 minutes each unless the block says otherwise.'],
+  pro:['Pro video minutes','Checked-off Watch blocks plus the extra minutes you type in the check-out.'],
+  checkins:['Check-ins','Saved morning check-ins.'],
+  checkouts:['Check-outs','Saved evening check-outs.'],
+};
+function stat(label, val, target, fmt, id) {
   fmt = fmt || (v => v);
   const pct = target ? Math.min(100, Math.round(val / target * 100)) : 0;
-  return `<div class="stat ${target && val >= target ? 'good' : ''}"><div class="stat-h"><span>${label}</span><b>${fmt(val)}${target ? `<small> / ${fmt(target)}</small>` : ''}</b></div>${target ? `<div class="bar"><i style="width:${pct}%"></i></div>` : ''}</div>`;
+  return `<div class="stat ${target && val >= target ? 'good' : ''} ${id ? 'tap' : ''}" ${id ? `data-act="stat" data-id="${id}" role="button" tabindex="0" title="Tap for the day-by-day"` : ''}><div class="stat-h"><span>${label}</span><b>${fmt(val)}${target ? `<small> / ${fmt(target)}</small>` : ''}</b></div>${target ? `<div class="bar"><i style="width:${pct}%"></i></div>` : ''}</div>`;
 }
 function viewWeek() {
   const t = todayISO(), ws = addDays(weekStartOf(t), S.weekOffset * 7), we = addDays(ws, 6);
@@ -612,11 +636,11 @@ function viewWeek() {
     ${wk ? `<div class="week-banner"><div class="eyebrow">Focus</div><b>${esc(wk.focus)}</b>${wk.musts ? `<div class="meta" style="margin-top:4px;color:var(--ink-2)">${esc(wk.musts)}</div>` : ''}</div>` : ''}
     <div class="two-eq">
     <section class="card"><div class="card-h"><h2>Business</h2><span class="meta">Counted from your calls + check-outs</span></div><div class="stats">
-      ${stat('Dials', st.dials, T.dials)}${stat('Owner conversations', st.convos, T.convos)}${stat('Demos booked', st.demos, T.demos)}${stat('Proposals sent', st.proposals, T.proposals)}
-      ${stat('Deals won', st.deals, T.deals)}${stat('Mockups sent', st.mockups, T.mockups)}${stat('DMs sent', st.dms, T.dms)}${stat('Cash in', st.cash, 0, money)}</div></section>
+      ${stat('Dials', st.dials, T.dials, null, 'dials')}${stat('Owner conversations', st.convos, T.convos, null, 'convos')}${stat('Demos booked', st.demos, T.demos, null, 'demos')}${stat('Proposals sent', st.proposals, T.proposals, null, 'proposals')}
+      ${stat('Deals won', st.deals, T.deals, null, 'deals')}${stat('Mockups sent', st.mockups, T.mockups, null, 'mockups')}${stat('DMs sent', st.dms, T.dms, null, 'dms')}${stat('Cash in', st.cash, 0, money, 'cash')}</div></section>
     <section class="card"><div class="card-h"><h2>Pickleball + body</h2><span class="meta">Counted from your checkoffs + sessions</span></div><div class="stats">
-      ${stat('Drill sessions', st.drill, T.drill)}${stat('Competitive sessions', st.competitive, T.competitive)}${stat('Gym sessions', st.gym, T.gym)}${stat('Mobility (min)', st.mobility, T.mobility)}
-      ${stat('Pro video (hrs)', Math.round(st.pro/6)/10, (T.proMinutes||210)/60)}${stat('Check-ins', st.checkins, 7)}${stat('Check-outs', st.checkouts, 7)}${stat(`Rated games in ${parseISO(month+'-01').toLocaleDateString('en-US',{month:'long'})}`, ratedGames, 0)}</div>
+      ${stat('Drill sessions', st.drill, T.drill, null, 'drill')}${stat('Competitive sessions', st.competitive, T.competitive, null, 'competitive')}${stat('Gym sessions', st.gym, T.gym, null, 'gym')}${stat('Mobility (min)', st.mobility, T.mobility, null, 'mobility')}
+      ${stat('Pro video (hrs)', Math.round(st.pro/6)/10, (T.proMinutes||210)/60, null, 'pro')}${stat('Check-ins', st.checkins, 7, null, 'checkins')}${stat('Check-outs', st.checkouts, 7, null, 'checkouts')}${stat(`Rated games in ${parseISO(month+'-01').toLocaleDateString('en-US',{month:'long'})}`, ratedGames, 0)}</div>
       <div class="meta" style="margin-top:8px">Rated DUPR games only happen at events, so they're counted by month, not week.</div></section></div>
     <div class="two-eq">${moneyCard(t)}
     <section class="card"><div class="card-h"><h2>Sunday review</h2><span class="meta">Biggest leak + one fix</span></div>
@@ -728,12 +752,39 @@ async function importFile(file) {
     render();
   } catch (e) { toast("Couldn't import: " + ((e && e.message) || 'unknown error')); }
 }
-function exportBackup() {
-  const blob = new Blob([JSON.stringify({exportedAt:new Date().toISOString(), app:'life-command-center', data:db.exportAll()}, null, 1)], {type:'application/json'});
+function downloadText(name, text, type) {
+  const blob = new Blob([text], {type});
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob); a.download = `lcc-backup-${todayISO()}.json`;
+  a.href = URL.createObjectURL(blob); a.download = name;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+function exportBackup() {
+  downloadText(`lcc-backup-${todayISO()}.json`, JSON.stringify({exportedAt:new Date().toISOString(), app:'life-command-center', data:db.exportAll()}, null, 1), 'application/json');
+}
+// A weekly repeating calendar of your blocks with alarms, for Apple or Google Calendar.
+function exportCalendar(lead) {
+  const days = (cfg().schedule || {}).days || {};
+  const BYDAY = {Mon:'MO',Tue:'TU',Wed:'WE',Thu:'TH',Fri:'FR',Sat:'SA',Sun:'SU'};
+  const icsEsc = s => String(s || '').replace(/\\/g, '\\\\').replace(/;/g, '\\;').replace(/,/g, '\\,').replace(/\r?\n/g, '\\n');
+  const fold = line => { const out = []; let s = line; while (s.length > 73) { out.push(s.slice(0, 73)); s = ' ' + s.slice(73); } out.push(s); return out.join('\r\n'); };
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
+  const start = weekStartOf(todayISO());
+  const lines = ['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//Life Command Center//EN','CALSCALE:GREGORIAN','METHOD:PUBLISH','X-WR-CALNAME:Life Command Center'];
+  WEEK_ORDER.forEach((dw, idx) => {
+    const date = addDays(start, idx).replace(/-/g, '');
+    (days[dw] || []).forEach(i => {
+      if (!i || !i.start || (i.kind === 'marker' && !i.tag)) return;
+      const title = (i.tag ? i.tag + ': ' : '') + (i.short || String(i.text || '').split(/[.:]/)[0]).slice(0, 60);
+      lines.push('BEGIN:VEVENT', `UID:lcc-${dw}-${i.key}@life-command-center`, 'DTSTAMP:' + stamp,
+        `DTSTART:${date}T${i.start.replace(':', '')}00`, `DTEND:${date}T${(i.end || i.start).replace(':', '')}00`,
+        `RRULE:FREQ=WEEKLY;BYDAY=${BYDAY[dw]}`, fold('SUMMARY:' + icsEsc(title)), fold('DESCRIPTION:' + icsEsc(i.text)), 'CATEGORIES:Life Command Center');
+      if (lead !== null) lines.push('BEGIN:VALARM', 'ACTION:DISPLAY', fold('DESCRIPTION:' + icsEsc(title)), `TRIGGER:-PT${lead}M`, 'END:VALARM');
+      lines.push('END:VEVENT');
+    });
+  });
+  lines.push('END:VCALENDAR');
+  downloadText('life-command-center.ics', lines.join('\r\n') + '\r\n', 'text/calendar');
 }
 
 /* ----- PLAN ----- */
@@ -819,32 +870,42 @@ function installBanner() {
   return `<div class="install"><img src="/icon-192.png" alt="" width="44" height="44"><div class="min0"><b>Put Command on your home screen</b><div class="meta">${esc(inst.hint)}</div></div><button class="x" data-act="install-dismiss" aria-label="Dismiss">×</button>
     <div class="acts">${inst.canPrompt ? '<button class="btn primary sm" data-act="install">Install app</button>' : ''}<button class="btn sm ghost" data-act="goto-settings">${inst.canPrompt ? 'Other ways' : 'Show me how'}</button></div></div>`;
 }
-function planOverview(t) {
-  const p = profile(), gate = p.gate || {saved:10000, monthly:3000, date:'2026-12-01'}, m = cfg().money || {}, T = targets();
+const MILE_WHY = {
+  gate:'The gate decides the move. Pass it and you apply for leases; miss it and you run plan B. "Saved" is the Scottsdale account balance you type on the Week tab. "Monthly signed" adds up the monthly amount of every lead marked Won.',
+  dupr:'Logged on the Log tab after rated play. Five drill mornings and three competitive sessions a week are what move it.',
+  body:'Counted from your morning weigh-ins as a 7-day average, so one heavy day does not move it. About a pound a week is the pace.',
+  move:'Everything before this date points here: the Dec 1 gate, the lease packet in November, the truck in December.',
+};
+const MILE_AREAS = {gate:['Money','Sales'], dupr:['Pickleball'], body:['Body'], move:['Move']};
+function milestones(t) {
+  const p = profile(), gate = p.gate || {saved:10000, monthly:3000, date:'2026-12-01'}, m = cfg().money || {};
   const sc = num(m.scottsdale) || 0;
   const monthly = Object.values(S.data.leads).filter(l => l.stage === 'Won').reduce((a,l) => a + (num(l.monthly)||0), 0);
   const dl = duprList(), latest = dl.length ? num(dl[dl.length-1].rating) : null, dStart = num(p.duprStart);
   const a7 = avg7(t), start = num(p.startWeight), goal = num(p.goalWeight);
   const clamp = v => Math.max(0, Math.min(100, Math.round(v)));
   const ms = [];
-  if (gate.date) ms.push({date:gate.date, title:'The gate', sub:`${money(gate.saved)} saved and ${money(gate.monthly)} a month signed`, now:`${money(sc)} saved · ${money(monthly)} a month`, pct:clamp((Math.min(sc / gate.saved, 1) + Math.min(monthly / gate.monthly, 1)) / 2 * 100)});
-  (p.duprCheckpoints || []).forEach(c => ms.push({date:c.date, title:`DUPR ${Number(c.target).toFixed(1)}`, sub:'Doubles rating checkpoint', now:latest ? `now ${latest.toFixed(3)}` : 'no rating logged yet', pct:latest && dStart && c.target > dStart ? clamp((latest - dStart) / (c.target - dStart) * 100) : 0}));
+  if (gate.date) ms.push({id:'gate', kind:'gate', date:gate.date, title:'The gate', sub:`${money(gate.saved)} saved and ${money(gate.monthly)} a month signed`, now:`${money(sc)} saved · ${money(monthly)} a month`, pct:clamp((Math.min(sc / gate.saved, 1) + Math.min(monthly / gate.monthly, 1)) / 2 * 100)});
+  (p.duprCheckpoints || []).forEach(c => ms.push({id:'dupr-' + c.date, kind:'dupr', date:c.date, title:`DUPR ${Number(c.target).toFixed(1)}`, sub:'Doubles rating checkpoint', now:latest ? `now ${latest.toFixed(3)}` : 'no rating logged yet', pct:latest && dStart && c.target > dStart ? clamp((latest - dStart) / (c.target - dStart) * 100) : 0}));
   if (start) {
-    ms.push({date:'2026-12-31', title:`Body: ${Math.round(start - 10)} lb`, sub:'Start weight minus 10', now:a7 ? `7-day average ${a7.toFixed(1)} lb` : 'weigh in to start the trend', pct:a7 ? clamp((start - a7) / 10 * 100) : 0});
-    if (goal && goal < start) ms.push({date:'2027-03-31', title:`Goal weight ${goal} lb`, sub:'By the March checkpoint', now:a7 ? `7-day average ${a7.toFixed(1)} lb` : '', pct:a7 ? clamp((start - a7) / (start - goal) * 100) : 0});
+    ms.push({id:'body-10', kind:'body', date:'2026-12-31', title:`Body: ${Math.round(start - 10)} lb`, sub:'Start weight minus 10', now:a7 ? `7-day average ${a7.toFixed(1)} lb` : 'weigh in to start the trend', pct:a7 ? clamp((start - a7) / 10 * 100) : 0});
+    if (goal && goal < start) ms.push({id:'body-goal', kind:'body', date:'2027-03-31', title:`Goal weight ${goal} lb`, sub:'By the March checkpoint', now:a7 ? `7-day average ${a7.toFixed(1)} lb` : '', pct:a7 ? clamp((start - a7) / (start - goal) * 100) : 0});
   }
-  if (p.moveDate) ms.push({date:p.moveDate, title:'Move to Scottsdale', sub:'Lease signed, truck booked, new routine locked in', now:'', pct:null});
-  ms.sort((a,b) => a.date < b.date ? -1 : 1);
-  const row = x => {
-    const days = daysBetween(t, x.date);
-    const when = days < 0 ? 'passed' : days === 0 ? 'today' : days === 1 ? 'tomorrow' : `${days} days`;
-    return `<div class="mile ${days < 0 ? 'past' : ''}"><div class="d">${esc(fmtShort(x.date))}<br><span>${x.date.slice(0,4)}</span></div>
-      <div class="min0"><b>${esc(x.title)}</b><div class="meta">${esc(x.sub)}${x.now ? ' · ' + esc(x.now) : ''}</div>${x.pct !== null && x.pct !== undefined ? `<div class="bar ${x.pct >= 100 ? 'good' : ''}" style="margin-top:6px"><i style="width:${x.pct}%"></i></div>` : ''}</div>
-      <span class="pill ${days < 0 ? '' : days <= 14 ? 'warn' : 'acc'}">${when}</span></div>`;
-  };
+  if (p.moveDate) ms.push({id:'move', kind:'move', date:p.moveDate, title:'Move to Scottsdale', sub:'Lease signed, truck booked, new routine locked in', now:'', pct:null});
+  return ms.sort((a,b) => a.date < b.date ? -1 : 1);
+}
+function mileRow(x, t) {
+  const days = daysBetween(t, x.date);
+  const when = days < 0 ? 'passed' : days === 0 ? 'today' : days === 1 ? 'tomorrow' : `${days} days`;
+  return `<div class="mile ${days < 0 ? 'past' : ''}" data-act="mile" data-id="${esc(x.id)}" role="button" tabindex="0"><div class="d">${esc(fmtShort(x.date))}<br><span>${x.date.slice(0,4)}</span></div>
+    <div class="min0"><b>${esc(x.title)}</b><div class="meta">${esc(x.sub)}${x.now ? ' · ' + esc(x.now) : ''}</div>${x.pct !== null && x.pct !== undefined ? `<div class="bar ${x.pct >= 100 ? 'good' : ''}" style="margin-top:6px"><i style="width:${x.pct}%"></i></div>` : ''}</div>
+    <span class="pill ${days < 0 ? '' : days <= 14 ? 'warn' : 'acc'}">${when}</span></div>`;
+}
+function planOverview(t) {
+  const T = targets(), ms = milestones(t);
   const chips = [['Dials',T.dials],['Owner talks',T.convos],['Demos',T.demos],['Proposals',T.proposals],['Deals',T.deals],['Mockups',T.mockups],['DMs',T.dms],['Drill sessions',T.drill],['Competitive',T.competitive],['Gym',T.gym],['Mobility min',T.mobility],['Pro video min',T.proMinutes]].filter(x => x[1]);
-  return `<section class="card plan-top"><div class="card-h"><h2>The plan</h2><span class="meta">${esc(fmtShort(t))} to Jun 30, 2027</span></div>
-    <div class="miles">${ms.map(row).join('')}</div>
+  return `<section class="card plan-top"><div class="card-h"><h2>The plan</h2><span class="meta">${esc(fmtShort(t))} to Jun 30, 2027 · tap a line for more</span></div>
+    <div class="miles">${ms.map(x => mileRow(x, t)).join('')}</div>
     ${chips.length ? `<h3>Every week</h3><div class="targets">${chips.map(([l,v]) => `<span class="pill">${esc(l)} <b>${v}</b></span>`).join('')}</div>` : ''}
     <div class="meta" style="margin-top:8px">Every payment: 25% Taxes, 50% Scottsdale, 25% bills. ${restDays().length ? `Rest days: ${restDays().join(', ')}.` : ''}</div></section>`;
 }
@@ -887,6 +948,8 @@ function settingsCard() {
       <div class="seg">${THEMES.map(x => `<button type="button" class="${theme === x ? 'on' : ''}" data-act="theme" data-t="${x}">${x[0].toUpperCase() + x.slice(1)}</button>`).join('')}</div></div>
     <div class="srow"><div class="lbl">Sync<small>Last synced ${esc(last)}${s.pending ? ` · ${plural(s.pending,'change')} waiting to send` : ''}${host ? ` · ${esc(host)}` : ''}</small></div>
       <button class="btn sm" data-act="sync-now">Sync now</button></div>
+    <div class="srow"><div class="lbl">Reminders<small>${pushDoc() && pushDoc().enabled ? 'Phone notifications are on for this device.' : 'Calendar alarms need no setup. Phone notifications take a one-time, three-step setup.'}</small></div>
+      <div class="btnrow"><button class="btn sm" data-act="calendar">Add to calendar</button><button class="btn sm ${pushDoc() && pushDoc().enabled ? '' : 'primary'}" data-act="notif-setup">Phone notifications</button></div></div>
     <div class="srow"><div class="lbl">Fresh start<small>Begin the plan on a clean day: older to-dos move there, make-ups are dropped, Sundays rest.</small></div>
       <button class="btn sm" data-act="fresh-start">Set up</button></div>
     <div class="srow"><div class="lbl">Backup<small>Importing adds or replaces items with the same IDs. It never deletes anything. You can also drag a backup file onto the page.</small></div>
@@ -895,6 +958,173 @@ function settingsCard() {
       <div class="btnrow"><button class="btn sm ghost" data-act="signout">Sign out</button>${configSource === 'device' ? '<button class="btn sm ghost" data-act="disconnect">Disconnect</button>' : ''}</div></div>
     <div class="meta" style="margin-top:10px">Version ${esc(APP_VERSION)}${S.updateApp ? ' · <a data-act="update-app">Update ready, tap to reload</a>' : ''}</div>
   </section>`;
+}
+/* ----- detail sheets: tap anything for the story behind it ----- */
+const closeOnly = title => `<div class="card-h"><h2>${esc(title)}</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div><div class="meta">Nothing to show here right now.</div>`;
+const linkBtn = (name, label) => { const l = (profile().links || {})[name]; return l ? `<a class="btn sm" href="${esc(l)}" target="_blank" rel="noopener">${label}</a>` : ''; };
+const KIND_LABEL = {marker:'Marker', task:'Task block', checkin:'Check-in', checkout:'Check-out', calls:'Call block', session:'Court time', gym:'Gym', mobility:'Mobility', watch:'Study', dupr:'DUPR'};
+function blockSheet(key) {
+  const t = todayISO(), i = scheduleFor(t).find(x => x.key === key);
+  if (!i) return closeOnly('Block');
+  const done = isCheckable(i) && isDone(i, t), skipped = isSkipped(i, t), m = nowMin(), rest = isRestDay(t);
+  const status = !isCheckable(i) ? '' : skipped ? '<span class="pill">Skipped today</span>' : done ? '<span class="pill good">Done</span>' : (toMin(i.end || i.start) <= m && !rest) ? '<span class="pill warn">Behind</span>' : (toMin(i.start) <= m ? '<span class="pill acc">Now</span>' : `<span class="pill">In ${fmtMins(toMin(i.start) - m)}</span>`);
+  const kindLabel = KIND_LABEL[i.kind] || i.kind;
+  const startDate = profile().startDate || '0000-00-00';
+  const hist = [1,2,3,4].map(n => { const d = addDays(t, -7*n); if (d < startDate) return null; const sched = scheduleFor(d).find(x => x.key === key); return sched ? {d, done:isDone(sched, d), skipped:isSkipped(sched, d)} : null; }).filter(Boolean).reverse();
+  const histHtml = hist.length ? `<div class="hist">${hist.map(h => `<span class="hdot ${h.done ? 'on' : h.skipped ? 'skip' : ''}" title="${esc(fmtDay(h.d))}: ${h.done ? 'done' : h.skipped ? 'skipped' : 'missed'}"></span>`).join('')}<span class="meta">Last ${plural(hist.length, dowOf(t))}: ${hist.filter(h => h.done).length} done</span></div>` : '';
+  const T = targets(), st = weekStats(weekStartOf(t));
+  let panel = '';
+  if (i.kind === 'calls') panel = `<div class="auto"><div><b>${dialsFor(t, i.region)}/${i.quota}</b><span>${regionName(i.region)} dials today</span></div><div><b>${callsCount(t,'convo')}</b><span>owner talks today</span></div><div><b>${st.dials}/${T.dials || 150}</b><span>dials this week</span></div></div><div class="meta">Each result you tap counts the dial and books the next touch: call, call in 2 days, DM in 2 more, call in 3, last email in 6.</div><div class="btnrow"><button class="btn primary" data-act="view" data-v="calls">Open calls</button></div>`;
+  else if (i.kind === 'session') {
+    const sid = `auto-${t}-${key}`, s = S.data.sessions[sid], f = lastFix(t);
+    panel = `${f ? `<div class="week-banner"><div class="eyebrow">This week's fix</div><b>${esc(f)}</b></div>` : ''}<div class="auto"><div><b>${st.drill}/${T.drill || 5}</b><span>drill sessions this week</span></div><div><b>${st.competitive}/${T.competitive || 3}</b><span>competitive this week</span></div><div><b>${s && num(s.games) ? `${num(s.won) || 0}-${num(s.games) - (num(s.won) || 0)}` : '–'}</b><span>today's record</span></div></div>${s ? `<div class="btnrow"><button class="btn sm" data-act="session-edit" data-id="${sid}">${num(s.games) || s.workOn || s.wentWell ? 'Edit today\'s session' : 'Add record + notes'}</button></div>` : '<div class="meta">Check it off and a session is logged for you. Add your record and notes after.</div>'}`;
+  }
+  else if (i.kind === 'gym') panel = `<div class="auto"><div><b>${st.gym}/${T.gym || 3}</b><span>gym sessions this week</span></div></div><div class="btnrow">${linkBtn('playbook', 'Open the Playbook (Body)')}</div>`;
+  else if (i.kind === 'mobility') panel = `<div class="auto"><div><b>${st.mobility}/${T.mobility || 105}</b><span>mobility minutes this week</span></div><div><b>${i.minutes || 15}</b><span>minutes in this block</span></div></div><div class="btnrow">${linkBtn('playbook', 'Open the Playbook')}</div>`;
+  else if (i.kind === 'watch') panel = `<div class="auto"><div><b>${Math.round(st.pro)}/${T.proMinutes || 210}</b><span>pro video minutes this week</span></div><div><b>${i.minutes || 30}</b><span>minutes in this block</span></div></div>`;
+  else if (i.kind === 'checkin') panel = `<div class="btnrow"><button class="btn primary" data-act="goto" data-id="am-card">Go to the check-in</button></div>`;
+  else if (i.kind === 'checkout') panel = `<div class="btnrow"><button class="btn primary" data-act="goto" data-id="pm-card">Go to the check-out</button></div>`;
+  else if (i.kind === 'dupr') { const dl = duprList(), last = dl[dl.length - 1]; panel = `<div class="auto"><div><b>${last ? num(last.rating).toFixed(3) : '–'}</b><span>latest DUPR</span></div></div><div class="btnrow"><button class="btn primary" data-act="view" data-v="log">Log today's DUPR</button></div>`; }
+  else if (i.kind === 'task' && i.area) panel = `<div class="meta">Counts toward ${esc(i.area)}.${i.carry ? ' If it is not done today it comes back tomorrow as a make-up.' : ''}</div>`;
+  const acts = isCheckable(i) && !['checkin','checkout','dupr'].includes(i.kind)
+    ? `<div class="btnrow">${done ? `<button class="btn ghost" data-act="check" data-key="${esc(key)}">Undo</button>` : `<button class="btn primary" data-act="check" data-key="${esc(key)}">Mark done</button>`}${skipped ? `<button class="btn" data-act="skip" data-key="${esc(key)}" data-on="0">Unskip</button>` : `<button class="btn ghost" data-act="skip" data-key="${esc(key)}" data-on="1">Skip today (no make-up)</button>`}</div>` : '';
+  return `<div class="card-h"><h2>${esc(i.tag || kindLabel)}</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
+    <div class="meta mono">${fmtTap(i.start)}${i.end && i.end !== i.start ? ' – ' + fmtTap(i.end) : ''} · ${esc(kindLabel)}${i.carry ? ' · moves to tomorrow if missed' : ''}</div>
+    <p style="margin:0;font-size:16px">${esc(i.text)}</p>
+    ${status ? `<div>${status}</div>` : ''}
+    ${panel}
+    ${histHtml}
+    ${acts}`;
+}
+function taskSheet(id) {
+  const x = S.data.tasks[id]; if (!x) return closeOnly('To-do');
+  const f = (k, def) => draft('tk-' + k, def);
+  const origin = x.kind === 'makeup' ? 'A make-up the catch-up automation created.' : x.kind === 'top3' ? 'Came from a morning top 3.' : x.kind === 'fix' ? 'Your check-out fix.' : x.kind === 'sales' ? 'Created from a call result.' : '';
+  const moved = x.origDue && x.origDue !== x.due ? `Originally due ${fmtDay(x.origDue)}.` : '';
+  const doneLine = x.done && x.doneOn ? `Done ${fmtDay(x.doneOn)}.` : '';
+  return `<div class="card-h"><h2>To-do</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
+    <form class="stack" data-form="task-edit" data-id="${esc(id)}">
+      <div class="fld"><label for="tk-title">What</label><input class="in" id="tk-title" data-draft value="${esc(f('title', x.title))}"></div>
+      <div class="grid2"><div class="fld"><label for="tk-due">Due</label><input class="in" type="date" id="tk-due" data-draft value="${esc(f('due', x.due))}"></div>
+        <div class="fld"><label for="tk-area">Area</label><select class="in" id="tk-area" data-draft>${AREAS.map(a => `<option ${f('area', x.area || 'Other') === a ? 'selected' : ''}>${a}</option>`).join('')}</select></div></div>
+      <div class="fld"><label for="tk-notes">Notes</label><textarea class="in" id="tk-notes" data-draft>${esc(f('notes', x.notes))}</textarea></div>
+      ${origin || moved || doneLine ? `<div class="meta">${esc([origin, moved, doneLine].filter(Boolean).join(' '))}</div>` : ''}
+      <div class="btnrow"><button class="btn primary" type="submit">Save</button>
+        ${x.done ? `<button class="btn ghost" type="button" data-act="task-toggle" data-id="${esc(id)}">Mark not done</button>` : `<button class="btn goodb" type="button" data-act="task-toggle" data-id="${esc(id)}">Done</button><button class="btn" type="button" data-act="task-tomorrow" data-id="${esc(id)}">Tomorrow</button>`}
+        ${S.confirm === 'tk-del' ? `<button class="btn badb" type="button" data-act="task-delete" data-id="${esc(id)}">Yes, delete it</button>` : '<button class="btn ghost" type="button" data-act="confirm" data-c="tk-del">Delete</button>'}</div>
+    </form>`;
+}
+function mileSheet(id) {
+  const t = todayISO(), x = milestones(t).find(k => k.id === id);
+  if (!x) return closeOnly('Milestone');
+  const days = daysBetween(t, x.date), areas = MILE_AREAS[x.kind] || [];
+  const related = liveTasks().filter(k => !k.done && !k.dropped && k.due && k.due <= x.date && areas.includes(k.area)).sort((a,b) => a.due < b.due ? -1 : 1).slice(0, 8);
+  const weeks = roadmap().filter(w => w.start <= x.date && addDays(w.start, 6) >= t).slice(-3);
+  return `<div class="card-h"><h2>${esc(x.title)}</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
+    <div class="meta mono">${esc(fmtLong(x.date))} · ${days < 0 ? 'passed' : days === 0 ? 'today' : plural(days, 'day') + ' away'}</div>
+    <p style="margin:0;font-size:16px">${esc(x.sub)}${x.now ? `<br><span class="meta">${esc(x.now)}</span>` : ''}</p>
+    ${x.pct !== null && x.pct !== undefined ? `<div class="progress"><div class="bar ${x.pct >= 100 ? 'good' : ''}"><i style="width:${x.pct}%"></i></div><span class="meta mono">${x.pct}%</span></div>` : ''}
+    <p class="meta" style="margin:0;color:var(--ink-2)">${esc(MILE_WHY[x.kind] || '')}</p>
+    ${related.length ? `<h3>On the way there</h3>${related.map(k => taskRow(k, t)).join('')}` : ''}
+    ${weeks.length ? `<h3>Roadmap</h3>${weeks.map(w => `<div class="road"><div class="d">${esc(fmtShort(w.start))}</div><div class="min0"><b>${esc(w.focus)}</b></div></div>`).join('')}` : ''}`;
+}
+function statSheet(id) {
+  const t = todayISO(), ws = addDays(weekStartOf(t), S.weekOffset * 7), T = targets(), info = STAT_INFO[id];
+  if (!info) return closeOnly('This week');
+  const days = [0,1,2,3,4,5,6].map(n => { const d = addDays(ws, n); return {d, v: dayStatsFor(d)[id] || 0}; });
+  const total = days.reduce((a, x) => a + x.v, 0), max = Math.max(1, ...days.map(x => x.v));
+  const target = {dials:T.dials, convos:T.convos, demos:T.demos, proposals:T.proposals, deals:T.deals, mockups:T.mockups, dms:T.dms, drill:T.drill, competitive:T.competitive, gym:T.gym, mobility:T.mobility, pro:T.proMinutes, checkins:7, checkouts:7}[id];
+  const fmt = id === 'cash' ? money : (v => v);
+  return `<div class="card-h"><h2>${esc(info[0])}</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
+    <div class="meta">Week of ${esc(fmtShort(ws))}</div>
+    <div class="kv"><span><b>${fmt(total)}</b>${target ? ` of ${fmt(target)}` : ''} this week</span>${target && target > total ? `<span><b>${fmt(target - total)}</b> to go</span>` : target ? '<span class="pill good">Target hit</span>' : ''}</div>
+    <div class="bars">${days.map(x => `<div class="bcol ${x.d === t ? 'today' : ''} ${x.d > t ? 'future' : ''}"><div class="bwrap"><i style="height:${Math.round(x.v / max * 100)}%"></i></div><span class="mono">${fmt(x.v)}</span><span class="meta">${dowOf(x.d)}</span></div>`).join('')}</div>
+    <p class="meta" style="margin:0">${esc(info[1])}</p>`;
+}
+
+/* ----- reminders: calendar export and phone notifications ----- */
+function deviceId() {
+  let id = null; try { id = localStorage.getItem('lcc-device'); } catch(e) {}
+  if (!id) { id = 'd-' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36); try { localStorage.setItem('lcc-device', id); } catch(e) {} }
+  return id;
+}
+const pushDoc = () => (S.data.push || {})[deviceId()] || null;
+const fnUrl = () => sbConfig ? String(sbConfig.url).replace(/\/+$/, '') + '/functions/v1/reminders' : '';
+const projectRef = () => { try { return new URL(sbConfig.url).host.split('.')[0]; } catch(e) { return 'YOUR-PROJECT-REF'; } };
+const urlB64ToU8 = s => { const pad = '='.repeat((4 - s.length % 4) % 4); const raw = atob((s + pad).replace(/-/g, '+').replace(/_/g, '/')); return Uint8Array.from(raw, c => c.charCodeAt(0)); };
+function pushEnv() {
+  const ua = navigator.userAgent || '';
+  const iOS = /iPhone|iPad|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const standalone = (window.matchMedia && matchMedia('(display-mode: standalone)').matches) || navigator.standalone === true;
+  const supported = 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+  return {iOS, standalone, supported, perm: supported ? Notification.permission : 'unsupported', needsHome: iOS && !standalone};
+}
+async function notifCheck() {
+  S.notif = {...(S.notif || {}), checking:true}; render();
+  try {
+    const r = await fetch(fnUrl() + '?status=1');
+    if (r.status === 404) S.notif = {fn:'missing'};
+    else if (r.status === 401 || r.status === 403) S.notif = {fn:'error', msg:'The function is there but still checks for a login. Open its settings and turn off "Verify JWT".'};
+    else if (!r.ok) { const txt = await r.text().catch(() => ''); let m = ''; try { m = JSON.parse(txt).error || ''; } catch(e) { m = txt; } S.notif = {fn:'error', msg:`The function answered ${r.status}. ${String(m).slice(0, 160)}`}; }
+    else { const j = await r.json(); const age = j.lastRun ? (Date.now() - Date.parse(j.lastRun)) / 60000 : Infinity; S.notif = {fn:'ok', cron: age <= 3 ? 'ok' : 'idle', lastRun:j.lastRun, subscriptions:j.subscriptions}; }
+  } catch (e) { S.notif = {fn:'error', msg:"Couldn't reach the function. Check your connection and that the function is deployed."}; }
+  render();
+}
+async function notifEnable() {
+  const env = pushEnv();
+  if (!env.supported) { S.notif = {...(S.notif || {}), msg:'This browser cannot show push notifications.', kind:'err'}; render(); return; }
+  if (env.needsHome) { S.notif = {...(S.notif || {}), msg:'On iPhone, open Command from your Home Screen icon first, then turn this on.', kind:'err'}; render(); return; }
+  S.notifBusy = true; S.notif = {...(S.notif || {}), msg:''}; render();
+  try {
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') throw new Error('Notifications were not allowed. You can allow them in your browser settings for this site.');
+    const r = await fetch(fnUrl() + '?public_key=1');
+    if (r.status === 404) throw new Error('The reminders function is not deployed yet. Do step 1 first.');
+    if (r.status === 401 || r.status === 403) throw new Error('The function still checks for a login. Turn off "Verify JWT" in its settings.');
+    if (!r.ok) { let m = ''; try { m = (await r.json()).error || ''; } catch(e) {} throw new Error(m || `The function answered ${r.status}.`); }
+    const {publicKey} = await r.json();
+    if (!publicKey) throw new Error('The function has no keys yet. Run supabase/schema.sql again, then retry.');
+    const reg = await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) sub = await reg.pushManager.subscribe({userVisibleOnly:true, applicationServerKey:urlB64ToU8(publicKey)});
+    const j = sub.toJSON();
+    const lead = Number((document.getElementById('nt-lead') || {}).value);
+    await setDoc('push', deviceId(), {endpoint:j.endpoint, keys:j.keys, expirationTime:j.expirationTime || null, tz:Intl.DateTimeFormat().resolvedOptions().timeZone, ua:navigator.userAgent.slice(0, 140), lead:Number.isFinite(lead) ? lead : 5, enabled:true, error:null, createdAt:Date.now(), updatedAt:Date.now()});
+    await db.flush();
+    const tr = await fetch(fnUrl() + '?test=' + encodeURIComponent(deviceId()), {method:'POST'});
+    const tj = await tr.json().catch(() => ({}));
+    S.notif = {...(S.notif || {}), fn:'ok', msg: tj.sent ? 'On. A test notification is on its way.' : 'On. The test could not be delivered yet' + (tj.error ? ': ' + tj.error : '. Try "Send a test" in a moment.'), kind: tj.sent ? 'ok' : 'err'};
+  } catch (e) { S.notif = {...(S.notif || {}), msg:(e && e.message) || 'Something went wrong.', kind:'err'}; }
+  S.notifBusy = false; render();
+}
+async function notifOff() {
+  try { const reg = await navigator.serviceWorker.ready; const sub = await reg.pushManager.getSubscription(); if (sub) await sub.unsubscribe(); } catch(e) {}
+  if (pushDoc()) patchDoc('push', deviceId(), {enabled:false, updatedAt:Date.now()});
+  S.notif = {...(S.notif || {}), msg:'Off for this device.', kind:'ok'}; render();
+}
+async function notifTest() {
+  toast('Sending a test…');
+  try { const r = await fetch(fnUrl() + '?test=' + encodeURIComponent(deviceId()), {method:'POST'}); const j = await r.json().catch(() => ({})); toast(j.sent ? 'Sent. It should pop up any second.' : 'Nothing sent' + (j.error ? ': ' + j.error : '. Is this device turned on above?')); }
+  catch (e) { toast("Couldn't reach the function."); }
+}
+function notifSheet() {
+  const env = pushEnv(), sub = pushDoc(), st = S.notif || {}, on = !!(sub && sub.enabled);
+  const step = (n, title, body, ok) => `<div class="step ${ok ? 'ok' : ''}"><div class="num">${ok ? '✓' : n}</div><div class="min0"><b>${title}</b><div class="meta" style="color:var(--ink-2)">${body}</div></div></div>`;
+  const three = !env.supported ? 'This browser cannot show push notifications. On iPhone, open Command from your Home Screen icon.'
+    : env.needsHome ? 'On iPhone this only works from the Home Screen icon. Share › Add to Home Screen, open Command from there, and come back to this screen.'
+    : env.perm === 'denied' ? 'Notifications are blocked for this site in your browser settings. Allow them, then try again.'
+    : on ? `On for this device${sub.tz ? ', ' + esc(sub.tz) : ''}.` : 'Your browser will ask once for permission, then a test notification is sent.';
+  return `<div class="card-h"><h2>Phone notifications</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
+    <p class="meta" style="margin:0;color:var(--ink-2)">A tiny function in your own Supabase project checks the clock every minute and nudges this device before each block. Set it up once; every device after that is just step 3.</p>
+    ${step(1, 'Create the function', `In Supabase open <b>Edge Functions</b> › <b>Deploy a new function</b> › <b>Via Editor</b>. Name it <span class="kbd">reminders</span>, replace all the code with the copied code, and <b>Deploy</b>. Then open the function's <b>Settings</b> and turn <b>off</b> "Verify JWT".<div class="btnrow" style="margin-top:6px"><button class="btn sm" data-act="copy-fn">Copy the code</button><button class="btn sm ghost" data-act="notif-check">${st.checking ? 'Checking…' : 'Check'}</button>${st.fn === 'ok' ? '<span class="pill good">Found</span>' : st.fn === 'missing' ? '<span class="pill warn">Not found yet</span>' : st.fn === 'error' ? '<span class="pill bad">Problem</span>' : ''}</div>${st.fn === 'error' && st.msg ? `<div class="err" style="margin-top:6px">${esc(st.msg)}</div>` : ''}`, st.fn === 'ok')}
+    ${step(2, 'Run it every minute', `In Supabase open <b>Integrations</b> › <b>Cron</b> (enable it if asked) › <b>Create job</b>. Name <span class="kbd">reminders</span>, schedule <span class="kbd">* * * * *</span>, type <b>Supabase Edge Function</b>, pick <b>reminders</b>, method <b>POST</b>, Create. Prefer SQL? Copy it and run it in the SQL Editor instead.<div class="btnrow" style="margin-top:6px"><button class="btn sm ghost" data-act="copy-sql">Copy the SQL</button>${st.cron === 'ok' ? '<span class="pill good">Running</span>' : st.cron === 'idle' ? '<span class="pill warn">Not running yet. Check again in two minutes.</span>' : ''}</div>`, st.cron === 'ok')}
+    ${step(3, 'Turn it on for this device', three, on)}
+    <div class="btnrow">
+      ${on ? '<button class="btn" data-act="notif-test">Send a test</button><button class="btn ghost" data-act="notif-off">Turn off</button>' : `<button class="btn primary" data-act="notif-enable" ${!env.supported || env.needsHome || S.notifBusy ? 'disabled' : ''}>${S.notifBusy ? 'Working…' : 'Turn on notifications'}</button>`}
+      <label class="meta">Nudge <select class="in" id="nt-lead" style="width:auto;display:inline-block;padding:4px 8px;font-size:14px">${[[0,'at the start'],[5,'5 min before'],[10,'10 min before'],[15,'15 min before']].map(([v,l]) => `<option value="${v}" ${String(sub && sub.lead !== undefined ? sub.lead : (S.drafts['nt-lead'] ?? 5)) === String(v) ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+    </div>
+    ${st.msg && st.fn !== 'error' ? `<div class="${st.kind === 'ok' ? 'ok-box' : 'err'}">${esc(st.msg)}</div>` : ''}
+    <div class="meta">Calendar alarms are the no-setup alternative: <a data-act="calendar">Add to calendar</a> gives you a weekly calendar with an alarm before every block.</div>`;
 }
 async function signOut() {
   if (db) {
@@ -914,7 +1144,7 @@ function renderModal() {
   const el = document.getElementById('modal');
   if (!S.modal) { el.hidden = true; el.innerHTML = ''; return; }
   el.hidden = false;
-  el.innerHTML = `<div class="sheet" role="dialog" aria-modal="true">${S.modal.type === 'session' ? sessionForm() : S.modal.type === 'fresh' ? freshForm() : leadEditForm()}</div>`;
+  el.innerHTML = `<div class="sheet" role="dialog" aria-modal="true">${S.modal.type === 'session' ? sessionForm() : S.modal.type === 'fresh' ? freshForm() : S.modal.type === 'block' ? blockSheet(S.modal.key) : S.modal.type === 'task' ? taskSheet(S.modal.id) : S.modal.type === 'mile' ? mileSheet(S.modal.id) : S.modal.type === 'stat' ? statSheet(S.modal.id) : S.modal.type === 'notif' ? notifSheet() : leadEditForm()}</div>`;
 }
 function sessionForm() {
   const id = S.modal.id, s = S.data.sessions[id] || {date:todayISO(), type:'Drill', hours:2};
@@ -977,7 +1207,7 @@ function renderToast() {
 
 /* ---------- actions ---------- */
 function setView(v) {
-  S.view = v; S.openItem = null; S.leadForm = null;
+  S.view = v; S.openItem = null; S.leadForm = null; S.modal = null; S.confirm = null;
   try { localStorage.setItem('lcc-view', v); } catch(e) {}
   render(); window.scrollTo(0, 0);
 }
@@ -1004,13 +1234,13 @@ function handle(act, el, ev) {
   const t = todayISO(), d = el.dataset;
   switch (act) {
     case 'view': setView(d.v); break;
-    case 'goto': { const tgt = document.getElementById(d.id); if (tgt) { tgt.scrollIntoView({behavior:'smooth', block:'start'}); const f = tgt.querySelector('input'); if (f) setTimeout(() => f.focus({preventScroll:true}), 350); } break; }
+    case 'goto': { if (S.modal) { S.modal = null; render(); } const tgt = document.getElementById(d.id); if (tgt) { tgt.scrollIntoView({behavior:'smooth', block:'start'}); const f = tgt.querySelector('input'); if (f) setTimeout(() => f.focus({preventScroll:true}), 350); } break; }
     case 'check': toggleCheck(d.key); break;
     case 'item-menu': S.openItem = S.openItem === d.key ? null : d.key; render(); break;
     case 'skip': patchDay(t, {skips:{[d.key]: d.on === '1'}}); S.openItem = null; render(); break;
-    case 'task-toggle': taskToggle(d.id); break;
-    case 'task-tomorrow': { const x = S.data.tasks[d.id]; if (!x) break; S.lastUndo = {type:'task', id:d.id, prev:clone(x)}; patchDoc('tasks', d.id, {due:addDays(t,1), origDue:x.origDue || x.due}); toast('Moved to tomorrow.', true); break; }
-    case 'task-drop': { const x = S.data.tasks[d.id]; if (!x) break; S.lastUndo = {type:'task', id:d.id, prev:clone(x)}; patchDoc('tasks', d.id, {dropped:true, droppedOn:t}); toast('Dropped.', true); break; }
+    case 'task-toggle': taskToggle(d.id); if (S.modal && S.modal.type === 'task') S.modal = null; break;
+    case 'task-tomorrow': { const x = S.data.tasks[d.id]; if (!x) break; S.lastUndo = {type:'task', id:d.id, prev:clone(x)}; patchDoc('tasks', d.id, {due:addDays(t,1), origDue:x.origDue || x.due}); if (S.modal && S.modal.type === 'task') S.modal = null; toast('Moved to tomorrow.', true); break; }
+    case 'task-drop': { const x = S.data.tasks[d.id]; if (!x) break; S.lastUndo = {type:'task', id:d.id, prev:clone(x)}; patchDoc('tasks', d.id, {dropped:true, droppedOn:t}); if (S.modal && S.modal.type === 'task') S.modal = null; toast('Dropped.', true); break; }
     case 'top3': { const am = clone(dayOf(t).am || {}); const arr = am.top3 || []; const n = +d.i; if (!arr[n]) break; arr[n].done = !arr[n].done; patchDay(t, {am:{top3:arr}}); break; }
     case 'energy': S.drafts['am-energy'] = d.n; render(); break;
     case 'am-edit': S.editAM = true; clearDrafts('am-'); render(); break;
@@ -1038,6 +1268,19 @@ function handle(act, el, ev) {
     case 'modal-close': S.modal = null; S.confirm = null; render(); break;
     case 'undo': undo(); render(); break;
     case 'fresh-start': clearDrafts('fs-'); S.modal = {type:'fresh'}; render(); break;
+    case 'block': S.openItem = null; S.modal = {type:'block', key:d.key}; render(); break;
+    case 'task-open': clearDrafts('tk-'); S.confirm = null; S.modal = {type:'task', id:d.id}; render(); break;
+    case 'task-delete': delDoc('tasks', d.id); S.modal = null; S.confirm = null; toast('Deleted.'); render(); break;
+    case 'mile': S.modal = {type:'mile', id:d.id}; render(); break;
+    case 'stat': S.modal = {type:'stat', id:d.id}; render(); break;
+    case 'calendar': { const sub = pushDoc(); const lead = sub && sub.lead !== undefined ? Number(sub.lead) : 5; exportCalendar(lead); toast('Calendar file saved. Open it and add it to your calendar.'); break; }
+    case 'notif-setup': S.modal = {type:'notif'}; render(); if (!S.notif) notifCheck(); break;
+    case 'notif-check': notifCheck(); break;
+    case 'notif-enable': notifEnable(); break;
+    case 'notif-off': notifOff(); break;
+    case 'notif-test': notifTest(); break;
+    case 'copy-fn': { const code = REMINDERS_FN; navigator.clipboard.writeText(code).then(() => toast('Function code copied. Paste it into the Supabase editor.'), () => toast("Couldn't copy. Open supabase/functions/reminders/index.ts in the repo instead.")); break; }
+    case 'copy-sql': { const sql = CRON_SQL.replace(/YOUR-PROJECT-REF/g, projectRef()); navigator.clipboard.writeText(sql).then(() => toast('SQL copied. Run it in the Supabase SQL Editor.'), () => toast("Couldn't copy. Open supabase/functions/reminders/cron.sql in the repo instead.")); break; }
     case 'fs-sunday': { const cur = S.drafts['fs-sunday'] !== undefined ? S.drafts['fs-sunday'] : true; S.drafts['fs-sunday'] = !cur; render(); break; }
     case 'export': exportBackup(); break;
     case 'signout': signOut(); break;
@@ -1154,6 +1397,12 @@ function submit(form) {
       S.modal = null; clearDrafts('fs-');
       toast(`Fresh start on ${fmtDay(date)}. ${plural(moved,'to-do')} and ${plural(leadsMoved,'follow-up')} moved, ${plural(dropped,'make-up')} dropped.`); render(); break;
     }
+    case 'task-edit': {
+      const id = form.dataset.id, x = S.data.tasks[id]; if (!x) { S.modal = null; render(); return; }
+      const title = String(v('tk-title')).trim(); if (!title) { toast('Give it a name first.'); return; }
+      patchDoc('tasks', id, {title, due:v('tk-due') || x.due, area:v('tk-area') || x.area || 'Other', notes:String(v('tk-notes')).trim()});
+      S.modal = null; clearDrafts('tk-'); toast('Saved.'); render(); break;
+    }
     case 'review': {
       const ws = form.dataset.ws;
       setDoc('weeks', ws, {...(S.data.weeks[ws] || {}), leak:String(v('rv-leak')).trim(), fix:String(v('rv-fix')).trim(), savedAt:new Date().toISOString()});
@@ -1169,7 +1418,7 @@ document.addEventListener('click', ev => {
   if (el.tagName === 'INPUT') return;
   ev.preventDefault();
   handle(el.dataset.act, el, ev);
-  if (!['goto','copy','view','undo','export','signout','retry','sync-now','install','update-app','disconnect','goto-settings'].includes(el.dataset.act)) render();
+  if (!['goto','copy','view','undo','export','signout','retry','sync-now','install','update-app','disconnect','goto-settings','calendar','notif-check','notif-enable','notif-off','notif-test','copy-fn','copy-sql'].includes(el.dataset.act)) render();
 });
 document.addEventListener('submit', ev => { const f = ev.target.closest('form[data-form]'); if (!f) return; ev.preventDefault(); submit(f); });
 document.addEventListener('input', ev => {
@@ -1180,6 +1429,7 @@ document.addEventListener('input', ev => {
 document.addEventListener('change', ev => {
   const el = ev.target;
   if (el.id === 'fs-date') { S.drafts['fs-date'] = el.value; render(); return; }
+  if (el.id === 'nt-lead') { S.drafts['nt-lead'] = el.value; if (pushDoc()) { patchDoc('push', deviceId(), {lead:Number(el.value), updatedAt:Date.now()}); toast('Saved.'); } return; }
   if (el.id === 'import-file' && el.files && el.files[0]) { importFile(el.files[0]); el.value = ''; return; }
   if (el.dataset && el.dataset.act === 'task-date' && el.value) { const x = S.data.tasks[el.dataset.id]; if (x) patchDoc('tasks', el.dataset.id, {due:el.value, origDue:x.origDue || x.due}); toast('Moved to ' + fmtDay(el.value) + '.'); return; }
   if (el.hasAttribute && el.hasAttribute('data-draft') && el.id) S.drafts[el.id] = el.value;
@@ -1234,7 +1484,13 @@ function startDb(session) {
 }
 applyTheme();
 render();
-window.__lcc = { status: () => db && db.status(), state: S, version: APP_VERSION };
+window.__lcc = { status: () => db && db.status(), state: S, version: APP_VERSION, pushes: [] };
+if ('serviceWorker' in navigator) navigator.serviceWorker.addEventListener('message', ev => {
+  const d = ev.data;
+  if (!d || d.type !== 'lcc-push') return;
+  window.__lcc.pushes.push(d);
+  toast(d.title + (d.body ? ' · ' + d.body : ''));
+});
 window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); S.installEvt = e; if (S.dbState === 'ok') scheduleRender(); });
 window.addEventListener('appinstalled', () => { S.installEvt = null; toast('Installed. Open Command from your home screen or dock.'); scheduleRender(); });
 const updateSW = registerSW({

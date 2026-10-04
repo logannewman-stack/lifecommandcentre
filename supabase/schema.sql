@@ -78,6 +78,16 @@ end $$;
 revoke all on function public.patch_doc(text, text, jsonb) from public;
 grant execute on function public.patch_doc(text, text, jsonb) to authenticated, service_role;
 
+-- Keys for phone reminders (Web Push). Only the "reminders" Edge Function touches this
+-- table, through the service role; there are no policies on purpose.
+create table if not exists public.push_vapid (
+  id         int         primary key default 1 check (id = 1),
+  keys       jsonb       not null,
+  last_run   timestamptz,
+  created_at timestamptz not null default now()
+);
+alter table public.push_vapid enable row level security;
+
 -- Live sync between your phone and laptop.
 alter table public.docs replica identity full;
 do $$

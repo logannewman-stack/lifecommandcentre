@@ -35,17 +35,15 @@ export default defineConfig({
           { name: 'Log a session', url: '/#log', icons: [{ src: '/icon-192.png', sizes: '192x192' }] },
         ],
       },
-      workbox: {
-        // Everything the app shell needs is cached at install time, so it opens
-        // instantly and works without a connection. Supabase requests are never
-        // cached: the data layer keeps its own local copy.
+      // src/sw.js is our own worker (precache + push reminders); the plugin injects the
+      // list of built files into it. Supabase requests are never cached: the data
+      // layer keeps its own local copy.
+      strategies: 'injectManifest',
+      srcDir: 'src',
+      filename: 'sw.js',
+      injectManifest: {
         globPatterns: ['**/*.{js,css,html,svg,png,ico,woff2,webmanifest}'],
         globIgnores: ['**/icon-512*.png'],
-        navigateFallback: '/index.html',
-        cleanupOutdatedCaches: true,
-        clientsClaim: true,
-        skipWaiting: false,
-        inlineWorkboxRuntime: true,
         maximumFileSizeToCacheInBytes: 3 * 1024 * 1024,
       },
       devOptions: { enabled: false },

@@ -11,7 +11,12 @@ import { execSync } from 'node:child_process';
 //   rounded  - transparent corners, used for icon-192/512 and the favicon
 //   square   - full bleed, iOS applies its own mask (apple-touch-icon)
 //   maskable - full bleed with the drawing inside the 80% safe zone (Android)
+function badgeSvg(size) {
+  // Monochrome court for the Android notification badge: white on transparent.
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 96 96"><g stroke="#FFFFFF" stroke-width="7" stroke-linecap="round" fill="none"><rect x="26" y="8" width="44" height="80" rx="3"/><line x1="26" y1="48" x2="70" y2="48" stroke-width="9"/><line x1="26" y1="30" x2="70" y2="30"/><line x1="26" y1="66" x2="70" y2="66"/><line x1="48" y1="8" x2="48" y2="30"/><line x1="48" y1="66" x2="48" y2="88"/></g></svg>`;
+}
 function svg(variant, size) {
+  if (variant === 'badge') return badgeSvg(size);
   const S = 512;
   const scale = variant === 'maskable' ? 0.8 : 1;
   const bgRadius = variant === 'rounded' ? 112 : 0;
@@ -62,6 +67,7 @@ const jobs = [
   ['rounded', 192, 'icon-192.png', true],
   ['maskable', 512, 'icon-512-maskable.png', false],
   ['square', 180, 'apple-touch-icon.png', false],
+  ['badge', 96, 'badge-96.png', true],
   ['rounded', 48, '_fav-48.png', true],
   ['rounded', 32, '_fav-32.png', true],
   ['rounded', 16, '_fav-16.png', true],
