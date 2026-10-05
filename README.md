@@ -47,21 +47,43 @@ The app also shows a banner with the right steps for the device you are on, and 
 - **A to-do**: edit the title, due date, area and notes; see where it came from (make-up, top 3, check-out fix) and when it was originally due.
 - **A milestone on the Plan tab**: what it means, how it is counted, and the to-dos on the way there.
 - **A number on the Week tab**: the day-by-day bars and how that number is counted.
+- **A calendar event**: its notes, **Edit event**, and **Add to my calendar**.
 
 ## Calling mode
 
 During a call block the NOW card offers **Start calling** (also on the Calls tab, or press `c` on a laptop). It serves one lead at a time with a big Call button and the result buttons; each result counts the dial, books the next touch and brings up the next lead. **Skip for now** sends a lead to the back of the list. The bar at the top shows the block's dials and today's total.
 
+## Your calendar
+
+Anything with a date and a time that is not part of the weekly schedule: a demo, a dentist appointment, a tournament, a flight.
+
+- **Add one** with **+ Event** on Today's plan or on the Plan tab, press `e` on a laptop, or tell the assistant ("put a demo on my calendar Thursday at 2").
+- It shows in that day's plan in time order with a green **EVENT** tag, counts as a block you can check off, and gets a phone nudge before it starts, Sundays included.
+- Tap it for **Edit event** and **Add to my calendar**, which saves a one-off `.ics` file for your phone or Mac calendar. The weekly export under Reminders includes your events too.
+- **Coming up** on the Plan tab lists the next 90 days of events alongside your to-dos.
+
+## Ask: talk to the app
+
+The **Ask** button at the bottom right (or `a` on a laptop) opens a chat with Claude that sees your live data: today's plan and what is done, to-dos, the call list and pipeline, this week's numbers against the targets, the roadmap, money, body, DUPR and your calendar. Ask what to focus on, how the week is going or who to call first, or tell it to do something: it can add and change to-dos and calendar events, add a dated note to a lead and log your DUPR. On a phone, tap the mic to dictate. The conversation is saved in your database, so it is the same on every device; **Clear** starts over.
+
+It runs as a second Edge Function in your own Supabase project with your own Anthropic key, so nothing goes through anyone else's server. Plan → This device → **Assistant** → **Set up** walks you through it once:
+
+1. At console.anthropic.com add a few dollars of credit under **Billing**, then create a key under **Settings → API keys**.
+2. In Supabase open **Edge Functions → Deploy a new function → Via Editor**, name it `assistant`, replace the code with the app's **Copy the code** button (it is `supabase/functions/assistant/index.ts`), deploy, then turn off **Verify JWT** in the function's settings. Tap **Check** in the app.
+3. Under **Edge Functions → Secrets** add `ANTHROPIC_API_KEY` with the key from step 1, then tap **Check** again.
+
+Each question costs a few cents. The function checks that the request comes from your signed-in account before it reads anything, and the key never leaves Supabase. It uses Claude Opus 5.5 with Anthropic's server-side fallback turned on, so a request that a safety filter declines is retried on a fallback model instead of failing.
+
 ## Laptop keys
 
-`1` to `5` switch tabs, `/` opens Calls with the search focused, `n` jumps to the new to-do box, `c` starts calling, `Esc` closes any sheet.
+`1` to `5` switch tabs, `/` opens Calls with the search focused, `n` jumps to the new to-do box, `e` adds a calendar event, `c` starts calling, `a` opens Ask, `Esc` closes any sheet.
 
 ## Reminders
 
 Two ways, pick either or both:
 
-- **Calendar alarms, no setup.** Plan → This device → **Add to calendar** saves a `.ics` file: a weekly repeating calendar of your blocks with an alarm before each one. Open the file on your iPhone and tap **Add All**, or double-click it on your Mac (Calendar syncs it to your phone through iCloud). Google Calendar: Settings → Import. Re-export after you change the schedule.
-- **Phone notifications.** Plan → This device → **Phone notifications** walks you through a one-time, three-step setup: paste the `supabase/functions/reminders/index.ts` code into a Supabase Edge Function called `reminders` (with "Verify JWT" off), schedule it every minute (Supabase Cron page, or `cron.sql`), then turn it on for each device. On iPhone this only works from the Home Screen icon. The function runs in your own Supabase project, generates its own keys on first run (`push_vapid` table from `schema.sql`), and nudges you before each block in your time zone. Sundays stay quiet apart from check-in, check-out and play.
+- **Calendar alarms, no setup.** Plan → This device → **Add to calendar** saves a `.ics` file: a weekly repeating calendar of your blocks with an alarm before each one. Open the file on your iPhone and tap **Add All**, or double-click it on your Mac (Calendar syncs it to your phone through iCloud). Google Calendar: Settings → Import. Your calendar events are included; re-export after you change the schedule or add events.
+- **Phone notifications.** Plan → This device → **Phone notifications** walks you through a one-time, three-step setup: paste the `supabase/functions/reminders/index.ts` code into a Supabase Edge Function called `reminders` (with "Verify JWT" off), schedule it every minute (Supabase Cron page, or `cron.sql`), then turn it on for each device. On iPhone this only works from the Home Screen icon. The function runs in your own Supabase project, generates its own keys on first run (`push_vapid` table from `schema.sql`), and nudges you before each block in your time zone. Calendar events nudge too. Sundays stay quiet apart from check-in, check-out, play and events.
 
 ## Rest days and fresh starts
 
