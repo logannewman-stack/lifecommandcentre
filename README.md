@@ -62,10 +62,17 @@ Your week has a plan that repeats (every Monday looks the same), and any single 
 - **Cancel.** **Cancel for today** (or **Cancel on** another date) takes a block off that day only. It leaves your week alone and never comes back as a make-up.
 - **Catch up.** When blocks slip by, the **3 behind · Catch up** pill on Today lists them: mark what you did (court time logs the session), reschedule what you still want to do, and cancel the rest in one tap.
 - **Plan another day.** **Edit** on Today's plan (or `s` on a laptop) opens **Your schedule**: tap Today, Tomorrow or any day in the next week, or pick a date, then tap a block to change it for that day.
-- **Add something.** **+ Add** (or `e`) adds to one day (an appointment, extra pickleball, a gym session) or to every week on the weekdays you pick. Pickleball counts toward your week's drill and competitive numbers when you check it off. If it overlaps other blocks, the app says which.
+- **Add something.** **+ Add** (or `e`) opens one box. Type it the way you would say it, and the line under the box shows what you will get before you press Enter: "Pickleball Thu 6-8am" is court time on Thursday, "Dentist Friday 2pm" is an appointment, "Gym every Mon, Wed, Fri 6:30pm" goes on your weekly plan, and anything without a time is a to-do. **More options** opens the full form (type, day or weekdays, place, notes) with what you typed filled in. Pickleball counts toward your week's drill and competitive numbers when you check it off. If it overlaps other blocks, the app says which.
 - **Change your week for good.** In a block's sheet, **Edit it or remove it from your week** changes the label, details, times and type, and **Apply to** copies the change to other weekdays. **Remove from your week** takes it out of the days you pick.
 - Every change shows **Undo** for a few seconds, and a moved block flashes in its new spot. The Plan tab's **Your schedule** card and the Week tab's **Day by day** card open the same editor.
 - One-off items show in that day's plan with a green tag, get a phone nudge before they start (Sundays included), and **Add to my calendar** saves one as an `.ics` file. **Coming up** on the Plan tab lists the next 90 days of them.
+
+## To-dos
+
+- **Add one** in the box under **To-dos due today**, in plain words: "Call Lisa tomorrow" is a Sales to-do due tomorrow, and "Send the proposal Wednesday" is due Wednesday. Without a day it is due on the date next to the box. A line with a time, like "Gym 6pm", goes on your plan instead; tap **Just a to-do** if you meant a to-do.
+- **Finish, move or drop it with a swipe.** On a phone, swipe a to-do right to mark it done, or left for **Tomorrow**, **Pick a day** and **Drop**. On a laptop, rest the pointer on it for the same buttons. Tap the title to edit it. Each change has **Undo**.
+- **Long lists are grouped by area**: your check-out fix first, then Sales, Build, Pickleball, Body, Money, Move, DoD and Other.
+- **Too many for one day?** When more than six are due, **Spread over the week** keeps the five most important today (your fix, top 3, make-ups, then whatever has waited longest) and moves the rest onto the next days that count, five a day. **Undo** puts them back.
 
 ## Ask: talk to the app
 
@@ -74,7 +81,7 @@ The **Ask** button at the bottom right (or `a` on a laptop) opens a chat with Cl
 - "I have pickleball 6 to 8, 12 to 2 and 4:30 to 6:30 tomorrow" (it moves or adds court time and tells you what overlaps)
 - "Push everything after lunch 30 minutes", "Cancel gym today", "Move gym to tomorrow", "Move check-in to 6:45 every weekday"
 - "I finished drill, went 7 and 3, work on resets", "Weight 218.4, slept 7 hours, energy 8"
-- "Add a to-do for Friday: send the proposal", "Note on Lisa: call back Thursday"
+- "Add a to-do for Friday: send the proposal", "Note on Lisa: call back Thursday", "I'm sick, take today off"
 
 A change for a named day stays on that day; it changes your weekly plan only when you say every, always or from now on. Each reply lists what it changed. On a phone, tap the mic to dictate. The conversation is saved in your database, so it is the same on every device; **Clear** starts over.
 
@@ -90,20 +97,23 @@ Each question costs a few cents. The function checks that the request comes from
 
 ## Laptop keys
 
-`1` to `5` switch tabs, `/` opens Calls with the search focused, `n` jumps to the new to-do box, `s` opens your schedule, `e` adds to your plan, `c` starts calling, `a` opens Ask, `Esc` closes any sheet.
+`1` to `5` switch tabs, `/` opens Calls with the search focused, `n` jumps to the new to-do box, `s` opens your schedule, `e` opens **Add**, `c` starts calling, `a` opens Ask, `Esc` closes any sheet.
 
 ## Reminders
 
 Two ways, pick either or both:
 
 - **Calendar alarms, no setup.** Plan → This device → **Add to calendar** saves a `.ics` file: a weekly repeating calendar of your blocks with an alarm before each one. Open the file on your iPhone and tap **Add All**, or double-click it on your Mac (Calendar syncs it to your phone through iCloud). Google Calendar: Settings → Import. One-off items are included; moves for a single day are not. Re-export after you change your weekly plan.
-- **Phone notifications.** Plan → This device → **Phone notifications** walks you through a one-time, three-step setup: paste the `supabase/functions/reminders/index.ts` code into a Supabase Edge Function called `reminders` (with "Verify JWT" off), schedule it every minute (Supabase Cron page, or `cron.sql`), then turn it on for each device. On iPhone this only works from the Home Screen icon. The function runs in your own Supabase project, generates its own keys on first run (`push_vapid` table from `schema.sql`), and nudges you before each block in your time zone, at the moved time when you moved a block for that day. One-off items nudge too. Sundays stay quiet apart from check-in, check-out, play and one-off items.
+- **Phone notifications.** Plan → This device → **Phone notifications** walks you through a one-time, three-step setup: paste the `supabase/functions/reminders/index.ts` code into a Supabase Edge Function called `reminders` (with "Verify JWT" off), schedule it every minute (Supabase Cron page, or `cron.sql`), then turn it on for each device. On iPhone this only works from the Home Screen icon. The function runs in your own Supabase project, generates its own keys on first run (`push_vapid` table from `schema.sql`), and nudges you before each block in your time zone, at the moved time when you moved a block for that day. One-off items nudge too. Sundays and days off stay quiet apart from check-in, check-out, play and one-off items.
 
-## Rest days and fresh starts
+## Rest days, days off and fresh starts
 
 - **Sundays are rest days**: nothing counts as late, the carried-over list is hidden, and the catch-up automation never creates make-ups for them. The Plan tab lists the current rest days.
-- **The first load after the October 2026 update runs a fresh start by itself**, once, so the plan begins on Monday October 5 (or today, if later) with Sundays as rest days. It records that in `meta/setup` and never repeats.
+- **A day off** is a rest day for one date. When a day is not happening, open **Catch up** (the behind pill on Today) and tap **Make today a day off**, or ask ("take Friday off"). Nothing that day is late or turns into a make-up. Today shows a **Day off** banner with **It's not a day off** to undo it.
+- **Start fresh tomorrow**, also in Catch up, makes today a day off and runs a fresh start for tomorrow.
 - **Fresh start** (Plan tab → This device → Fresh start) begins the plan on a day you choose: older unfinished to-dos and call follow-ups move to that day, make-ups the app created are dropped, the catch-up automation starts counting from there, and Sunday gets the church (10:30 to 1), rest and pickleball schedule. Use it after any break.
+- **The first load after the October 2026 update ran a fresh start by itself**, once, so the plan began on Monday October 5 with Sundays as rest days.
+- **Everything starts on Tuesday, October 6.** The first time the app opens on or before that day, it restarts once: Monday the 5th becomes a day off, older unfinished to-dos and call follow-ups move to Tuesday, make-ups are dropped, and Monday's work is logged: the three pickleball sessions and the InnerBoard app updates, with a note on the Leah Roling lead. It records that in `meta/setup` and never repeats.
 
 ## Updates
 
