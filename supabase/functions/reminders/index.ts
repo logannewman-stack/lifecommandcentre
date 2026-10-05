@@ -17,7 +17,7 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 import * as webpush from "jsr:@negrel/webpush@0.5.0";
 
 // ---- pure logic (plain JavaScript; the Node test imports this section) ----
-export const KIND_LABEL: any = { marker: "", task: "Task", checkin: "Check-in", checkout: "Check-out", calls: "Calls", session: "Court time", gym: "Gym", mobility: "Mobility", watch: "Pro video", dupr: "DUPR" };
+export const KIND_LABEL: any = { marker: "", task: "Task", checkin: "Check-in", checkout: "Check-out", calls: "Calls", session: "Court time", gym: "Gym", mobility: "Mobility", watch: "Pro video", dupr: "DUPR", event: "Event" };
 // Weekday, local date and minutes since midnight in the device's time zone.
 export function localClock(tz: any, date: any = new Date()) {
   let parts: any[];
@@ -33,8 +33,11 @@ export function localClock(tz: any, date: any = new Date()) {
 export const toMin = (t: any) => { const [h, m] = String(t || "0:0").split(":").map(Number); return h * 60 + (m || 0); };
 export const fmtTap = (t: any) => { let [h, m] = String(t).split(":").map(Number); const ap = h >= 12 ? "pm" : "am"; h = h % 12 || 12; return `${h}:${String(m || 0).padStart(2, "0")} ${ap}`; };
 // The nudges one device should get this minute. `sent` holds ids already delivered.
-export function dueReminders({ schedule, profile, day, clock, lead, sent }: any) {
-  const items = (((schedule || {}).days || {})[clock.dow]) || [];
+export function dueReminders({ schedule, profile, day, clock, lead, sent, events }: any) {
+  const items = [
+    ...((((schedule || {}).days || {})[clock.dow]) || []),
+    ...((events || []).filter((e: any) => e && e.start).map((e: any) => ({ key: "ev-" + e.id, start: e.start, end: e.end, tag: "EVENT", text: `${e.title}${e.where ? " at " + e.where : ""}`, kind: "event" }))),
+  ];
   const restDays = Array.isArray((profile || {}).restDays) ? profile.restDays : ["Sun"];
   const rest = restDays.includes(clock.dow);
   const checks = (day && day.checks) || {}, skips = (day && day.skips) || {};
@@ -42,7 +45,7 @@ export function dueReminders({ schedule, profile, day, clock, lead, sent }: any)
   for (const i of items) {
     if (!i || !i.start) continue;
     if (i.kind === "marker" && !i.tag) continue;
-    if (rest && !["checkin", "checkout", "session"].includes(i.kind)) continue;
+    if (rest && !["checkin", "checkout", "session", "event"].includes(i.kind)) continue;
     const fire = toMin(i.start) - (Number(lead) || 0);
     if (clock.minutes < fire || clock.minutes > fire + 1) continue; // this minute, or the next if cron ran late
     const id = `${clock.date}|${i.key}`;
@@ -62,6 +65,7 @@ export function dueReminders({ schedule, profile, day, clock, lead, sent }: any)
       title: `${label} · ${fmtTap(i.start)}${Number(lead) ? ` (in ${Number(lead)} min)` : ""}`,
       body, tag: "lcc-" + i.key,
       url: i.kind === "calls" ? "/#calls" : i.kind === "dupr" ? "/#log" : "/#today",
+      event: i.kind === "event",
     });
   }
   return out;
@@ -115,11 +119,11 @@ Deno.serve(async (req: Request) => {
     if (req.method !== "POST") return json({ ok: true, hint: "POST to send due reminders" });
 
     const test = url.searchParams.get("test");
-    const { data: rows, error } = await admin.from("docs").select("owner,collection,id,data").in("collection", ["push", "pushlog", "config", "days"]);
+    const { data: rows, error } = await admin.from("docs").select("owner,collection,id,data").in("collection", ["push", "pushlog", "config", "days", "events"]);
     if (error) throw error;
     const byOwner: any = {};
     for (const r of rows || []) {
-      const o = (byOwner[r.owner] ||= { push: {}, pushlog: {}, config: {}, days: {} });
+      const o = (byOwner[r.owner] ||= { push: {}, pushlog: {}, config: {}, days: {}, events: {} });
       (o[r.collection] ||= {})[r.id] = r.data;
     }
     const as = await webpush.ApplicationServer.new({ contactInformation: Deno.env.get("VAPID_SUBJECT") || "mailto:reminders@life-command-center.app", vapidKeys: keys });
@@ -132,7 +136,8 @@ Deno.serve(async (req: Request) => {
         const log = d.pushlog[device] || { sent: {} };
         const notes = test
           ? [{ id: "test-" + Date.now(), key: "test", title: "Reminders are on", body: "You'll get a nudge like this before each block. Tap it to open the app.", tag: "lcc-test", url: "/#today" }]
-          : dueReminders({ schedule: d.config.schedule, profile: d.config.profile, day: d.days[clock.date], clock, lead: sub.lead, sent: log.sent });
+          : dueReminders({ schedule: d.config.schedule, profile: d.config.profile, day: d.days[clock.date], clock, lead: sub.lead, sent: log.sent,
+              events: Object.entries(d.events).filter(([, e]: any) => e && e.date === clock.date).map(([id, e]: any) => ({ id, ...e })) });
         if (!notes.length) continue;
         const subscriber = as.subscribe({ endpoint: sub.endpoint, keys: sub.keys });
         const sentIds: any = { ...(log.sent || {}) };
