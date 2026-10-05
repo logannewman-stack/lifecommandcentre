@@ -19,7 +19,7 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 import * as webpush from "jsr:@negrel/webpush@0.5.0";
 
 // ---- pure logic (plain JavaScript; the Node test imports this section) ----
-export const FN_VERSION = 3;
+export const FN_VERSION = 4;
 export const KIND_LABEL: any = { marker: "", task: "Task", checkin: "Check-in", checkout: "Check-out", calls: "Calls", session: "Court time", gym: "Gym", mobility: "Mobility", watch: "Pro video", dupr: "DUPR", event: "Event" };
 export const ONEOFF_TAG: any = { event: "EVENT", task: "TO-DO", gym: "GYM", mobility: "MOBILITY", watch: "STUDY", marker: "NOTE", calls: "CALLS" };
 // Weekday, local date and minutes since midnight in the device's time zone.
@@ -53,7 +53,7 @@ export function itemsForDay(schedule: any, dow: any, day: any, events: any) {
 export function dueReminders({ schedule, profile, day, clock, lead, sent, events }: any) {
   const items = itemsForDay(schedule, clock.dow, day, events);
   const restDays = Array.isArray((profile || {}).restDays) ? profile.restDays : ["Sun"];
-  const rest = restDays.includes(clock.dow);
+  const rest = restDays.includes(clock.dow) || !!(day && day.off); // a day off is quiet like a rest day
   const checks = (day && day.checks) || {}, skips = (day && day.skips) || {};
   const out: any[] = [];
   for (const i of items) {

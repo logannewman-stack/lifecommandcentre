@@ -17,7 +17,7 @@ import Anthropic from "npm:@anthropic-ai/sdk@0.131.0";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
 // ---- pure logic (no imports; the Deno test imports this section) ----
-export const FN_VERSION = 3;
+export const FN_VERSION = 4;
 export const MODEL = "claude-opus-5-5";
 const AREAS = ["Sales", "Build", "Pickleball", "Body", "Money", "Move", "DoD", "Fix", "Other"];
 const SESSION_TYPES = ["Drill", "Competitive", "Rec play", "Tournament", "Lesson"];
@@ -84,7 +84,7 @@ How to talk: plain, direct, second person, short. Lead with the answer. Use the 
 The schedule has two layers:
 - The weekly plan repeats every week, one list per weekday.
 - One-off changes apply to a single date: move_block (a new time, or to_date to move it to another day), skip_block (cancel it for that date), add_event (an extra item that date).
-"Cancel", "skip", "drop it today" and "not doing X today" all mean skip_block. "Reschedule", "move" and "push back" mean move_block. When Logan names a date or says today, tomorrow or a weekday, change only that date. Change the weekly plan (edit_weekly_block, add_weekly_block, remove_weekly_block) only when Logan says every, always, each week or from now on, or asks to change the routine. Use the keys exactly as the context shows them.
+"Cancel", "skip", "drop it today" and "not doing X today" all mean skip_block. When a whole day is not happening (sick, traveling, "take today off"), use set_day_off: nothing that date counts as late or turns into a make-up. "Reschedule", "move" and "push back" mean move_block. When Logan names a date or says today, tomorrow or a weekday, change only that date. Change the weekly plan (edit_weekly_block, add_weekly_block, remove_weekly_block) only when Logan says every, always, each week or from now on, or asks to change the routine. Use the keys exactly as the context shows them.
 
 When you move or add something, look at that day's plan for overlaps. If Logan asked to make room, move or skip the blocks in the way yourself; otherwise say in one line what it overlaps and offer to fix it. Pickleball is court time: add it with kind "session" and the right session_type so it counts toward the week. When Logan says something is done, check it off with check_block, then use log_session for a record or notes. Use log_checkin for weight, sleep, energy, top 3 and the morning note.
 
@@ -96,6 +96,7 @@ const DAYS_PROP = { type: "array", items: { type: "string", enum: WEEK }, descri
 export const TOOLS: any[] = [
   { name: "move_block", description: "Reschedule a block on one date only; the weekly plan stays the same. key is the [key] from the plan. If end is left out the block keeps its length. reset: true puts it back at its usual time. to_date moves it to another day instead: it is canceled on date and added there as a one-off (start optional, it keeps its time). Works for one-off items (keys starting ev-) too.", input_schema: { type: "object", properties: { date: { type: "string", description: "YYYY-MM-DD" }, key: { type: "string" }, start: { type: "string", description: "HH:MM" }, end: { type: "string", description: "HH:MM" }, to_date: { type: "string", description: "YYYY-MM-DD, to move it to another day" }, reset: { type: "boolean" } }, required: ["date", "key"] } },
   { name: "skip_block", description: "Cancel a block for one date (no make-up is created), or put it back with skip: false.", input_schema: { type: "object", properties: { date: { type: "string", description: "YYYY-MM-DD" }, key: { type: "string" }, skip: { type: "boolean" } }, required: ["date", "key"] } },
+  { name: "set_day_off", description: "Make a whole date a day off, like a rest day: nothing that date counts as late and nothing turns into a make-up. off: false makes the date count again.", input_schema: { type: "object", properties: { date: { type: "string", description: "YYYY-MM-DD" }, off: { type: "boolean" } }, required: ["date"] } },
   { name: "check_block", description: "Mark a block in today's plan done, or not done with done: false. Checking off court time logs a session.", input_schema: { type: "object", properties: { key: { type: "string" }, done: { type: "boolean" } }, required: ["key"] } },
   { name: "add_event", description: "Add a one-off item to one date: an appointment, a demo, a flight, extra pickleball or a gym session. It shows in that day's plan and nudges Logan. Use kind \"session\" with session_type for pickleball so it counts toward the week. Times are 24-hour HH:MM; end defaults to an hour after start.", input_schema: { type: "object", properties: { title: { type: "string" }, date: { type: "string", description: "YYYY-MM-DD" }, start: { type: "string", description: "HH:MM" }, end: { type: "string", description: "HH:MM" }, kind: { type: "string", enum: ONEOFF_KINDS }, session_type: { type: "string", enum: SESSION_TYPES }, label: { type: "string", description: "Optional short tag shown in caps, like DEMO" }, where: { type: "string" }, notes: { type: "string" } }, required: ["title", "date", "start"] } },
   { name: "update_event", description: "Change or remove a one-off item by its id (the part after ev- in its key).", input_schema: { type: "object", properties: { id: { type: "string" }, title: { type: "string" }, date: { type: "string" }, start: { type: "string" }, end: { type: "string" }, kind: { type: "string", enum: ONEOFF_KINDS }, session_type: { type: "string", enum: SESSION_TYPES }, where: { type: "string" }, notes: { type: "string" }, remove: { type: "boolean" } }, required: ["id"] } },
@@ -115,11 +116,11 @@ export function buildContext(d: any, today: string, now: string, tz: string) {
   const sched = (cfg.schedule || {}).days || {};
   const days = d.days || {}, tasks = d.tasks || {}, leads = d.leads || {}, events = d.events || {}, sessions = d.sessions || {}, dupr = d.dupr || {}, weeks = d.weeks || {};
   const restDays = Array.isArray(profile.restDays) ? profile.restDays : ["Sun"];
-  const dow = dowOf(today), rest = restDays.includes(dow);
-  const day = days[today] || {}, checks = day.checks || {};
+  const dow = dowOf(today), day = days[today] || {}, checks = day.checks || {};
+  const rest = restDays.includes(dow) || !!day.off;
   const dialsFor = (dd: any, region: string) => ((dd && dd.calls) || []).filter((c: any) => c.dial && (!region || c.region === region)).length;
   const lines: string[] = [];
-  lines.push(`Today is ${DOW_LONG[dow]} ${today}, ${fmtTap(now)} in ${tz}.${rest ? " Today is a rest day: nothing counts as late." : ""}`);
+  lines.push(`Today is ${DOW_LONG[dow]} ${today}, ${fmtTap(now)} in ${tz}.${day.off ? " Today is a day off: nothing counts as late." : rest ? " Today is a rest day: nothing counts as late." : ""}`);
   const gate = profile.gate || {};
   lines.push(`Logan. Move to Scottsdale on ${profile.moveDate || "?"}. Gate on ${gate.date || "?"}: ${money(gate.saved)} saved and ${money(gate.monthly)} a month signed. DUPR start ${profile.duprStart || "?"}, checkpoints ${(profile.duprCheckpoints || []).map((c: any) => `${c.target} by ${c.date}`).join(", ") || "-"}. Start weight ${profile.startWeight || "?"} lb, goal weight ${profile.goalWeight || "not set"}. Rest days: ${restDays.join(", ")}.`);
   lines.push(`Weekly targets: dials ${T.dials}, owner conversations ${T.convos}, demos ${T.demos}, proposals ${T.proposals}, deals ${T.deals}, mockups ${T.mockups}, DMs ${T.dms}, drill sessions ${T.drill}, competitive sessions ${T.competitive}, gym ${T.gym}, mobility ${T.mobility} min, pro video ${T.proMinutes} min.`);
@@ -137,10 +138,10 @@ export function buildContext(d: any, today: string, now: string, tz: string) {
   else lines.push("Morning check-in: not saved yet today.");
   if (day.pm && day.pm.savedAt) lines.push(`Evening check-out saved. Win: ${day.pm.win || "-"}. Fix for tomorrow: ${day.pm.fix || "-"}.`);
   const tm = addDays(today, 1);
-  lines.push(`TOMORROW'S PLAN (${dowOf(tm)} ${tm}):\n` + (itemsForDay(d, tm).map((i: any) => planLine(i, tm, false)).join("\n") || "- nothing planned"));
+  lines.push(`TOMORROW'S PLAN (${dowOf(tm)} ${tm}${(days[tm] || {}).off ? ", a day off" : ""}):\n` + (itemsForDay(d, tm).map((i: any) => planLine(i, tm, false)).join("\n") || "- nothing planned"));
   const later: string[] = [];
   for (let n = 2; n <= 7; n++) {
-    const dd = addDays(today, n), x = days[dd] || {}, bits: string[] = [];
+    const dd = addDays(today, n), x = days[dd] || {}, bits: string[] = x.off ? ["day off"] : [];
     for (const [k, m] of Object.entries(x.moves || {}) as any) if (m && m.start) bits.push(`[${k}] moved to ${m.start}-${m.end || m.start}`);
     for (const [k, v] of Object.entries(x.skips || {})) if (v) bits.push(`[${k}] off`);
     for (const [id, e] of Object.entries(events) as any) if (e && e.date === dd && e.start) bits.push(`[ev-${id}] ${e.start}-${e.end || e.start} ${e.title}${e.kind && e.kind !== "event" ? ` (${e.kind === "session" ? e.sessionType || "court time" : e.kind})` : ""}`);
@@ -253,6 +254,11 @@ export async function runTool(store: any, name: string, input: any, today: strin
       const skip = input.skip !== false;
       await patch("days", date, { date, skips: { [key]: skip } });
       return { result: skip ? `[${key}] is off ${date}` : `[${key}] is back on ${date}`, action: `${skip ? "Took" : "Put"} ${nameOf(it)} ${skip ? "off" : "back on"} ${fmtDay(date)}` };
+    }
+    case "set_day_off": {
+      const date = dateOf(input.date), off = input.off !== false;
+      await patch("days", date, { date, off });
+      return { result: off ? `${date} is a day off` : `${date} counts again`, action: off ? `Made ${fmtDay(date)} a day off` : `${fmtDay(date)} counts again` };
     }
     case "check_block": {
       const key = String(input.key || "");
