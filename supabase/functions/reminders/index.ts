@@ -19,9 +19,9 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 import * as webpush from "jsr:@negrel/webpush@0.5.0";
 
 // ---- pure logic (plain JavaScript; the Node test imports this section) ----
-export const FN_VERSION = 2;
+export const FN_VERSION = 3;
 export const KIND_LABEL: any = { marker: "", task: "Task", checkin: "Check-in", checkout: "Check-out", calls: "Calls", session: "Court time", gym: "Gym", mobility: "Mobility", watch: "Pro video", dupr: "DUPR", event: "Event" };
-export const ONEOFF_TAG: any = { event: "EVENT", task: "TO-DO", gym: "GYM", mobility: "MOBILITY", watch: "STUDY", marker: "NOTE" };
+export const ONEOFF_TAG: any = { event: "EVENT", task: "TO-DO", gym: "GYM", mobility: "MOBILITY", watch: "STUDY", marker: "NOTE", calls: "CALLS" };
 // Weekday, local date and minutes since midnight in the device's time zone.
 export function localClock(tz: any, date: any = new Date()) {
   let parts: any[];
@@ -44,7 +44,8 @@ export function itemsForDay(schedule: any, dow: any, day: any, events: any) {
   const extra = (events || []).filter((e: any) => e && e.start).map((e: any) => {
     const kind = e.kind && e.kind !== "event" ? e.kind : "event";
     return { key: "ev-" + e.id, start: e.start, end: e.end, kind, oneoff: true, text: `${e.title}${e.where ? " at " + e.where : ""}`,
-      tag: kind === "session" ? (e.sessionType || "Court time") : (ONEOFF_TAG[kind] || "EVENT") };
+      tag: e.tag || (kind === "session" ? (e.sessionType || "Court time") : (ONEOFF_TAG[kind] || "EVENT")),
+      quota: kind === "calls" ? (Number(e.quota) || 10) : undefined, region: kind === "calls" ? (e.region || "") : undefined };
   });
   return [...base, ...extra];
 }

@@ -17,13 +17,13 @@ import Anthropic from "npm:@anthropic-ai/sdk@0.131.0";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
 // ---- pure logic (no imports; the Deno test imports this section) ----
-export const FN_VERSION = 2;
+export const FN_VERSION = 3;
 export const MODEL = "claude-opus-5-5";
 const AREAS = ["Sales", "Build", "Pickleball", "Body", "Money", "Move", "DoD", "Fix", "Other"];
 const SESSION_TYPES = ["Drill", "Competitive", "Rec play", "Tournament", "Lesson"];
 const WEEKLY_KINDS = ["task", "session", "gym", "mobility", "watch", "calls", "marker"];
 const ONEOFF_KINDS = ["event", "session", "task", "gym", "mobility", "watch", "marker"];
-const ONEOFF_TAG: any = { event: "EVENT", task: "TO-DO", gym: "GYM", mobility: "MOBILITY", watch: "STUDY", marker: "NOTE" };
+const ONEOFF_TAG: any = { event: "EVENT", task: "TO-DO", gym: "GYM", mobility: "MOBILITY", watch: "STUDY", marker: "NOTE", calls: "CALLS" };
 const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const WEEK = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const DOW_LONG: any = { Sun: "Sunday", Mon: "Monday", Tue: "Tuesday", Wed: "Wednesday", Thu: "Thursday", Fri: "Friday", Sat: "Saturday" };
@@ -61,10 +61,12 @@ export function oneoffItem(id: string, e: any) {
   const kind = e.kind && e.kind !== "event" ? e.kind : "event";
   const mins = Math.max(0, toMin(e.end || e.start) - toMin(e.start));
   return { key: "ev-" + id, eventId: id, oneoff: true, start: e.start, end: e.end || e.start, kind,
-    tag: kind === "session" ? (e.sessionType || "Court time") : (ONEOFF_TAG[kind] || "EVENT"),
+    tag: e.tag || (kind === "session" ? (e.sessionType || "Court time") : (ONEOFF_TAG[kind] || "EVENT")),
     text: e.title + (e.where ? " at " + e.where : ""),
     sessionType: kind === "session" ? (e.sessionType || "Drill") : undefined,
-    hours: kind === "session" ? (Math.round(mins / 30) / 2 || 1) : undefined };
+    hours: kind === "session" ? (Math.round(mins / 30) / 2 || 1) : undefined,
+    quota: kind === "calls" ? (Number(e.quota) || 10) : undefined, region: kind === "calls" ? (e.region || "") : undefined,
+    movedFromDay: e.from && e.from.date ? e.from.date : undefined };
 }
 // A date's plan: the weekly plan for its weekday with that date's moves, plus one-off items.
 export function itemsForDay(d: any, date: string) {
@@ -81,8 +83,8 @@ How to talk: plain, direct, second person, short. Lead with the answer. Use the 
 
 The schedule has two layers:
 - The weekly plan repeats every week, one list per weekday.
-- One-off changes apply to a single date: move_block (a new time), skip_block (off that date), add_event (an extra item that date).
-When Logan names a date or says today, tomorrow or a weekday, change only that date. Change the weekly plan (edit_weekly_block, add_weekly_block, remove_weekly_block) only when Logan says every, always, each week or from now on, or asks to change the routine. Use the keys exactly as the context shows them.
+- One-off changes apply to a single date: move_block (a new time, or to_date to move it to another day), skip_block (cancel it for that date), add_event (an extra item that date).
+"Cancel", "skip", "drop it today" and "not doing X today" all mean skip_block. "Reschedule", "move" and "push back" mean move_block. When Logan names a date or says today, tomorrow or a weekday, change only that date. Change the weekly plan (edit_weekly_block, add_weekly_block, remove_weekly_block) only when Logan says every, always, each week or from now on, or asks to change the routine. Use the keys exactly as the context shows them.
 
 When you move or add something, look at that day's plan for overlaps. If Logan asked to make room, move or skip the blocks in the way yourself; otherwise say in one line what it overlaps and offer to fix it. Pickleball is court time: add it with kind "session" and the right session_type so it counts toward the week. When Logan says something is done, check it off with check_block, then use log_session for a record or notes. Use log_checkin for weight, sleep, energy, top 3 and the morning note.
 
@@ -92,10 +94,10 @@ Coaching: when Logan asks what to focus on, point at the next block, the numbers
 
 const DAYS_PROP = { type: "array", items: { type: "string", enum: WEEK }, description: "Weekdays, like [\"Mon\",\"Wed\"]" };
 export const TOOLS: any[] = [
-  { name: "move_block", description: "Move a block on one date only; the weekly plan stays the same. key is the [key] from the plan. If end is left out the block keeps its length. reset: true puts it back at its usual time. Works for one-off items (keys starting ev-) too.", input_schema: { type: "object", properties: { date: { type: "string", description: "YYYY-MM-DD" }, key: { type: "string" }, start: { type: "string", description: "HH:MM" }, end: { type: "string", description: "HH:MM" }, reset: { type: "boolean" } }, required: ["date", "key"] } },
-  { name: "skip_block", description: "Take a block off one date (no make-up is created), or put it back with skip: false.", input_schema: { type: "object", properties: { date: { type: "string", description: "YYYY-MM-DD" }, key: { type: "string" }, skip: { type: "boolean" } }, required: ["date", "key"] } },
+  { name: "move_block", description: "Reschedule a block on one date only; the weekly plan stays the same. key is the [key] from the plan. If end is left out the block keeps its length. reset: true puts it back at its usual time. to_date moves it to another day instead: it is canceled on date and added there as a one-off (start optional, it keeps its time). Works for one-off items (keys starting ev-) too.", input_schema: { type: "object", properties: { date: { type: "string", description: "YYYY-MM-DD" }, key: { type: "string" }, start: { type: "string", description: "HH:MM" }, end: { type: "string", description: "HH:MM" }, to_date: { type: "string", description: "YYYY-MM-DD, to move it to another day" }, reset: { type: "boolean" } }, required: ["date", "key"] } },
+  { name: "skip_block", description: "Cancel a block for one date (no make-up is created), or put it back with skip: false.", input_schema: { type: "object", properties: { date: { type: "string", description: "YYYY-MM-DD" }, key: { type: "string" }, skip: { type: "boolean" } }, required: ["date", "key"] } },
   { name: "check_block", description: "Mark a block in today's plan done, or not done with done: false. Checking off court time logs a session.", input_schema: { type: "object", properties: { key: { type: "string" }, done: { type: "boolean" } }, required: ["key"] } },
-  { name: "add_event", description: "Add a one-off item to one date: an appointment, a demo, a flight, extra pickleball or a gym session. It shows in that day's plan and nudges Logan. Use kind \"session\" with session_type for pickleball so it counts toward the week. Times are 24-hour HH:MM; end defaults to an hour after start.", input_schema: { type: "object", properties: { title: { type: "string" }, date: { type: "string", description: "YYYY-MM-DD" }, start: { type: "string", description: "HH:MM" }, end: { type: "string", description: "HH:MM" }, kind: { type: "string", enum: ONEOFF_KINDS }, session_type: { type: "string", enum: SESSION_TYPES }, where: { type: "string" }, notes: { type: "string" } }, required: ["title", "date", "start"] } },
+  { name: "add_event", description: "Add a one-off item to one date: an appointment, a demo, a flight, extra pickleball or a gym session. It shows in that day's plan and nudges Logan. Use kind \"session\" with session_type for pickleball so it counts toward the week. Times are 24-hour HH:MM; end defaults to an hour after start.", input_schema: { type: "object", properties: { title: { type: "string" }, date: { type: "string", description: "YYYY-MM-DD" }, start: { type: "string", description: "HH:MM" }, end: { type: "string", description: "HH:MM" }, kind: { type: "string", enum: ONEOFF_KINDS }, session_type: { type: "string", enum: SESSION_TYPES }, label: { type: "string", description: "Optional short tag shown in caps, like DEMO" }, where: { type: "string" }, notes: { type: "string" } }, required: ["title", "date", "start"] } },
   { name: "update_event", description: "Change or remove a one-off item by its id (the part after ev- in its key).", input_schema: { type: "object", properties: { id: { type: "string" }, title: { type: "string" }, date: { type: "string" }, start: { type: "string" }, end: { type: "string" }, kind: { type: "string", enum: ONEOFF_KINDS }, session_type: { type: "string", enum: SESSION_TYPES }, where: { type: "string" }, notes: { type: "string" }, remove: { type: "boolean" } }, required: ["id"] } },
   { name: "edit_weekly_block", description: "Change a block of the weekly plan on the listed weekdays: times, label, details, type or the make-up flag. Only the fields you pass change; a new start without an end keeps each day's length. Weekdays that don't have the block get a copy.", input_schema: { type: "object", properties: { key: { type: "string" }, days: DAYS_PROP, start: { type: "string" }, end: { type: "string" }, label: { type: "string" }, details: { type: "string" }, kind: { type: "string", enum: WEEKLY_KINDS }, session_type: { type: "string", enum: SESSION_TYPES }, carry: { type: "boolean", description: "If missed, it comes back the next day as a make-up" } }, required: ["key", "days"] } },
   { name: "add_weekly_block", description: "Add a new block to the weekly plan on the listed weekdays.", input_schema: { type: "object", properties: { days: DAYS_PROP, start: { type: "string" }, end: { type: "string" }, label: { type: "string", description: "Short name shown in caps, like GYM" }, details: { type: "string" }, kind: { type: "string", enum: WEEKLY_KINDS }, session_type: { type: "string", enum: SESSION_TYPES }, carry: { type: "boolean" } }, required: ["days", "start", "label"] } },
@@ -206,6 +208,24 @@ export async function runTool(store: any, name: string, input: any, today: strin
       const it: any = itemsForDay(d, date).find((i: any) => i.key === key);
       if (!it) return err(`no block [${key}] on ${date}`);
       const len = Math.max(0, toMin(it.end || it.start) - toMin(it.start));
+      if (isDate(input.to_date) && input.to_date !== date) {
+        const start = isTime(input.start) ? input.start : it.start;
+        const end = isTime(input.end) ? input.end : hhmm(toMin(start) + len);
+        if (toMin(end) < toMin(start)) return err("end is before start");
+        if (it.oneoff) {
+          const e = (d.events || {})[it.eventId]; if (!e) return err("that one-off item is gone");
+          await put("events", it.eventId, { ...e, date: input.to_date, start, end, updatedAt: Date.now() });
+          return { result: `moved [${key}] to ${input.to_date} ${start}-${end}`, action: `Moved ${nameOf(it)} to ${fmtDay(input.to_date)}, ${fmtTap(start)}` };
+        }
+        if (["checkin", "checkout", "dupr"].includes(it.kind)) return err("check-in, check-out and DUPR stay on their own day");
+        const id = "ev-" + uid36();
+        const doc: any = { title: it.text || it.tag || "Block", tag: it.tag || "", date: input.to_date, start, end, where: "", notes: "", kind: it.kind, from: { date, key }, createdAt: Date.now(), updatedAt: Date.now() };
+        if (it.kind === "session") doc.sessionType = it.sessionType || "Drill";
+        if (it.kind === "calls") { doc.quota = it.quota || 10; doc.region = it.region || ""; }
+        await put("events", id, doc);
+        await patch("days", date, { date, skips: { [key]: true } });
+        return { result: `moved [${key}] to ${input.to_date} as [ev-${id}]; canceled on ${date}`, action: `Moved ${nameOf(it)} to ${fmtDay(input.to_date)}, ${fmtTap(start)}` };
+      }
       if (it.oneoff) {
         const e = (d.events || {})[it.eventId]; if (!e) return err("that one-off item is gone");
         if (!isTime(input.start)) return err("start (HH:MM) is required for a one-off item");
@@ -257,6 +277,7 @@ export async function runTool(store: any, name: string, input: any, today: strin
       if (toMin(end) < toMin(input.start)) return err("end is before start");
       const id = "ev-" + uid36();
       const doc: any = { title, date: input.date, start: input.start, end, where: str(input.where), notes: str(input.notes), createdAt: Date.now(), updatedAt: Date.now() };
+      if (str(input.label)) doc.tag = str(input.label);
       if (ONEOFF_KINDS.includes(input.kind) && input.kind !== "event") { doc.kind = input.kind; if (input.kind === "session") doc.sessionType = SESSION_TYPES.includes(input.session_type) ? input.session_type : "Rec play"; }
       await put("events", id, doc);
       return { result: `added [ev-${id}]`, action: `Added ${title}: ${fmtDay(input.date)}, ${fmtTap(input.start)}–${fmtTap(end)}` };
