@@ -10,12 +10,13 @@ import { supabase, config as sbConfig, configSource, saveConfig, clearConfig } f
 import { createDb } from './db.js';
 import REMINDERS_FN from '../supabase/functions/reminders/index.ts?raw';
 import CRON_SQL from '../supabase/functions/reminders/cron.sql?raw';
+import ASSISTANT_FN from '../supabase/functions/assistant/index.ts?raw';
 
 (() => {
 'use strict';
 
 /* ---------- constants ---------- */
-const COLS = ['config','days','tasks','leads','sessions','dupr','weeks','meta','push'];
+const COLS = ['config','days','tasks','leads','sessions','dupr','weeks','meta','push','events','chat'];
 const VIEWS = [['today','Today'],['calls','Calls'],['week','Week'],['log','Log'],['plan','Plan']];
 const ICONS = {
   today: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15.5" rx="2.5"/><path d="M3.5 10h17M8 3v4M16 3v4"/><path d="m9.5 15 2 2 3.5-3.5"/></svg>',
@@ -59,13 +60,14 @@ const WEEK_ORDER = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
 /* ---------- state ---------- */
 const S = {
   dbState:'loading', err:null,
-  data:{config:{},days:{},tasks:{},leads:{},sessions:{},dupr:{},weeks:{},meta:{},push:{}},
+  data:{config:{},days:{},tasks:{},leads:{},sessions:{},dupr:{},weeks:{},meta:{},push:{},events:{},chat:{}},
   got:{},
   view:'today', drafts:{}, openItem:null, editAM:false, editPM:false,
   callFilter:'due', search:'', leadForm:null,
   weekOffset:0, weekDay:null, modal:null, toast:null, lastUndo:null, confirm:null,
   sync:null, email:'', installEvt:null, installDismissed:undefined, updateApp:null,
-  connectBusy:false, connectErr:null, loginBusy:false, loginErr:null, notif:null, notifBusy:false, callMode:null
+  connectBusy:false, connectErr:null, loginBusy:false, loginErr:null, notif:null, notifBusy:false, callMode:null,
+  chatBusy:false, chatErr:null, listening:false, assist:null
 };
 let db = null;
 let theme = 'auto';
@@ -126,6 +128,10 @@ const roadmap = () => ((cfg().roadmap || {}).weeks || []).slice().sort((a,b) => 
 const roadmapFor = d => { let cur = null; roadmap().forEach(w => { if (w.start <= d) cur = w; }); return cur; };
 const dayOf = d => S.data.days[d] || {};
 const restDays = () => { const r = profile().restDays; return Array.isArray(r) ? r : ['Sun']; };
+const eventsOn = d => Object.entries(S.data.events || {}).map(([id, e]) => ({id, ...e})).filter(e => e.date === d && e.start).sort((a,b) => a.start < b.start ? -1 : 1);
+const eventItem = e => ({key:'ev-' + e.id, start:e.start, end:e.end || e.start, tag:'EVENT', text:e.title + (e.where ? ' · ' + e.where : ''), kind:'event', eventId:e.id, notes:e.notes});
+// Everything on a given day: the weekly schedule plus one-off calendar events, in time order.
+const itemsFor = d => [...scheduleFor(d), ...eventsOn(d).map(eventItem)].sort((a,b) => toMin(a.start) - toMin(b.start));
 const isRestDay = d => restDays().includes(dowOf(d));
 const isCheckable = i => i.kind !== 'marker';
 const dialsFor = (d, region) => (dayOf(d).calls || []).filter(c => c.dial && (!region || c.region === region)).length;
@@ -316,6 +322,8 @@ function renderHeader() {
     (days !== null ? `<div class="count"><b>${days}</b><span>days to<br>Scottsdale</span></div>` : '');
 }
 function renderTabs() {
+  const fab = document.getElementById('fab');
+  if (fab) fab.hidden = !(S.dbState === 'ok' && allLoaded() && cfg().schedule);
   if (S.dbState !== 'ok') { document.getElementById('tabs').innerHTML = ''; return; }
   const due = allLoaded() && !isRestDay(todayISO()) ? leadsDue(todayISO()).length : 0;
   document.getElementById('tabs').innerHTML = VIEWS.map(([k,l]) =>
@@ -324,7 +332,7 @@ function renderTabs() {
 
 /* ----- TODAY ----- */
 function viewToday() {
-  const t = todayISO(), day = dayOf(t), items = scheduleFor(t), rest = isRestDay(t);
+  const t = todayISO(), day = dayOf(t), items = itemsFor(t), rest = isRestDay(t);
   const checkable = items.filter(isCheckable);
   const doneN = checkable.filter(i => isDone(i, t)).length;
   const carried = tasksCarried(t), due = tasksDue(t), doneTasks = tasksDoneOn(t);
@@ -338,7 +346,7 @@ function viewToday() {
     rest ? `<div class="rest-banner ord-2"><div class="eyebrow">Rest day</div><b>Church, rest and pickleball.</b><div class="meta">Nothing counts as late today.${carried.length ? ` ${plural(carried.length,'to-do')} will be waiting for you tomorrow.` : ''}</div></div>` : '',
     `<div class="progress ord-3 ${pct === 100 ? 'good' : ''}"><div class="bar"><i style="width:${pct}%"></i></div><span class="meta mono">${doneN}/${checkable.length} blocks</span>${behind ? `<span class="pill warn">${behind} behind</span>` : ''}${carried.length && !rest ? `<span class="pill bad">${carried.length} carried over</span>` : ''}</div>`,
     nowCard(items, t),
-    `<section class="card ord-7"><div class="card-h"><h2>Today's plan</h2><span class="meta">${esc(dowOf(t))} schedule</span></div>${items.map(i => planRow(i, t, day)).join('')}</section>`,
+    `<section class="card ord-7"><div class="card-h"><h2>Today's plan</h2><div class="btnrow"><span class="meta">${esc(dowOf(t))} schedule</span><button class="btn sm ghost" data-act="event-new" data-date="${t}">+ Event</button></div></div>${items.map(i => planRow(i, t, day)).join('')}</section>`,
   ];
   const side = [
     amCard(t, day),
@@ -356,7 +364,7 @@ function tipBanner() {
   let done = false; try { done = !!localStorage.getItem('lcc-tip-done'); } catch(e) {}
   if (done) return '';
   const desktop = window.matchMedia && matchMedia('(min-width: 980px)').matches;
-  return `<div class="tip"><span><b>Tap any block, to-do or number</b> for the story behind it.${desktop ? ' Keys: <kbd>1</kbd>–<kbd>5</kbd> tabs, <kbd>/</kbd> search leads, <kbd>n</kbd> new to-do, <kbd>c</kbd> start calling.' : ' During a call block, tap <b>Start calling</b> and work one lead at a time.'}</span><button class="btn sm ghost" data-act="tip-done">Got it</button></div>`;
+  return `<div class="tip"><span><b>Tap any block, to-do or number</b> for the story behind it.${desktop ? ' Keys: <kbd>1</kbd>–<kbd>5</kbd> tabs, <kbd>/</kbd> search leads, <kbd>n</kbd> new to-do, <kbd>e</kbd> new event, <kbd>c</kbd> start calling, <kbd>a</kbd> ask.' : ' During a call block, tap <b>Start calling</b> and work one lead at a time.'}</span><button class="btn sm ghost" data-act="tip-done">Got it</button></div>`;
 }
 function nowCard(items, t) {
   const m = nowMin();
@@ -410,7 +418,7 @@ function planRow(i, t, day) {
       : `<button class="btn sm" data-act="skip" data-key="${esc(i.key)}" data-on="1">Skip today (no make-up)</button>`}</div>` : '';
   return `<div class="row ${!isCheckable(i) ? 'marker' : ''} ${done ? 'done' : ''} ${isNow ? 'is-now' : ''} ${late ? 'late' : ''}">
     <div class="time" data-act="block" data-key="${esc(i.key)}">${fmtT(i.start)}</div>${box}
-    <div class="txt" data-act="block" data-key="${esc(i.key)}" role="button" tabindex="0">${i.tag ? `<span class="tag">${esc(i.tag)}</span>` : ''}${esc(i.text)}${subs.map(s => `<div class="sub">${s}</div>`).join('')}</div>
+    <div class="txt" data-act="block" data-key="${esc(i.key)}" role="button" tabindex="0">${i.tag ? `<span class="tag ${i.kind === 'event' ? 'ev' : ''}">${esc(i.tag)}</span>` : ''}${esc(i.text)}${subs.map(s => `<div class="sub">${s}</div>`).join('')}</div>
     ${isCheckable(i) && !['checkin','checkout'].includes(i.kind) ? `<button class="more" data-act="item-menu" data-key="${esc(i.key)}" aria-label="More options">⋯</button>` : '<span></span>'}
     ${menu}</div>`;
 }
@@ -824,15 +832,33 @@ function exportCalendar(lead) {
       lines.push('END:VEVENT');
     });
   });
+  Object.entries(S.data.events || {}).map(([id, e]) => ({id, ...e})).filter(e => e.date && e.start && e.date >= addDays(todayISO(), -7)).forEach(e => lines.push(...eventLines(e, stamp, lead, fold, icsEsc)));
   lines.push('END:VCALENDAR');
   downloadText('life-command-center.ics', lines.join('\r\n') + '\r\n', 'text/calendar');
+}
+function eventLines(e, stamp, lead, fold, icsEsc) {
+  const d = e.date.replace(/-/g, ''), title = e.title + (e.where ? ' at ' + e.where : '');
+  const out = ['BEGIN:VEVENT', `UID:lcc-ev-${e.id}@life-command-center`, 'DTSTAMP:' + stamp, `DTSTART:${d}T${e.start.replace(':', '')}00`, `DTEND:${d}T${(e.end || e.start).replace(':', '')}00`, fold('SUMMARY:' + icsEsc(e.title)), fold('DESCRIPTION:' + icsEsc(e.notes || '')), 'CATEGORIES:Life Command Center'];
+  if (e.where) out.push(fold('LOCATION:' + icsEsc(e.where)));
+  if (lead !== null) out.push('BEGIN:VALARM', 'ACTION:DISPLAY', fold('DESCRIPTION:' + icsEsc(title)), `TRIGGER:-PT${lead}M`, 'END:VALARM');
+  out.push('END:VEVENT');
+  return out;
+}
+function exportEvent(id) {
+  const e = (S.data.events || {})[id]; if (!e || !e.date || !e.start) return;
+  const icsEsc = s => String(s || '').replace(/\\/g, '\\\\').replace(/;/g, '\\;').replace(/,/g, '\\,').replace(/\r?\n/g, '\\n');
+  const fold = line => { const out = []; let s = line; while (s.length > 73) { out.push(s.slice(0, 73)); s = ' ' + s.slice(73); } out.push(s); return out.join('\r\n'); };
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
+  const lines = ['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//Life Command Center//EN','CALSCALE:GREGORIAN','METHOD:PUBLISH', ...eventLines({id, ...e}, stamp, 10, fold, icsEsc), 'END:VCALENDAR'];
+  downloadText(`${String(e.title || 'event').replace(/[^\w]+/g, '-').slice(0, 40)}.ics`, lines.join('\r\n') + '\r\n', 'text/calendar');
 }
 
 /* ----- PLAN ----- */
 function viewPlan() {
   const t = todayISO(), p = profile();
   const upcoming = liveTasks().filter(x => !x.done && !x.dropped && x.due && x.due >= t).sort((a,b) => a.due < b.due ? -1 : a.due > b.due ? 1 : 0);
-  const groups = {}; upcoming.forEach(x => { (groups[x.due] = groups[x.due] || []).push(x); });
+  const groups = {}; upcoming.forEach(x => { (groups[x.due] = groups[x.due] || {tasks:[], events:[]}).tasks.push(x); });
+  Object.entries(S.data.events || {}).map(([id, e]) => ({id, ...e})).filter(e => e.date && e.date >= t && e.date <= addDays(t, 90)).sort((a,b) => (a.start || '') < (b.start || '') ? -1 : 1).forEach(e => { (groups[e.date] = groups[e.date] || {tasks:[], events:[]}).events.push(e); });
   const recent = liveTasks().filter(x => x.done && x.doneOn && x.doneOn >= addDays(t,-14)).sort((a,b) => a.doneOn < b.doneOn ? 1 : -1);
   const cur = roadmapFor(t);
   const rm = roadmap(), curIdx = cur ? rm.findIndex(w => w.start === cur.start) : 0;
@@ -841,9 +867,9 @@ function viewPlan() {
   return `
     ${planOverview(t)}
     <div class="two-eq"><div class="col">
-    <section class="card"><div class="card-h"><h2>Add a to-do</h2></div>${addTaskForm('pt', t)}</section>
+    <section class="card"><div class="card-h"><h2>Add a to-do</h2><button class="btn sm ghost" data-act="event-new">+ Event</button></div>${addTaskForm('pt', t)}</section>
     <section class="card"><div class="card-h"><h2>Coming up</h2><span class="meta">${plural(upcoming.length,'to-do')}</span></div>
-      ${Object.keys(groups).length ? Object.entries(groups).map(([d, xs]) => `<h3>${d === t ? 'Today' : esc(fmtDay(d))}</h3>${xs.map(x => `<div class="trow"><button class="ck" data-act="task-toggle" data-id="${esc(x.id)}" aria-label="Done: ${esc(x.title)}"></button><div class="min0"><div class="txt">${esc(x.title)}</div><div class="btnrow" style="margin-top:6px">${x.area ? `<span class="pill">${esc(x.area)}</span>` : ''}<input class="in" type="date" value="${esc(x.due)}" data-act="task-date" data-id="${esc(x.id)}" aria-label="Move date" style="width:auto;padding:4px 8px;font-size:14px"><button class="btn sm ghost" data-act="task-drop" data-id="${esc(x.id)}">Drop</button></div></div></div>`).join('')}`).join('') : '<div class="meta">Nothing scheduled.</div>'}</section></div>
+      ${Object.keys(groups).length ? Object.keys(groups).sort().map(d => { const g = groups[d]; return `<h3>${d === t ? 'Today' : esc(fmtDay(d))}</h3>${g.events.map(e => `<div class="trow ev"><span class="evdot" aria-hidden="true"></span><div class="min0"><div class="txt" data-act="event-edit" data-id="${esc(e.id)}" role="button" tabindex="0"><span class="mono">${fmtTap(e.start)}${e.end && e.end !== e.start ? '–' + fmtTap(e.end) : ''}</span> ${esc(e.title)}</div>${e.where ? `<div class="meta">${esc(e.where)}</div>` : ''}</div></div>`).join('')}${g.tasks.map(x => `<div class="trow"><button class="ck" data-act="task-toggle" data-id="${esc(x.id)}" aria-label="Done: ${esc(x.title)}"></button><div class="min0"><div class="txt" data-act="task-open" data-id="${esc(x.id)}" role="button" tabindex="0">${esc(x.title)}</div><div class="btnrow" style="margin-top:6px">${x.area ? `<span class="pill">${esc(x.area)}</span>` : ''}<input class="in" type="date" value="${esc(x.due)}" data-act="task-date" data-id="${esc(x.id)}" aria-label="Move date" style="width:auto;padding:4px 8px;font-size:14px"><button class="btn sm ghost" data-act="task-drop" data-id="${esc(x.id)}">Drop</button></div></div></div>`).join('')}`; }).join('') : '<div class="meta">Nothing scheduled.</div>'}</section></div>
     <section class="card"><div class="card-h"><h2>Roadmap</h2><span class="meta">To the move, then DUPR 5.5</span></div>
       ${past.length ? `<details><summary>Earlier weeks (${past.length})</summary>${past.map(roadRow).join('')}</details>` : ''}${ahead.map(roadRow).join('')}</section></div>
     ${recent.length ? `<section class="card"><details><summary>Done in the last 2 weeks (${recent.length})</summary>${recent.map(x => taskRow(x, t)).join('')}</details></section>` : ''}
@@ -991,22 +1017,24 @@ function settingsCard() {
       <button class="btn sm" data-act="sync-now">Sync now</button></div>
     <div class="srow"><div class="lbl">Reminders<small>${pushDoc() && pushDoc().enabled ? 'Phone notifications are on for this device.' : 'Calendar alarms need no setup. Phone notifications take a one-time, three-step setup.'}</small></div>
       <div class="btnrow"><button class="btn sm" data-act="calendar">Add to calendar</button><button class="btn sm ${pushDoc() && pushDoc().enabled ? '' : 'primary'}" data-act="notif-setup">Phone notifications</button></div></div>
+    <div class="srow"><div class="lbl">Assistant<small>Talk to Claude inside the app. It sees your plan and numbers and can add to-dos and events. One-time, three-step setup with your own Anthropic key.</small></div>
+      <div class="btnrow"><button class="btn sm" data-act="ask">Ask</button><button class="btn sm ghost" data-act="assistant-setup">Set up</button></div></div>
     <div class="srow"><div class="lbl">Fresh start<small>Begin the plan on a clean day: older to-dos move there, make-ups are dropped, Sundays rest.</small></div>
       <button class="btn sm" data-act="fresh-start">Set up</button></div>
     <div class="srow"><div class="lbl">Backup<small>Importing adds or replaces items with the same IDs. It never deletes anything. You can also drag a backup file onto the page.</small></div>
       <div class="btnrow"><button class="btn sm" data-act="export">Download</button>${importControl('btn sm')}</div></div>
     <div class="srow"><div class="lbl">Account<small>${esc(S.email || '')}</small></div>
       <div class="btnrow"><button class="btn sm ghost" data-act="signout">Sign out</button>${configSource === 'device' ? '<button class="btn sm ghost" data-act="disconnect">Disconnect</button>' : ''}</div></div>
-    <div class="meta" style="margin-top:10px">Laptop keys: <span class="kbd">1</span>–<span class="kbd">5</span> tabs · <span class="kbd">/</span> search leads · <span class="kbd">n</span> new to-do · <span class="kbd">c</span> start calling · <span class="kbd">Esc</span> close</div>
+    <div class="meta" style="margin-top:10px">Laptop keys: <span class="kbd">1</span>–<span class="kbd">5</span> tabs · <span class="kbd">/</span> search leads · <span class="kbd">n</span> new to-do · <span class="kbd">c</span> start calling · <span class="kbd">e</span> new event · <span class="kbd">a</span> ask · <span class="kbd">Esc</span> close</div>
     <div class="meta" style="margin-top:6px">Version ${esc(APP_VERSION)}${S.updateApp ? ' · <a data-act="update-app">Update ready, tap to reload</a>' : ''}</div>
   </section>`;
 }
 /* ----- detail sheets: tap anything for the story behind it ----- */
 const closeOnly = title => `<div class="card-h"><h2>${esc(title)}</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div><div class="meta">Nothing to show here right now.</div>`;
 const linkBtn = (name, label) => { const l = (profile().links || {})[name]; return l ? `<a class="btn sm" href="${esc(l)}" target="_blank" rel="noopener">${label}</a>` : ''; };
-const KIND_LABEL = {marker:'Marker', task:'Task block', checkin:'Check-in', checkout:'Check-out', calls:'Call block', session:'Court time', gym:'Gym', mobility:'Mobility', watch:'Study', dupr:'DUPR'};
+const KIND_LABEL = {marker:'Marker', task:'Task block', checkin:'Check-in', checkout:'Check-out', calls:'Call block', session:'Court time', gym:'Gym', mobility:'Mobility', watch:'Study', dupr:'DUPR', event:'Calendar event'};
 function blockSheet(key) {
-  const t = todayISO(), i = scheduleFor(t).find(x => x.key === key);
+  const t = todayISO(), i = itemsFor(t).find(x => x.key === key);
   if (!i) return closeOnly('Block');
   const done = isCheckable(i) && isDone(i, t), skipped = isSkipped(i, t), m = nowMin(), rest = isRestDay(t);
   const status = !isCheckable(i) ? '' : skipped ? '<span class="pill">Skipped today</span>' : done ? '<span class="pill good">Done</span>' : (toMin(i.end || i.start) <= m && !rest) ? '<span class="pill warn">Behind</span>' : (toMin(i.start) <= m ? '<span class="pill acc">Now</span>' : `<span class="pill">In ${fmtMins(toMin(i.start) - m)}</span>`);
@@ -1028,6 +1056,7 @@ function blockSheet(key) {
   else if (i.kind === 'checkout') panel = `<div class="btnrow"><button class="btn primary" data-act="goto" data-id="pm-card">Go to the check-out</button></div>`;
   else if (i.kind === 'dupr') { const dl = duprList(), last = dl[dl.length - 1]; panel = `<div class="auto"><div><b>${last ? num(last.rating).toFixed(3) : '–'}</b><span>latest DUPR</span></div></div><div class="btnrow"><button class="btn primary" data-act="view" data-v="log">Log today's DUPR</button></div>`; }
   else if (i.kind === 'task' && i.area) panel = `<div class="meta">Counts toward ${esc(i.area)}.${i.carry ? ' If it is not done today it comes back tomorrow as a make-up.' : ''}</div>`;
+  else if (i.kind === 'event') { const ev = (S.data.events || {})[i.eventId] || {}; panel = `${ev.notes ? `<p class="note">${esc(ev.notes)}</p>` : ''}<div class="btnrow"><button class="btn" data-act="event-edit" data-id="${esc(i.eventId)}">Edit event</button><button class="btn ghost" data-act="event-ics" data-id="${esc(i.eventId)}">Add to my calendar</button></div>`; }
   const acts = isCheckable(i) && !['checkin','checkout','dupr'].includes(i.kind)
     ? `<div class="btnrow">${done ? `<button class="btn ghost" data-act="check" data-key="${esc(key)}">Undo</button>` : `<button class="btn primary" data-act="check" data-key="${esc(key)}">Mark done</button>`}${skipped ? `<button class="btn" data-act="skip" data-key="${esc(key)}" data-on="0">Unskip</button>` : `<button class="btn ghost" data-act="skip" data-key="${esc(key)}" data-on="1">Skip today (no make-up)</button>`}</div>` : '';
   return `<div class="card-h"><h2>${esc(i.tag || kindLabel)}</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
@@ -1168,6 +1197,111 @@ function notifSheet() {
     ${st.msg && st.fn !== 'error' ? `<div class="${st.kind === 'ok' ? 'ok-box' : 'err'}">${esc(st.msg)}</div>` : ''}
     <div class="meta">Calendar alarms are the no-setup alternative: <a data-act="calendar">Add to calendar</a> gives you a weekly calendar with an alarm before every block.</div>`;
 }
+/* ----- calendar events ----- */
+function eventForm() {
+  const id = S.modal.id, e = (S.data.events || {})[id] || {date:S.modal.date || todayISO(), start:'', end:'', title:'', where:'', notes:''};
+  const isNew = !(S.data.events || {})[id];
+  const f = (k, def) => draft('ev-' + k, def);
+  return `<div class="card-h"><h2>${isNew ? 'Add to your calendar' : 'Edit event'}</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
+    <form class="stack" data-form="event-edit" data-id="${esc(id)}">
+      <div class="fld"><label for="ev-title">What</label><input class="in" id="ev-title" data-draft value="${esc(f('title', e.title))}" placeholder="Demo with Lisa, dentist, tournament…"></div>
+      <div class="grid3"><div class="fld"><label for="ev-date">Date</label><input class="in" type="date" id="ev-date" data-draft value="${esc(f('date', e.date))}"></div>
+        <div class="fld"><label for="ev-start">Starts</label><input class="in" type="time" id="ev-start" data-draft value="${esc(f('start', e.start))}"></div>
+        <div class="fld"><label for="ev-end">Ends</label><input class="in" type="time" id="ev-end" data-draft value="${esc(f('end', e.end))}"></div></div>
+      <div class="fld"><label for="ev-where">Where</label><input class="in" id="ev-where" data-draft value="${esc(f('where', e.where))}" placeholder="Address, Zoom, the courts"></div>
+      <div class="fld"><label for="ev-notes">Notes</label><textarea class="in" id="ev-notes" data-draft>${esc(f('notes', e.notes))}</textarea></div>
+      <div class="meta">It shows in that day's plan, counts as a block you can check off, nudges you like any block, and can be added to your phone's calendar.</div>
+      <div class="btnrow"><button class="btn primary" type="submit">${isNew ? 'Add event' : 'Save'}</button>${!isNew ? `<button class="btn" type="button" data-act="event-ics" data-id="${esc(id)}">Add to my calendar</button>${S.confirm === 'ev-del' ? `<button class="btn badb" type="button" data-act="event-delete" data-id="${esc(id)}">Yes, delete it</button>` : '<button class="btn ghost" type="button" data-act="confirm" data-c="ev-del">Delete</button>'}` : ''}</div>
+    </form>`;
+}
+
+/* ----- the assistant: talk to Claude inside the app ----- */
+const assistantUrl = () => sbConfig ? String(sbConfig.url).replace(/\/+$/, '') + '/functions/v1/assistant' : '';
+const coarsePointer = () => !!(window.matchMedia && matchMedia('(pointer: coarse)').matches);
+const chatDoc = () => (S.data.chat || {}).main || {messages:[]};
+const SR = typeof window !== 'undefined' ? (window.SpeechRecognition || window.webkitSpeechRecognition) : null;
+let recog = null;
+function fmtChat(text) {
+  return esc(text).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/^(?:- |• )(.*)$/gm, '<span class="li">$1</span>').replace(/\n/g, '<br>');
+}
+async function askAssistant(text) {
+  text = String(text || '').trim();
+  if (!text || S.chatBusy) return;
+  if (!assistantUrl()) { S.chatErr = 'Connect your Supabase project first.'; render(); return; }
+  const prev = (chatDoc().messages || []).slice(-40);
+  const history = prev.slice(-16).map(m => ({role:m.role, content:m.content}));
+  setDoc('chat', 'main', {messages:[...prev, {role:'user', content:text, at:Date.now()}].slice(-40)});
+  // Empty and blur the box before re-rendering: a focused field that is replaced fires a late
+  // change event, and the generic draft listener would put the sent text straight back.
+  const box = document.getElementById('chat-in'); if (box) { box.value = ''; box.blur(); }
+  S.chatBusy = true; S.chatErr = null; clearDrafts('chat-'); render(); clearDrafts('chat-'); chatScroll();
+  try {
+    const {data} = await supabase.auth.getSession();
+    const token = data && data.session && data.session.access_token;
+    if (!token) throw new Error('Sign out and back in, then try again.');
+    const now = new Date();
+    const r = await fetch(assistantUrl(), {method:'POST', headers:{'Content-Type':'application/json', 'Authorization':'Bearer ' + token},
+      body:JSON.stringify({message:text, history, tz:Intl.DateTimeFormat().resolvedOptions().timeZone, today:todayISO(), now:`${pad(now.getHours())}:${pad(now.getMinutes())}`})});
+    if (r.status === 404) throw new Error("The assistant isn't set up yet. Open Plan › This device › Assistant for the three steps.");
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.error) throw new Error(j.error || `The assistant answered ${r.status}.`);
+    const cur = chatDoc().messages || [];
+    setDoc('chat', 'main', {messages:[...cur, {role:'assistant', content:j.reply || '(no answer)', at:Date.now(), actions:j.actions || []}].slice(-40)});
+    if (j.actions && j.actions.length && db) db.refresh().catch(() => {});
+  } catch (e) { S.chatErr = (e && e.message) || "Couldn't reach the assistant. Check your connection."; }
+  S.chatBusy = false; render(); chatScroll();
+  if (S.modal && S.modal.type === 'chat' && !coarsePointer()) { const b = document.getElementById('chat-in'); if (b) b.focus(); }
+}
+function chatScroll() { setTimeout(() => { const el = document.getElementById('chat-log'); if (el) el.scrollTop = el.scrollHeight; }, 30); }
+function chatMic() {
+  if (!SR) return;
+  if (recog) { try { recog.stop(); } catch(e) {} recog = null; S.listening = false; render(); return; }
+  recog = new SR(); recog.lang = navigator.language || 'en-US'; recog.interimResults = true; recog.continuous = false;
+  let finalText = '';
+  recog.onresult = ev => { let interim = ''; for (let i = ev.resultIndex; i < ev.results.length; i++) { const t = ev.results[i][0].transcript; if (ev.results[i].isFinal) finalText += t; else interim += t; } const box = document.getElementById('chat-in'); if (box) { box.value = (finalText + interim).trim(); S.drafts['chat-in'] = box.value; } };
+  recog.onend = () => { recog = null; S.listening = false; const box = document.getElementById('chat-in'); if (box && box.value.trim() && finalText) askAssistant(box.value); else render(); };
+  recog.onerror = () => { recog = null; S.listening = false; S.chatErr = 'The microphone did not work. Check the browser permission and try again.'; render(); };
+  S.listening = true; render();
+  try { recog.start(); } catch(e) { recog = null; S.listening = false; render(); }
+}
+function chatSheet() {
+  const msgs = chatDoc().messages || [];
+  const sugg = ['What should I focus on right now?', "How's my week against the targets?", 'Who should I call first today?', 'Add a to-do for tomorrow: ', 'Put a demo on my calendar Thursday at 2'];
+  return `<div class="card-h"><h2>Ask</h2><div class="btnrow"><button class="btn sm ghost" data-act="chat-clear" ${msgs.length ? '' : 'disabled'}>Clear</button><button class="btn sm ghost" data-act="modal-close">Close</button></div></div>
+    <div class="chat" id="chat-log">
+      ${msgs.length ? msgs.map(m => `<div class="msg ${m.role}"><div class="bubble">${fmtChat(m.content)}</div>${m.actions && m.actions.length ? `<div class="done-acts">${m.actions.map(a => `<span class="pill good">${esc(a)}</span>`).join('')}</div>` : ''}</div>`).join('') : '<div class="meta">Ask about your day, your numbers or a lead, or tell me to add something. I can see your plan, to-dos, calls, calendar and week, and I can add to-dos and events for you.</div>'}
+      ${S.chatBusy ? '<div class="msg assistant"><div class="bubble thinking">Thinking…</div></div>' : ''}
+      ${S.chatErr ? `<div class="err">${esc(S.chatErr)}</div>` : ''}
+    </div>
+    ${!msgs.length && !S.chatBusy ? `<div class="chips">${sugg.map(s => `<button class="chip" data-act="chat-suggest" data-text="${esc(s)}">${esc(s)}</button>`).join('')}</div>` : ''}
+    <form class="chatbar" data-form="chat">
+      <textarea class="in" id="chat-in" rows="1" data-draft placeholder="${S.listening ? 'Listening…' : 'Type, or tap the mic'}">${esc(draft('chat-in'))}</textarea>
+      ${SR ? `<button type="button" class="btn ${S.listening ? 'primary' : ''}" data-act="chat-mic" aria-label="Dictate" title="Dictate">${S.listening ? '●' : '🎤'}</button>` : ''}
+      <button class="btn primary" type="submit" ${S.chatBusy ? 'disabled' : ''}>Send</button>
+    </form>`;
+}
+async function assistantCheck() {
+  S.assist = {...(S.assist || {}), checking:true}; render();
+  try {
+    const r = await fetch(assistantUrl() + '?status=1');
+    if (r.status === 404) S.assist = {fn:'missing'};
+    else if (r.status === 401 || r.status === 403) S.assist = {fn:'error', msg:'The function is there but still checks for a login. Open its settings and turn off "Verify JWT".'};
+    else if (!r.ok) S.assist = {fn:'error', msg:`The function answered ${r.status}.`};
+    else { const j = await r.json(); S.assist = {fn:'ok', hasKey:!!j.hasKey, model:j.model}; }
+  } catch (e) { S.assist = {fn:'error', msg:"Couldn't reach the function. Check your connection and that it is deployed."}; }
+  render();
+}
+function assistantSheet() {
+  const st = S.assist || {};
+  const step = (n, title, body, ok) => `<div class="step ${ok ? 'ok' : ''}"><div class="num">${ok ? '✓' : n}</div><div class="min0"><b>${title}</b><div class="meta" style="color:var(--ink-2)">${body}</div></div></div>`;
+  return `<div class="card-h"><h2>Assistant</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
+    <p class="meta" style="margin:0;color:var(--ink-2)">Talk to Claude inside the app. It runs in your own Supabase project with your own Anthropic key, sees your live data, and can add to-dos and calendar events for you. Three steps, once. If a request is ever declined by Anthropic's safety filters, it automatically retries on a fallback model.</p>
+    ${step(1, 'Get an Anthropic API key', 'At <b>console.anthropic.com</b>: add a few dollars of credit under Billing, then <b>Settings › API keys › Create key</b>. Copy it.', !!st.hasKey)}
+    ${step(2, 'Create the function', `In Supabase open <b>Edge Functions</b> › <b>Deploy a new function</b> › <b>Via Editor</b>. Name it <span class="kbd">assistant</span>, replace all the code with the copied code, and <b>Deploy</b>. Then open the function's <b>Settings</b> and turn <b>off</b> "Verify JWT".<div class="btnrow" style="margin-top:6px"><button class="btn sm" data-act="copy-assistant">Copy the code</button><button class="btn sm ghost" data-act="assistant-check">${st.checking ? 'Checking…' : 'Check'}</button>${st.fn === 'ok' ? '<span class="pill good">Found</span>' : st.fn === 'missing' ? '<span class="pill warn">Not found yet</span>' : st.fn === 'error' ? '<span class="pill bad">Problem</span>' : ''}</div>${st.fn === 'error' && st.msg ? `<div class="err" style="margin-top:6px">${esc(st.msg)}</div>` : ''}`, st.fn === 'ok')}
+    ${step(3, 'Give it the key', `In Supabase open <b>Edge Functions</b> › <b>Secrets</b> (or Project Settings › Edge Functions). Add a secret named <span class="kbd">ANTHROPIC_API_KEY</span> with the key from step 1. Then tap Check again.${st.fn === 'ok' ? (st.hasKey ? ' <span class="pill good">Key is set</span>' : ' <span class="pill warn">No key yet</span>') : ''}`, st.fn === 'ok' && !!st.hasKey)}
+    <div class="btnrow">${st.fn === 'ok' && st.hasKey ? '<button class="btn primary" data-act="ask">Open the assistant</button>' : ''}<span class="meta">Model: ${esc(st.model || 'claude-opus-5-5')}. Each question costs a few cents.</span></div>`;
+}
+
 /* ----- calling mode: one lead at a time ----- */
 function callSheet() {
   const t = todayISO(), cm = S.callMode || {}, m = nowMin();
@@ -1205,7 +1339,7 @@ function renderModal() {
   const el = document.getElementById('modal');
   if (!S.modal) { el.hidden = true; el.innerHTML = ''; return; }
   el.hidden = false;
-  el.innerHTML = `<div class="sheet" role="dialog" aria-modal="true">${S.modal.type === 'session' ? sessionForm() : S.modal.type === 'fresh' ? freshForm() : S.modal.type === 'block' ? blockSheet(S.modal.key) : S.modal.type === 'task' ? taskSheet(S.modal.id) : S.modal.type === 'mile' ? mileSheet(S.modal.id) : S.modal.type === 'stat' ? statSheet(S.modal.id) : S.modal.type === 'notif' ? notifSheet() : S.modal.type === 'call' ? callSheet() : leadEditForm()}</div>`;
+  el.innerHTML = `<div class="sheet" role="dialog" aria-modal="true">${S.modal.type === 'session' ? sessionForm() : S.modal.type === 'fresh' ? freshForm() : S.modal.type === 'block' ? blockSheet(S.modal.key) : S.modal.type === 'task' ? taskSheet(S.modal.id) : S.modal.type === 'mile' ? mileSheet(S.modal.id) : S.modal.type === 'stat' ? statSheet(S.modal.id) : S.modal.type === 'notif' ? notifSheet() : S.modal.type === 'call' ? callSheet() : S.modal.type === 'event' ? eventForm() : S.modal.type === 'chat' ? chatSheet() : S.modal.type === 'assist' ? assistantSheet() : leadEditForm()}</div>`;
 }
 function sessionForm() {
   const id = S.modal.id, s = S.data.sessions[id] || {date:todayISO(), type:'Drill', hours:2};
@@ -1273,7 +1407,7 @@ function setView(v) {
   render(); window.scrollTo(0, 0);
 }
 function toggleCheck(key) {
-  const t = todayISO(), i = scheduleFor(t).find(x => x.key === key); if (!i) return;
+  const t = todayISO(), i = itemsFor(t).find(x => x.key === key); if (!i) return;
   const day = dayOf(t), ch = day.checks || {};
   if (i.kind === 'calls' && !ch[key] && isDone(i, t)) { toast('Quota hit, so this block is already done.'); return; }
   const on = !ch[key];
@@ -1330,6 +1464,17 @@ function handle(act, el, ev) {
     case 'call-start': S.leadForm = null; S.callMode = {region:d.region || null, skipped:[]}; S.modal = {type:'call'}; render(); break;
     case 'call-skip': if (S.callMode) S.callMode.skipped = [...(S.callMode.skipped || []), d.id]; render(); break;
     case 'tip-done': try { localStorage.setItem('lcc-tip-done', '1'); } catch(e) {} render(); break;
+    case 'event-new': clearDrafts('ev-'); S.confirm = null; S.modal = {type:'event', id:'ev-' + Date.now().toString(36), date:d.date || todayISO()}; render(); break;
+    case 'event-edit': clearDrafts('ev-'); S.confirm = null; S.modal = {type:'event', id:d.id}; render(); break;
+    case 'event-delete': delDoc('events', d.id); closeModal(); toast('Event deleted.'); render(); break;
+    case 'event-ics': exportEvent(d.id); toast('Calendar file saved. Open it to add the event.'); break;
+    case 'ask': S.modal = {type:'chat'}; S.chatErr = null; render(); chatScroll(); setTimeout(() => { const b = document.getElementById('chat-in'); if (b && !coarsePointer()) b.focus(); }, 60); break;
+    case 'chat-suggest': if (/[:：]\s*$/.test(d.text)) { S.drafts['chat-in'] = d.text; render(); setTimeout(() => { const b = document.getElementById('chat-in'); if (b) { b.focus(); b.setSelectionRange(b.value.length, b.value.length); } }, 30); } else askAssistant(d.text); break;
+    case 'chat-clear': setDoc('chat', 'main', {messages:[]}); S.chatErr = null; render(); break;
+    case 'chat-mic': chatMic(); break;
+    case 'assistant-setup': S.modal = {type:'assist'}; render(); if (!S.assist) assistantCheck(); break;
+    case 'assistant-check': assistantCheck(); break;
+    case 'copy-assistant': navigator.clipboard.writeText(ASSISTANT_FN).then(() => toast('Function code copied. Paste it into the Supabase editor.'), () => toast("Couldn't copy. Open supabase/functions/assistant/index.ts in the repo instead.")); break;
     case 'undo': undo(); render(); break;
     case 'fresh-start': clearDrafts('fs-'); S.modal = {type:'fresh'}; render(); break;
     case 'block': S.openItem = null; S.modal = {type:'block', key:d.key}; render(); break;
@@ -1447,6 +1592,16 @@ function submit(form) {
       S.modal = null; clearDrafts('fs-');
       toast(`Fresh start on ${fmtDay(date)}. ${plural(moved,'to-do')} and ${plural(leadsMoved,'follow-up')} moved, ${plural(dropped,'make-up')} dropped.`); render(); break;
     }
+    case 'event-edit': {
+      const id = form.dataset.id, old = (S.data.events || {})[id] || {};
+      const title = String(v('ev-title')).trim(), date = v('ev-date'), start = v('ev-start'), end = v('ev-end');
+      if (!title) { toast('Give it a name first.'); return; }
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) { toast('Pick a date.'); return; }
+      if (!/^\d{2}:\d{2}$/.test(start)) { toast('Pick a start time.'); return; }
+      setDoc('events', id, {...old, title, date, start, end:/^\d{2}:\d{2}$/.test(end) ? end : '', where:String(v('ev-where')).trim(), notes:String(v('ev-notes')).trim(), createdAt:old.createdAt || Date.now(), updatedAt:Date.now()});
+      closeModal(); clearDrafts('ev-'); toast(old.title ? 'Event saved.' : `On your calendar: ${fmtDay(date)} at ${fmtTap(start)}.`); render(); break;
+    }
+    case 'chat': { const txt = v('chat-in'); askAssistant(txt); break; }
     case 'task-edit': {
       const id = form.dataset.id, x = S.data.tasks[id]; if (!x) { S.modal = null; render(); return; }
       const title = String(v('tk-title')).trim(); if (!title) { toast('Give it a name first.'); return; }
@@ -1468,7 +1623,7 @@ document.addEventListener('click', ev => {
   if (el.tagName === 'INPUT') return;
   ev.preventDefault();
   handle(el.dataset.act, el, ev);
-  if (!['goto','copy','view','undo','export','signout','retry','sync-now','install','update-app','disconnect','goto-settings','calendar','notif-check','notif-enable','notif-off','notif-test','copy-fn','copy-sql'].includes(el.dataset.act)) render();
+  if (!['goto','copy','view','undo','export','signout','retry','sync-now','install','update-app','disconnect','goto-settings','calendar','notif-check','notif-enable','notif-off','notif-test','copy-fn','copy-sql','event-ics','ask','chat-suggest','chat-mic','assistant-setup','assistant-check','copy-assistant'].includes(el.dataset.act)) render();
 });
 document.addEventListener('submit', ev => { const f = ev.target.closest('form[data-form]'); if (!f) return; ev.preventDefault(); submit(f); });
 document.addEventListener('input', ev => {
@@ -1488,12 +1643,15 @@ document.addEventListener('keydown', ev => {
   if (ev.key === 'Escape' && S.modal) { closeModal(); render(); return; }
   if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
   const a = document.activeElement;
+  if (a && a.id === 'chat-in' && ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); askAssistant(a.value); return; }
   const typing = a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT' || a.isContentEditable);
   if (typing || S.modal || S.dbState !== 'ok' || !allLoaded()) return;
   if (ev.key >= '1' && ev.key <= '5') { ev.preventDefault(); setView(VIEWS[+ev.key - 1][0]); }
   else if (ev.key === '/') { ev.preventDefault(); setView('calls'); setTimeout(() => { const s = document.getElementById('lead-search'); if (s) s.focus(); }, 0); }
   else if (ev.key === 'n') { ev.preventDefault(); if (!['today','plan'].includes(S.view)) setView('today'); setTimeout(() => { const f = document.getElementById(S.view === 'plan' ? 'pt-title' : 'qt-title'); if (f) { f.scrollIntoView({block:'center'}); f.focus(); } }, 0); }
   else if (ev.key === 'c') { ev.preventDefault(); handle('call-start', {dataset:{}}, ev); render(); }
+  else if (ev.key === 'e') { ev.preventDefault(); handle('event-new', {dataset:{}}, ev); }
+  else if (ev.key === 'a') { ev.preventDefault(); handle('ask', {dataset:{}}, ev); }
 });
 // Drop a backup file anywhere on the page to import it.
 const dragHasFiles = ev => !!(ev.dataTransfer && Array.from(ev.dataTransfer.types || []).includes('Files'));

@@ -307,6 +307,30 @@ body.dropping::after{content:"Drop your backup file to import it";position:fixed
   .leads{grid-template-columns:repeat(3,minmax(0,1fr))}
 }
 
+/* events, the assistant */
+.tag.ev{color:var(--good)}
+.trow.ev{grid-template-columns:30px minmax(0,1fr)}
+.evdot{width:10px;height:10px;border-radius:99px;background:var(--good);margin:8px 0 0 9px}
+.fab{position:fixed;right:max(16px,env(safe-area-inset-right));bottom:calc(74px + env(safe-area-inset-bottom,0px));z-index:9;display:inline-flex;align-items:center;gap:7px;padding:11px 16px 11px 13px;border:0;border-radius:99px;background:var(--accent);color:var(--accent-ink);font:700 14px var(--f-display);letter-spacing:.08em;text-transform:uppercase;box-shadow:0 8px 24px color-mix(in srgb,var(--accent) 35%,transparent);cursor:pointer}
+.fab svg{width:20px;height:20px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.fab:hover{background:var(--accent-2)}
+@media (min-width:980px){.fab{bottom:24px;right:24px}}
+.chat{display:flex;flex-direction:column;gap:8px;max-height:52vh;overflow:auto;padding:2px}
+.msg{display:flex;flex-direction:column;gap:4px;max-width:92%}
+.msg.user{align-self:flex-end;align-items:flex-end}
+.msg.assistant{align-self:flex-start}
+.bubble{padding:9px 12px;border-radius:14px;background:var(--surface-2);line-height:1.45;font-size:15px;white-space:normal}
+.msg.user .bubble{background:var(--accent);color:var(--accent-ink);border-bottom-right-radius:4px}
+.msg.assistant .bubble{border-bottom-left-radius:4px}
+.bubble .li{display:block;padding-left:12px;text-indent:-10px}
+.bubble .li::before{content:"· "}
+.bubble.thinking{color:var(--ink-3)}
+@media (prefers-reduced-motion:no-preference){.bubble.thinking{animation:shimmer 1.2s ease-in-out infinite}}
+.done-acts{display:flex;flex-wrap:wrap;gap:4px}
+.chatbar{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:8px;align-items:end}
+.chatbar textarea{min-height:42px;max-height:140px;resize:none}
+@media (min-width:640px){.chat{max-height:60vh}}
+
 /* small phones */
 @media (max-width:420px){.row{grid-template-columns:46px 28px minmax(0,1fr) auto;gap:7px}.auto{grid-template-columns:repeat(2,minmax(0,1fr))}.stats{grid-template-columns:1fr}.grid3{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media (prefers-reduced-motion:no-preference){.bar>i{transition:width .3s ease}}
