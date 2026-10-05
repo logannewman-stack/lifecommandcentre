@@ -74,10 +74,10 @@ const ITEM_TYPES = [
   ['gym','Gym'],
   ['mobility','Mobility'],
   ['watch','Pro video or study'],
-  ['calls','Call block','week'],
+  ['calls','Call block'],
   ['marker','Just a note, no checkbox'],
 ];
-const ONEOFF_TAG = {event:'EVENT', task:'TO-DO', gym:'GYM', mobility:'MOBILITY', watch:'STUDY', marker:'NOTE'};
+const ONEOFF_TAG = {event:'EVENT', task:'TO-DO', gym:'GYM', mobility:'MOBILITY', watch:'STUDY', marker:'NOTE', calls:'CALLS'};
 
 /* ---------- state ---------- */
 const S = {
@@ -89,7 +89,7 @@ const S = {
   weekOffset:0, weekDay:null, modal:null, toast:null, lastUndo:null, confirm:null,
   sync:null, email:'', installEvt:null, installDismissed:undefined, updateApp:null,
   connectBusy:false, connectErr:null, loginBusy:false, loginErr:null, notif:null, notifBusy:false, callMode:null,
-  chatBusy:false, chatErr:null, listening:false, assist:null
+  chatBusy:false, chatErr:null, listening:false, assist:null, swipeKey:null, flash:null
 };
 let db = null;
 let theme = 'auto';
@@ -159,11 +159,13 @@ const minsOf = i => Math.max(0, toMin(i.end || i.start) - toMin(i.start));
 const eventItem = e => {
   const kind = e.kind && e.kind !== 'event' ? e.kind : 'event', mins = minsOf(e);
   return {key:'ev-' + e.id, start:e.start, end:e.end || e.start, kind, eventId:e.id, oneoff:true, notes:e.notes,
-    tag: kind === 'session' ? (e.sessionType || 'Court time') : (ONEOFF_TAG[kind] || 'EVENT'),
+    tag: e.tag || (kind === 'session' ? (e.sessionType || 'Court time') : (ONEOFF_TAG[kind] || 'EVENT')),
     text: e.title + (e.where ? ' · ' + e.where : ''),
     sessionType: kind === 'session' ? (e.sessionType || 'Drill') : undefined,
     hours: kind === 'session' ? (Math.round(mins / 30) / 2 || 1) : undefined,
-    minutes: ['mobility','watch'].includes(kind) && mins ? mins : undefined};
+    minutes: ['mobility','watch'].includes(kind) && mins ? mins : undefined,
+    quota: kind === 'calls' ? (Number(e.quota) || 10) : undefined, region: kind === 'calls' ? (e.region || '') : undefined,
+    movedFromDay: e.from && e.from.date ? e.from.date : undefined};
 };
 // One-off moves for a date: days/<date>.moves = {key: {start, end}}. null means back to the usual time.
 const movesOn = d => dayOf(d).moves || {};
@@ -303,11 +305,34 @@ function moveBlock(date, key, start, end, scope) {
   patchDay(date, {moves:{[key]: usual ? null : {start, end}}});
   return usual ? `${itemName(i)} is back at ${when}.` : `Moved ${itemName(i)} to ${when}, ${dayWord(date)} only.`;
 }
+// Reschedule to another date: cancel it on this date and put a one-off copy on the new one.
+// One-off items just change their date.
+function moveToDay(date, key, toDate) {
+  const i = itemsFor(date).find(x => x.key === key);
+  if (!i || !/^\d{4}-\d{2}-\d{2}$/.test(toDate) || toDate === date) return '';
+  const when = `${dayWord(toDate)} at ${fmtTap(i.start)}`;
+  if (i.eventId) {
+    const e = (S.data.events || {})[i.eventId]; if (!e) return '';
+    S.lastUndo = {type:'restore', ops:[{set:['events', i.eventId, clone(e)]}]};
+    setDoc('events', i.eventId, {...e, date:toDate, updatedAt:Date.now()});
+    return `Moved ${itemName(i)} to ${when}.`;
+  }
+  if (['checkin','checkout','dupr'].includes(i.kind)) return '';
+  const id = 'ev-' + Date.now().toString(36);
+  const doc = {title:i.text || i.tag || 'Block', tag:i.tag || '', date:toDate, start:i.start, end:i.end || i.start, where:'', notes:'', kind:i.kind, from:{date, key}, createdAt:Date.now(), updatedAt:Date.now()};
+  if (i.kind === 'session') doc.sessionType = i.sessionType || 'Drill';
+  if (i.kind === 'calls') { doc.quota = i.quota || 10; doc.region = i.region || ''; }
+  const prevSkip = !!((dayOf(date).skips || {})[key]);
+  setDoc('events', id, doc);
+  patchDay(date, {skips:{[key]:true}});
+  S.lastUndo = {type:'restore', ops:[{del:['events', id]}, {patch:['days', date, {skips:{[key]:prevSkip}}]}]};
+  return `Moved ${itemName(i)} to ${when}. It's canceled ${dayWord(date)}.`;
+}
 function moveBy(date, key, mins, scope) {
   const i = itemsFor(date).find(x => x.key === key); if (!i) return;
   const len = minsOf(i), start = hhmm(toMin(i.start) + mins);
   const msg = moveBlock(date, key, start, hhmm(Math.min(toMin(start) + len, 24*60 - 1)), scope);
-  if (msg) toast(msg, true);
+  if (msg) { S.flash = {key, at:Date.now()}; toast(msg, true); }
 }
 // The Starts / Ends boxes in a block sheet. Changing the start keeps the length.
 function moveTime(el) {
@@ -317,7 +342,7 @@ function moveTime(el) {
   if (el.id === 'mv-start') { start = el.value; end = hhmm(Math.min(toMin(start) + minsOf(i), 24*60 - 1)); }
   else { end = el.value; if (toMin(end) < toMin(start)) { toast('The end is before the start. Change the start first.'); return; } }
   const msg = moveBlock(date, d.key, start, end, (S.modal && S.modal.scope) || 'day');
-  if (msg) toast(msg, true);
+  if (msg) { S.flash = {key:d.key, at:Date.now()}; toast(msg, true); }
 }
 function resetMove(date, key) {
   const ti = templateItem(dowOf(date), key); if (!ti) return;
@@ -463,7 +488,7 @@ function viewToday() {
   const main = [
     wk ? `<div class="week-banner ord-1"><div class="eyebrow">This week</div><b>${esc(wk.focus)}</b>${wk.musts ? `<details><summary>Must-dos this week</summary><div class="meta" style="margin-top:4px;color:var(--ink-2)">${esc(wk.musts)}</div></details>` : ''}</div>` : '',
     rest ? `<div class="rest-banner ord-2"><div class="eyebrow">Rest day</div><b>Church, rest and pickleball.</b><div class="meta">Nothing counts as late today.${carried.length ? ` ${plural(carried.length,'to-do')} will be waiting for you tomorrow.` : ''}</div></div>` : '',
-    `<div class="progress ord-3 ${pct === 100 ? 'good' : ''}"><div class="bar"><i style="width:${pct}%"></i></div><span class="meta mono">${doneN}/${checkable.length} blocks</span>${behind ? `<span class="pill warn">${behind} behind</span>` : ''}${carried.length && !rest ? `<span class="pill bad">${carried.length} carried over</span>` : ''}</div>`,
+    `<div class="progress ord-3 ${pct === 100 ? 'good' : ''}"><div class="bar"><i style="width:${pct}%"></i></div><span class="meta mono">${doneN}/${checkable.length} blocks</span>${behind ? `<button class="pill warn tap" data-act="catchup" title="Sort out what you missed">${behind} behind · Catch up</button>` : ''}${carried.length && !rest ? `<span class="pill bad">${carried.length} carried over</span>` : ''}</div>`,
     nowCard(items, t),
     `<section class="card ord-7"><div class="card-h"><h2>Today's plan</h2><div class="btnrow"><button class="btn sm" data-act="sched-open" data-date="${t}">Edit</button><button class="btn sm" data-act="add-open" data-date="${t}">+ Add</button></div></div>${items.map(i => planRow(i, t, day)).join('')}</section>`,
   ];
@@ -480,10 +505,10 @@ function viewToday() {
   return installBanner() + tipBanner() + `<div class="two"><div class="main">${main.join('')}</div><div class="side">${side.join('')}</div></div>`;
 }
 function tipBanner() {
-  let done = false; try { done = !!localStorage.getItem('lcc-tip-done'); } catch(e) {}
+  let done = false; try { done = !!localStorage.getItem('lcc-tip2-done'); } catch(e) {}
   if (done) return '';
   const desktop = window.matchMedia && matchMedia('(min-width: 980px)').matches;
-  return `<div class="tip"><span><b>Tap any block, to-do or number</b> for the story behind it.${desktop ? ' Keys: <kbd>1</kbd>–<kbd>5</kbd> tabs, <kbd>/</kbd> search leads, <kbd>n</kbd> new to-do, <kbd>s</kbd> schedule, <kbd>e</kbd> add to your plan, <kbd>c</kbd> start calling, <kbd>a</kbd> ask.' : ' During a call block, tap <b>Start calling</b> and work one lead at a time.'}</span><button class="btn sm ghost" data-act="tip-done">Got it</button></div>`;
+  return `<div class="tip"><span><b>Tap any block</b> for the story behind it.${desktop ? ' <b>Rest your pointer on a block</b> to push it back, reschedule or cancel it. Keys: <kbd>1</kbd>–<kbd>5</kbd> tabs, <kbd>/</kbd> search leads, <kbd>n</kbd> new to-do, <kbd>s</kbd> schedule, <kbd>e</kbd> add to your plan, <kbd>c</kbd> start calling, <kbd>a</kbd> ask.' : ' <b>Swipe a block left</b> to push it back, reschedule or cancel it, or <b>right</b> to mark it done.'}</span><button class="btn sm ghost" data-act="tip-done">Got it</button></div>`;
 }
 function nowCard(items, t) {
   const m = nowMin();
@@ -517,11 +542,12 @@ function planRow(i, t, day) {
   const m = nowMin(), done = isCheckable(i) && isDone(i, t), skipped = isSkipped(i, t);
   const isNow = toMin(i.start) <= m && m < toMin(i.end || i.start);
   const late = isCheckable(i) && !done && toMin(i.end || i.start) <= m && !isRestDay(t);
+  const k = esc(i.key);
   let box;
   if (!isCheckable(i)) box = `<span class="dot" aria-hidden="true"></span>`;
   else if (i.kind === 'checkin' || i.kind === 'checkout') box = `<button class="ck ${done ? 'on' : ''}" data-act="goto" data-id="${i.kind === 'checkin' ? 'am-card' : 'pm-card'}" aria-label="${esc(i.tag || i.text)}"></button>`;
   else if (i.kind === 'dupr' && !done) box = `<button class="ck" data-act="view" data-v="log" aria-label="Log DUPR"></button>`;
-  else box = `<button class="ck ${done ? 'on' : ''} ${skipped ? 'skip' : ''}" data-act="check" data-key="${esc(i.key)}" aria-pressed="${done}" aria-label="Done: ${esc(i.tag || i.text)}"></button>`;
+  else box = `<button class="ck ${done ? 'on' : ''} ${skipped ? 'skip' : ''}" data-act="check" data-key="${k}" aria-pressed="${done}" aria-label="Done: ${esc(i.tag || i.text)}"></button>`;
   const subs = [];
   if (i.kind === 'calls') subs.push(`<span class="mono">${dialsFor(t, i.region)}/${i.quota}</span> ${regionName(i.region)} dials · <a data-act="view" data-v="calls">Open calls</a>`);
   if (i.kind === 'session' && i.sessionType === 'Drill') { const f = lastFix(t); if (f) subs.push(`This week's fix: ${esc(f)}`); }
@@ -531,17 +557,30 @@ function planRow(i, t, day) {
     subs.push(`${rec}<a data-act="session-edit" data-id="${sid}">${s && (num(s.games) || s.workOn || s.wentWell) ? 'Edit session' : 'Add record + notes'}</a>`);
   }
   if (i.movedFrom) subs.push(`Moved from ${fmtTap(i.movedFrom)}, today only.`);
-  if (skipped) subs.push('Skipped today. No make-up.');
+  if (i.movedFromDay) subs.push(`Moved here from ${esc(fmtDay(i.movedFromDay))}.`);
+  if (skipped) subs.push('Canceled for today. No make-up.');
   else if (i.carry && !done) subs.push('Moves to tomorrow if not done.');
-  const canSkip = isCheckable(i) && !['checkin','checkout'].includes(i.kind);
-  const menu = S.openItem === i.key ? `<div class="menu"><span class="meta">Push back</span>${[[15,'15 min'],[30,'30 min'],[60,'1 hour']].map(([m,l]) => `<button class="btn sm" data-act="move-by" data-key="${esc(i.key)}" data-date="${t}" data-m="${m}" data-scope="day">${l}</button>`).join('')}<button class="btn sm ghost" data-act="block" data-key="${esc(i.key)}">Move…</button>${!canSkip ? '' : skipped
-      ? `<button class="btn sm" data-act="skip" data-key="${esc(i.key)}" data-on="0">Unskip</button>`
-      : `<button class="btn sm" data-act="skip" data-key="${esc(i.key)}" data-on="1">Skip today (no make-up)</button>`}</div>` : '';
-  return `<div class="row ${!isCheckable(i) ? 'marker' : ''} ${done ? 'done' : ''} ${isNow ? 'is-now' : ''} ${late ? 'late' : ''}">
-    <div class="time" data-act="block" data-key="${esc(i.key)}">${fmtT(i.start)}</div>${box}
-    <div class="txt" data-act="block" data-key="${esc(i.key)}" role="button" tabindex="0">${i.tag ? `<span class="tag ${i.eventId ? 'ev' : ''}">${esc(i.tag)}</span>` : ''}${esc(i.text)}${subs.map(s => `<div class="sub">${s}</div>`).join('')}</div>
-    <button class="more" data-act="item-menu" data-key="${esc(i.key)}" aria-label="Move or skip ${esc(itemName(i))}">⋯</button>
-    ${menu}</div>`;
+  const canCancel = isCheckable(i) && !['checkin','checkout'].includes(i.kind);
+  const canDone = isCheckable(i) && !['checkin','checkout'].includes(i.kind) && !(i.kind === 'dupr' && !done);
+  const open = S.swipeKey === i.key;
+  const push = (mins, label, cls, extra = '') => `<button class="${cls}" data-act="move-by" data-key="${k}" data-date="${t}" data-m="${mins}" data-scope="day" ${extra}>${label}</button>`;
+  const menu = S.openItem === i.key ? `<div class="menu"><span class="meta">Push back</span>${push(15, '15 min', 'btn sm')}${push(30, '30 min', 'btn sm')}${push(60, '1 hour', 'btn sm')}<button class="btn sm" data-act="block" data-key="${k}">Reschedule…</button>${!canCancel ? '' : skipped
+      ? `<button class="btn sm" data-act="skip" data-key="${k}" data-on="0">Undo cancel</button>`
+      : `<button class="btn sm ghost" data-act="skip" data-key="${k}" data-on="1">Cancel for today</button>`}</div>` : '';
+  // Laptop: quick actions appear when the pointer rests on a row.
+  const qa = `<div class="qa" aria-hidden="true">${push(15, '+15', 'btn sm', 'tabindex="-1"')}${push(30, '+30', 'btn sm', 'tabindex="-1"')}<button class="btn sm" data-act="block" data-key="${k}" tabindex="-1">Reschedule</button>${canCancel && !skipped ? `<button class="btn sm ghost" data-act="skip" data-key="${k}" data-on="1" tabindex="-1">Cancel</button>` : ''}</div>`;
+  // Phone: swipe left for the same actions, right to mark it done.
+  const ti = open ? '0' : '-1';
+  const acts = [push(30, '+30 min', 'sa push', `tabindex="${ti}"`), `<button class="sa resched" data-act="block" data-key="${k}" tabindex="${ti}">Reschedule</button>`];
+  if (canCancel) acts.push(skipped ? `<button class="sa undo" data-act="skip" data-key="${k}" data-on="0" tabindex="${ti}">Undo cancel</button>` : `<button class="sa cancel" data-act="skip" data-key="${k}" data-on="1" tabindex="${ti}">Cancel</button>`);
+  const flash = S.flash && S.flash.key === i.key && Date.now() - S.flash.at < 1600 ? 'flash' : '';
+  return `<div class="swipe ${open ? 'open' : ''} ${isNow ? 'is-now' : ''}" data-key="${k}" data-done="${canDone ? 1 : 0}" style="--acts-w:${acts.length * 84}px">
+    ${canDone ? `<div class="swipe-done" aria-hidden="true">${done ? 'Undo' : 'Done'}</div>` : ''}<div class="swipe-acts" ${open ? '' : 'aria-hidden="true"'}>${acts.join('')}</div>
+    <div class="row ${!isCheckable(i) ? 'marker' : ''} ${done ? 'done' : ''} ${isNow ? 'is-now' : ''} ${late ? 'late' : ''} ${flash}">
+    <div class="time" data-act="block" data-key="${k}">${fmtT(i.start)}</div>${box}
+    <div class="txt" data-act="block" data-key="${k}" role="button" tabindex="0">${i.tag ? `<span class="tag ${i.eventId ? 'ev' : ''}">${esc(i.tag)}</span>` : ''}${esc(i.text)}${subs.map(s => `<div class="sub">${s}</div>`).join('')}</div>
+    <button class="more" data-act="item-menu" data-key="${k}" aria-label="Reschedule or cancel ${esc(itemName(i))}">⋯</button>
+    ${qa}${menu}</div></div>`;
 }
 function taskRow(x, t) {
   const late = !x.done && x.due && x.due < t && !isRestDay(t) ? daysBetween(x.due, t) : 0;
@@ -1163,10 +1202,10 @@ function blockSheet(key, date) {
   const today = todayISO(), t = date || today, isToday = t === today;
   const i = itemsFor(t).find(x => x.key === key);
   if (!i) return closeOnly('Block');
-  const back = S.modal && S.modal.back === 'sched' ? `<button class="btn sm ghost" data-act="sched-open" data-date="${t}">‹ Back</button>` : '';
+  const back = S.modal && S.modal.back === 'sched' ? `<button class="btn sm ghost" data-act="sched-open" data-date="${t}">‹ Back</button>` : S.modal && S.modal.back === 'catchup' ? '<button class="btn sm ghost" data-act="catchup">‹ Back</button>' : '';
   const done = isToday && isCheckable(i) && isDone(i, t), skipped = isSkipped(i, t), m = nowMin(), rest = isRestDay(t);
-  const status = !isToday ? `<span class="pill">${esc(fmtDayLong(t))}</span>${skipped ? ' <span class="pill">Off this day</span>' : ''}`
-    : !isCheckable(i) ? '' : skipped ? '<span class="pill">Skipped today</span>' : done ? '<span class="pill good">Done</span>' : (toMin(i.end || i.start) <= m && !rest) ? '<span class="pill warn">Behind</span>' : (toMin(i.start) <= m ? '<span class="pill acc">Now</span>' : `<span class="pill">In ${fmtMins(toMin(i.start) - m)}</span>`);
+  const status = !isToday ? `<span class="pill">${esc(fmtDayLong(t))}</span>${skipped ? ' <span class="pill">Canceled this day</span>' : ''}`
+    : !isCheckable(i) ? '' : skipped ? '<span class="pill">Canceled today</span>' : done ? '<span class="pill good">Done</span>' : (toMin(i.end || i.start) <= m && !rest) ? '<span class="pill warn">Behind</span>' : (toMin(i.start) <= m ? '<span class="pill acc">Now</span>' : `<span class="pill">In ${fmtMins(toMin(i.start) - m)}</span>`);
   const kindLabel = i.eventId ? (i.kind === 'event' ? 'Just this day' : `${KIND_LABEL[i.kind] || i.kind}, just this day`) : (KIND_LABEL[i.kind] || i.kind);
   const startDate = profile().startDate || '0000-00-00';
   const hist = !isToday ? [] : [1,2,3,4].map(n => { const d = addDays(t, -7*n); if (d < startDate) return null; const sched = scheduleFor(d).find(x => x.key === key); return sched ? {d, done:isDone(sched, d), skipped:isSkipped(sched, d)} : null; }).filter(Boolean).reverse();
@@ -1189,11 +1228,11 @@ function blockSheet(key, date) {
   if (i.eventId) { const ev = (S.data.events || {})[i.eventId] || {}; panel += `${ev.notes ? `<p class="note">${esc(ev.notes)}</p>` : ''}<div class="btnrow"><button class="btn" data-act="event-edit" data-id="${esc(i.eventId)}">Edit event</button><button class="btn ghost" data-act="event-ics" data-id="${esc(i.eventId)}">Add to my calendar</button></div>`; }
   const canAct = isCheckable(i) && !['checkin','checkout','dupr'].includes(i.kind);
   const acts = !canAct ? '' : `<div class="btnrow">${isToday ? (done ? `<button class="btn ghost" data-act="check" data-key="${esc(key)}">Undo</button>` : `<button class="btn primary" data-act="check" data-key="${esc(key)}">Mark done</button>`) : ''}${skipped
-    ? `<button class="btn" data-act="skip" data-key="${esc(key)}" data-date="${t}" data-on="0">${isToday ? 'Unskip' : 'Put it back on ' + esc(fmtDay(t))}</button>`
-    : `<button class="btn ghost" data-act="skip" data-key="${esc(key)}" data-date="${t}" data-on="1">${isToday ? 'Skip today (no make-up)' : 'Take it off ' + esc(fmtDay(t))}</button>`}</div>`;
+    ? `<button class="btn" data-act="skip" data-key="${esc(key)}" data-date="${t}" data-on="0">${isToday ? 'Undo cancel' : 'Put it back on ' + esc(fmtDay(t))}</button>`
+    : `<button class="btn ghost" data-act="skip" data-key="${esc(key)}" data-date="${t}" data-on="1">${isToday ? 'Cancel for today' : 'Cancel on ' + esc(fmtDay(t))}</button>`}</div>`;
   const over = overlaps(t, i.start, i.end || i.start, i.key);
   const overHtml = over.length ? `<div class="over"><span class="meta">Overlaps</span>${over.map(o => `<button class="chip" data-act="block" data-key="${esc(o.key)}" data-date="${t}">${esc(fmtTap(o.start))} ${esc(itemName(o))}</button>`).join('')}</div>` : '';
-  const editRow = i.eventId ? '' : `<div class="btnrow"><button class="btn ghost" data-act="block-edit" data-key="${esc(key)}" data-date="${t}">Change it or take it out of your week</button></div>`;
+  const editRow = i.eventId ? '' : `<div class="btnrow"><button class="btn ghost" data-act="block-edit" data-key="${esc(key)}" data-date="${t}">Edit it or remove it from your week</button></div>`;
   return `<div class="card-h"><h2>${esc(i.tag || kindLabel)}</h2><div class="btnrow">${back}<button class="btn sm ghost" data-act="modal-close">Close</button></div></div>
     <div class="meta mono">${fmtTap(i.start)}${i.end && i.end !== i.start ? ' – ' + fmtTap(i.end) : ''} · ${esc(kindLabel)}${i.carry ? ' · moves to tomorrow if missed' : ''}</div>
     <p style="margin:0;font-size:16px">${esc(i.text)}</p>
@@ -1205,14 +1244,34 @@ function blockSheet(key, date) {
     ${histHtml}
     ${editRow}`;
 }
-// The "Move it" box: nudge buttons, exact times, and whether the change is for this day or every week.
+// Blocks whose time has passed today and that are neither done nor canceled.
+const behindOn = t => isRestDay(t) ? [] : itemsFor(t).filter(i => isCheckable(i) && !isDone(i, t) && toMin(i.end || i.start) <= nowMin());
+function catchupSheet() {
+  const t = todayISO(), list = behindOn(t);
+  const row = i => {
+    const k = esc(i.key);
+    const acts = i.kind === 'checkin' || i.kind === 'checkout' ? `<button class="btn sm primary" data-act="goto" data-id="${i.kind === 'checkin' ? 'am-card' : 'pm-card'}">Do it now</button>`
+      : i.kind === 'dupr' ? `<button class="btn sm primary" data-act="view" data-v="log">Log it</button><button class="btn sm ghost" data-act="skip" data-key="${k}" data-on="1">Cancel</button>`
+      : `<button class="btn sm primary" data-act="check" data-key="${k}">Done</button><button class="btn sm" data-act="block" data-key="${k}" data-back="catchup">Reschedule</button><button class="btn sm ghost" data-act="skip" data-key="${k}" data-on="1">Cancel</button>`;
+    return `<div class="cu-row"><span class="time mono">${fmtTap(i.start)}</span><div class="min0"><div class="txtc">${i.tag ? `<span class="tag ${i.eventId ? 'ev' : ''}">${esc(i.tag)}</span>` : ''}${esc(i.text)}</div><div class="btnrow">${acts}</div></div></div>`;
+  };
+  const cancelable = list.filter(i => !['checkin','checkout'].includes(i.kind));
+  return `<div class="card-h"><h2>Catch up</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
+    ${list.length ? `<p class="meta" style="margin:0">These are past their time and not checked off. Mark what you did, reschedule what you still want to do, and cancel the rest. Canceled blocks don't come back tomorrow as make-ups.</p>
+    <div class="cu">${list.map(row).join('')}</div>
+    ${cancelable.length > 1 ? '<div class="btnrow"><button class="btn ghost" data-act="catchup-cancel">Cancel the rest for today</button></div>' : ''}`
+    : '<div class="card empty"><b>You\'re caught up.</b><br>Everything before now is done or canceled.</div>'}`;
+}
+// The Reschedule box: nudge buttons, exact times, another day, and whether the change is for this day or every week.
 function movePanel(i, t) {
   const scope = i.eventId ? 'day' : ((S.modal && S.modal.scope) || 'day');
   const dow = dowOf(t);
-  return `<div class="movebox"><div class="card-h"><h3>Move it</h3>${i.movedFrom ? `<span class="meta">Usually ${fmtTap(i.movedFrom)} · <a data-act="move-reset" data-key="${esc(i.key)}" data-date="${t}">Put it back</a></span>` : ''}</div>
+  const canDay = scope === 'day' && !['checkin','checkout','dupr'].includes(i.kind), next = addDays(t, 1);
+  return `<div class="movebox"><div class="card-h"><h3>Reschedule</h3>${i.movedFrom ? `<span class="meta">Usually ${fmtTap(i.movedFrom)} · <a data-act="move-reset" data-key="${esc(i.key)}" data-date="${t}">Put it back</a></span>` : ''}</div>
     ${i.eventId ? '' : `<div class="seg scope" role="group" aria-label="Which days"><button type="button" class="${scope === 'day' ? 'on' : ''}" data-act="move-scope" data-s="day" aria-pressed="${scope === 'day'}">Only ${esc(dayWord(t))}</button><button type="button" class="${scope === 'week' ? 'on' : ''}" data-act="move-scope" data-s="week" aria-pressed="${scope === 'week'}">Every ${DOW_LONG[dow]}</button></div>`}
     <div class="nudges">${[[-30,'−30'],[-15,'−15'],[15,'+15'],[30,'+30'],[60,'+60']].map(([m, l]) => `<button type="button" class="btn sm" data-act="move-by" data-key="${esc(i.key)}" data-date="${t}" data-m="${m}" aria-label="${m < 0 ? 'Earlier' : 'Later'} by ${Math.abs(m)} minutes">${l}</button>`).join('')}<span class="meta">minutes</span></div>
-    <div class="grid2"><div class="fld"><label for="mv-start">Starts</label><input class="in" type="time" id="mv-start" value="${esc(i.start)}" data-act="move-time" data-key="${esc(i.key)}" data-date="${t}"></div><div class="fld"><label for="mv-end">Ends</label><input class="in" type="time" id="mv-end" value="${esc(i.end || i.start)}" data-act="move-time" data-key="${esc(i.key)}" data-date="${t}"></div></div></div>`;
+    <div class="grid2"><div class="fld"><label for="mv-start">Starts</label><input class="in" type="time" id="mv-start" value="${esc(i.start)}" data-act="move-time" data-key="${esc(i.key)}" data-date="${t}"></div><div class="fld"><label for="mv-end">Ends</label><input class="in" type="time" id="mv-end" value="${esc(i.end || i.start)}" data-act="move-time" data-key="${esc(i.key)}" data-date="${t}"></div></div>
+    ${canDay ? `<div class="moveday"><button type="button" class="btn sm" data-act="move-day" data-key="${esc(i.key)}" data-date="${t}" data-to="${next}">Move to ${t === todayISO() ? 'tomorrow' : esc(fmtDay(next))}</button><label class="pickday meta">or another day <input class="in" type="date" id="mv-day" data-key="${esc(i.key)}" data-date="${t}" min="${todayISO()}"></label></div>` : ''}</div>`;
 }
 function taskSheet(id) {
   const x = S.data.tasks[id]; if (!x) return closeOnly('To-do');
@@ -1360,13 +1419,13 @@ function schedSheet() {
   return `<div class="card-h"><h2>Your schedule</h2><button class="btn sm ghost" data-act="modal-close">Done</button></div>
     <div class="chips">${chips}${other ? `<button class="chip on">${esc(fmtDay(date))}</button>` : ''}</div>
     <div class="schedhead"><b>${esc(fmtDayLong(date))}</b>${isRestDay(date) ? ' <span class="pill">Rest day</span>' : ''}<label class="pickday meta">Another day <input class="in" type="date" id="sc-date" value="${date}"></label></div>
-    <div class="meta">Tap a block to move it, change it or take it off. A move can be for this day only or for every ${DOW_LONG[dow]}.</div>
+    <div class="meta">Tap a block to reschedule it, cancel it for the day, or edit it for every ${DOW_LONG[dow]}.</div>
     <div class="sched">${items.map(i => schedRow(i, date)).join('') || '<div class="meta">Nothing planned.</div>'}</div>
     <div class="btnrow"><button class="btn primary" data-act="add-open" data-date="${date}" data-back="sched">+ Add to ${esc(dayWord(date))}</button><button class="btn" data-act="add-open" data-date="${date}" data-scope="week" data-back="sched">+ Add to every ${DOW_LONG[dow]}</button></div>`;
 }
 function schedRow(i, date) {
   const skipped = isCheckable(i) && isSkipped(i, date);
-  const notes = [i.movedFrom ? `<span class="pill acc">Moved from ${fmtTap(i.movedFrom)}</span>` : '', i.eventId ? '<span class="pill good">Just this day</span>' : '', skipped ? '<span class="pill">Off this day</span>' : ''].filter(Boolean).join(' ');
+  const notes = [i.movedFrom ? `<span class="pill acc">Moved from ${fmtTap(i.movedFrom)}</span>` : '', i.movedFromDay ? `<span class="pill acc">Moved from ${esc(fmtDay(i.movedFromDay))}</span>` : '', i.eventId ? '<span class="pill good">Just this day</span>' : '', skipped ? '<span class="pill">Canceled</span>' : ''].filter(Boolean).join(' ');
   return `<button type="button" class="srow-b ${skipped ? 'skipped' : ''} ${i.kind === 'marker' ? 'marker' : ''}" data-act="block" data-key="${esc(i.key)}" data-date="${date}" data-back="sched">
     <span class="time mono">${fmtTap(i.start)}${i.end && i.end !== i.start ? `<br>${fmtTap(i.end)}` : ''}</span>
     <span class="min0"><span class="txtc">${i.tag ? `<span class="tag ${i.eventId ? 'ev' : ''}">${esc(i.tag)}</span>` : ''}${esc(i.text)}</span>${notes ? `<span class="sub">${notes}</span>` : ''}</span>
@@ -1427,8 +1486,8 @@ function blockEditForm() {
       ${kind === 'calls' ? `<div class="grid2"><div class="fld"><label for="be-quota">Dials</label><input class="in" id="be-quota" data-draft inputmode="numeric" value="${esc(f('quota', ti.quota || 10))}"></div><div class="fld"><label for="be-region">Leads</label><select class="in" id="be-region" data-draft>${[['IA','Iowa'],['AZ','Arizona'],['','Any']].map(([v, l]) => `<option value="${v}" ${String(f('region', ti.region || '')) === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div></div>` : ''}
       ${carryable(kind) ? toggleRow('be-carry', carry, 'If you miss it, it comes back the next day as a make-up') : ''}
       <div class="fld"><label>Apply to</label>${dayPicker('be-day', sel, has)}<div class="meta">${has.length > 1 ? 'A dot means that day has this block too. ' : ''}Pick more days to change them as well. A day without it gets a copy.</div></div>
-      <div class="btnrow"><button class="btn primary" type="submit">Save for ${esc(daysLabel(sel))}</button>${S.confirm === 'be-del' ? `<button class="btn badb" type="button" data-act="block-remove">Yes, take it out of ${esc(daysLabel(sel))}</button>` : '<button class="btn ghost" type="button" data-act="confirm" data-c="be-del">Take it out</button>'}</div>
-      <div class="meta">To skip it just once, go back and use Skip or Take it off.</div>
+      <div class="btnrow"><button class="btn primary" type="submit">Save for ${esc(daysLabel(sel))}</button>${S.confirm === 'be-del' ? `<button class="btn badb" type="button" data-act="block-remove">Yes, remove it from ${esc(daysLabel(sel))}</button>` : '<button class="btn ghost" type="button" data-act="confirm" data-c="be-del">Remove from your week</button>'}</div>
+      <div class="meta">To cancel it just once, go back and tap Cancel.</div>
     </form>`;
 }
 
@@ -1568,7 +1627,7 @@ function renderModal() {
   const old = el.querySelector('.sheet'), top = old && el.dataset.sig === sig ? old.scrollTop : 0;
   const ty = S.modal.type;
   el.hidden = false;
-  el.innerHTML = `<div class="sheet ${ty === 'sched' ? 'wide' : ''}" role="dialog" aria-modal="true">${ty === 'session' ? sessionForm() : ty === 'fresh' ? freshForm() : ty === 'block' ? blockSheet(S.modal.key, S.modal.date) : ty === 'task' ? taskSheet(S.modal.id) : ty === 'mile' ? mileSheet(S.modal.id) : ty === 'stat' ? statSheet(S.modal.id) : ty === 'notif' ? notifSheet() : ty === 'call' ? callSheet() : ty === 'event' ? eventForm() : ty === 'chat' ? chatSheet() : ty === 'assist' ? assistantSheet() : ty === 'sched' ? schedSheet() : ty === 'add' ? addForm() : ty === 'blockedit' ? blockEditForm() : leadEditForm()}</div>`;
+  el.innerHTML = `<div class="sheet ${ty === 'sched' ? 'wide' : ''}" role="dialog" aria-modal="true">${ty === 'session' ? sessionForm() : ty === 'fresh' ? freshForm() : ty === 'block' ? blockSheet(S.modal.key, S.modal.date) : ty === 'task' ? taskSheet(S.modal.id) : ty === 'mile' ? mileSheet(S.modal.id) : ty === 'stat' ? statSheet(S.modal.id) : ty === 'notif' ? notifSheet() : ty === 'call' ? callSheet() : ty === 'event' ? eventForm() : ty === 'chat' ? chatSheet() : ty === 'assist' ? assistantSheet() : ty === 'sched' ? schedSheet() : ty === 'add' ? addForm() : ty === 'blockedit' ? blockEditForm() : ty === 'catchup' ? catchupSheet() : leadEditForm()}</div>`;
   el.dataset.sig = sig;
   if (top) el.querySelector('.sheet').scrollTop = top;
   if (keep) { const n = document.getElementById(keep.id); if (n) { n.focus({preventScroll:true}); try { if (keep.s != null) n.setSelectionRange(keep.s, keep.e); } catch(e) {} } }
@@ -1664,7 +1723,27 @@ function handle(act, el, ev) {
     case 'goto': { if (S.modal) { S.modal = null; render(); } const tgt = document.getElementById(d.id); if (tgt) { tgt.scrollIntoView({behavior:'smooth', block:'start'}); const f = tgt.querySelector('input'); if (f) setTimeout(() => f.focus({preventScroll:true}), 350); } break; }
     case 'check': toggleCheck(d.key); break;
     case 'item-menu': S.openItem = S.openItem === d.key ? null : d.key; render(); break;
-    case 'skip': patchDay(d.date || t, {skips:{[d.key]: d.on === '1'}}); S.openItem = null; render(); break;
+    case 'skip': {
+      const date = d.date || t, on = d.on === '1', it = itemsFor(date).find(x => x.key === d.key);
+      S.lastUndo = {type:'restore', ops:[{patch:['days', date, {skips:{[d.key]: !!((dayOf(date).skips || {})[d.key])}}]}]};
+      patchDay(date, {skips:{[d.key]: on}}); S.openItem = null;
+      const dw = dayWord(date), when = dw === 'today' || dw === 'tomorrow' ? 'for ' + dw : 'on ' + dw;
+      toast(on ? `Canceled ${it ? itemName(it) : 'it'} ${when}. No make-up.` : `${it ? itemName(it) : 'It'} is back on.`, true);
+      render(); break;
+    }
+    case 'catchup': S.openItem = null; S.confirm = null; S.modal = {type:'catchup'}; render(); break;
+    case 'catchup-cancel': {
+      const list = behindOn(t).filter(i => !['checkin','checkout'].includes(i.kind));
+      const prev = {}, sk = {};
+      list.forEach(i => { prev[i.key] = !!((dayOf(t).skips || {})[i.key]); sk[i.key] = true; });
+      if (list.length) { patchDay(t, {skips:sk}); S.lastUndo = {type:'restore', ops:[{patch:['days', t, {skips:prev}]}]}; toast(`Canceled ${plural(list.length, 'block')} for today.`, true); }
+      render(); break;
+    }
+    case 'move-day': {
+      const msg = moveToDay(d.date || t, d.key, d.to);
+      if (msg) { const back = S.modal && S.modal.back; S.modal = back === 'sched' ? {type:'sched', date:d.date || t} : back === 'catchup' ? {type:'catchup'} : null; toast(msg, true); }
+      render(); break;
+    }
     case 'task-toggle': taskToggle(d.id); if (S.modal && S.modal.type === 'task') S.modal = null; break;
     case 'task-tomorrow': { const x = S.data.tasks[d.id]; if (!x) break; S.lastUndo = {type:'task', id:d.id, prev:clone(x)}; patchDoc('tasks', d.id, {due:addDays(t,1), origDue:x.origDue || x.due}); if (S.modal && S.modal.type === 'task') S.modal = null; toast('Moved to tomorrow.', true); break; }
     case 'task-drop': { const x = S.data.tasks[d.id]; if (!x) break; S.lastUndo = {type:'task', id:d.id, prev:clone(x)}; patchDoc('tasks', d.id, {dropped:true, droppedOn:t}); if (S.modal && S.modal.type === 'task') S.modal = null; toast('Dropped.', true); break; }
@@ -1695,7 +1774,7 @@ function handle(act, el, ev) {
     case 'modal-close': closeModal(); render(); break;
     case 'call-start': S.leadForm = null; S.callMode = {region:d.region || null, skipped:[]}; S.modal = {type:'call'}; render(); break;
     case 'call-skip': if (S.callMode) S.callMode.skipped = [...(S.callMode.skipped || []), d.id]; render(); break;
-    case 'tip-done': try { localStorage.setItem('lcc-tip-done', '1'); } catch(e) {} render(); break;
+    case 'tip-done': try { localStorage.setItem('lcc-tip2-done', '1'); } catch(e) {} render(); break;
     case 'event-new': handle('add-open', el, ev); break;
     case 'event-edit': clearDrafts('ev-'); clearDrafts('ad-'); S.confirm = null; S.modal = {type:'event', id:d.id}; render(); break;
     case 'sched-open': S.openItem = null; S.confirm = null; S.modal = {type:'sched', date:d.date || t}; render(); break;
@@ -1721,7 +1800,7 @@ function handle(act, el, ev) {
       if (n) { patchDoc('config', 'schedule', {days:changes}); S.lastUndo = {type:'restore', ops:[{patch:['config', 'schedule', {days:prev}]}]}; }
       clearDrafts('be-'); clearDrafts('ad-'); S.confirm = null;
       S.modal = m.back === 'sched' ? {type:'sched', date} : null;
-      toast(n ? `Took ${name} out of ${daysLabel(sel)}.` : 'Nothing to take out on those days.', !!n); render(); break;
+      toast(n ? `Removed ${name} from ${daysLabel(sel)}.` : 'Nothing to remove on those days.', !!n); render(); break;
     }
     case 'event-delete': delDoc('events', d.id); closeModal(); toast('Event deleted.'); render(); break;
     case 'event-ics': exportEvent(d.id); toast('Calendar file saved. Open it to add the event.'); break;
@@ -1736,7 +1815,7 @@ function handle(act, el, ev) {
     case 'fresh-start': clearDrafts('fs-'); S.modal = {type:'fresh'}; render(); break;
     case 'block': {
       const prev = S.modal; S.openItem = null; S.confirm = null;
-      S.modal = {type:'block', key:d.key, date:d.date || t, scope:'day', back:d.back || (prev && prev.type === 'sched' ? 'sched' : prev && ['block','blockedit'].includes(prev.type) ? prev.back : null) || null};
+      S.modal = {type:'block', key:d.key, date:d.date || t, scope:'day', back:d.back || (prev && ['sched','catchup'].includes(prev.type) ? prev.type : prev && ['block','blockedit'].includes(prev.type) ? prev.back : null) || null};
       render(); break;
     }
     case 'task-open': clearDrafts('tk-'); S.confirm = null; S.modal = {type:'task', id:d.id}; render(); break;
@@ -1883,6 +1962,7 @@ function submit(form) {
         const id = 'ev-' + Date.now().toString(36);
         const doc = {title, date, start, end, where:String(v('ev-where')).trim(), notes:String(v('ev-notes')).trim(), createdAt:Date.now(), updatedAt:Date.now()};
         if (ty.kind !== 'event') { doc.kind = ty.kind; if (ty.sessionType) doc.sessionType = ty.sessionType; }
+        if (ty.kind === 'calls') { doc.quota = 10; doc.region = ''; }
         setDoc('events', id, doc);
         S.lastUndo = {type:'restore', ops:[{del:['events', id]}]};
         const over = overlaps(date, start, end, 'ev-' + id);
@@ -1956,6 +2036,14 @@ function submit(form) {
 
 /* ---------- events ---------- */
 document.addEventListener('click', ev => {
+  // An open swipe row closes on the next tap anywhere outside its buttons.
+  const openRow = document.querySelector('.swipe.open');
+  if (openRow && !ev.target.closest('.swipe-acts')) {
+    closeSwipe();
+    if (openRow.contains(ev.target)) { ev.preventDefault(); return; }
+  }
+  if (Date.now() - swipeEnded < 400 && ev.target.closest('.swipe') && !ev.target.closest('.swipe-acts')) { ev.preventDefault(); return; }
+  if (ev.target.closest('.swipe-acts')) S.swipeKey = null;
   const el = ev.target.closest('[data-act]');
   if (!el) { if (ev.target.id === 'modal') { closeModal(); render(); } return; }
   if (el.tagName === 'INPUT') return;
@@ -1963,6 +2051,46 @@ document.addEventListener('click', ev => {
   handle(el.dataset.act, el, ev);
   if (!['goto','copy','view','undo','export','signout','retry','sync-now','install','update-app','disconnect','goto-settings','calendar','notif-check','notif-enable','notif-off','notif-test','copy-fn','copy-sql','event-ics','ask','chat-suggest','chat-mic','assistant-setup','assistant-check','copy-assistant'].includes(el.dataset.act)) render();
 });
+/* ----- swipe a plan row (touch): left shows +30 min, Reschedule and Cancel; right marks it done ----- */
+let sw = null, swipeEnded = 0;
+function closeSwipe(except) {
+  document.querySelectorAll('.swipe.open').forEach(w => { if (w !== except) w.classList.remove('open'); });
+  if (!except || S.swipeKey !== except.dataset.key) S.swipeKey = null;
+}
+document.addEventListener('pointerdown', ev => {
+  if (ev.pointerType === 'mouse') return;
+  const row = ev.target.closest('.swipe > .row'); if (!row) return;
+  const wrap = row.parentElement, w = parseFloat(getComputedStyle(wrap).getPropertyValue('--acts-w')) || 250;
+  sw = {row, wrap, key:wrap.dataset.key, id:ev.pointerId, x:ev.clientX, y:ev.clientY, w, base:wrap.classList.contains('open') ? -w : 0, canDone:wrap.dataset.done === '1', active:false, pos:0};
+}, {passive:true});
+document.addEventListener('pointermove', ev => {
+  if (!sw || ev.pointerId !== sw.id) return;
+  const dx = ev.clientX - sw.x, dy = ev.clientY - sw.y;
+  if (!sw.active) {
+    if (Math.abs(dx) > 10 && Math.abs(dx) > Math.abs(dy) * 1.4) { sw.active = true; sw.row.style.transition = 'none'; closeSwipe(sw.wrap); }
+    else if (Math.abs(dy) > 12) { sw = null; return; }
+    else return;
+  }
+  let x = sw.base + dx;
+  if (x < -sw.w) x = -sw.w + (x + sw.w) * 0.35; // a little give past the buttons
+  x = Math.max(-sw.w - 40, Math.min(sw.canDone ? 130 : 18, x));
+  sw.pos = x; sw.row.style.transform = `translateX(${x}px)`;
+  sw.wrap.classList.toggle('done-ready', sw.canDone && x >= 76);
+}, {passive:true});
+function endSwipe(ev) {
+  if (!sw || ev.pointerId !== sw.id) return;
+  const s = sw; sw = null;
+  if (!s.active) return;
+  swipeEnded = Date.now();
+  s.row.style.transition = ''; s.row.style.transform = ''; s.wrap.classList.remove('done-ready');
+  if (ev.type === 'pointerup' && s.canDone && s.pos >= 76) { s.wrap.classList.remove('open'); S.swipeKey = null; toggleCheck(s.key); render(); return; }
+  const open = ev.type === 'pointerup' ? s.pos <= -s.w / 2 : s.base < 0;
+  s.wrap.classList.toggle('open', open);
+  s.wrap.querySelectorAll('.swipe-acts button').forEach(b => b.tabIndex = open ? 0 : -1);
+  S.swipeKey = open ? s.key : (S.swipeKey === s.key ? null : S.swipeKey);
+}
+document.addEventListener('pointerup', endSwipe);
+document.addEventListener('pointercancel', endSwipe);
 document.addEventListener('submit', ev => { const f = ev.target.closest('form[data-form]'); if (!f) return; ev.preventDefault(); submit(f); });
 document.addEventListener('input', ev => {
   const el = ev.target;
@@ -1973,6 +2101,7 @@ document.addEventListener('change', ev => {
   const el = ev.target;
   if (el.dataset && el.dataset.act === 'move-time') { moveTime(el); render(); return; }
   if (el.id === 'sc-date' && el.value) { S.modal = {type:'sched', date:el.value}; render(); return; }
+  if (el.id === 'mv-day' && el.value) { handle('move-day', {dataset:{key:el.dataset.key, date:el.dataset.date, to:el.value}}, ev); return; }
   if (el.hasAttribute && el.hasAttribute('data-rerender')) { S.drafts[el.id] = el.value; render(); return; }
   if (el.id === 'fs-date') { S.drafts['fs-date'] = el.value; render(); return; }
   if (el.id === 'nt-lead') { S.drafts['nt-lead'] = el.value; if (pushDoc()) { patchDoc('push', deviceId(), {lead:Number(el.value), updatedAt:Date.now()}); toast('Saved.'); } return; }
