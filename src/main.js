@@ -26,6 +26,10 @@ const ICONS = {
   plan: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6h12M9 12h12M9 18h12"/><path d="M4 6h.01M4 12h.01M4 18h.01" stroke-width="2.6"/></svg>',
 };
 const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : 'dev';
+// The version inside each Edge Function's code. A deployed function reports its own in ?status=1,
+// so the setup sheets can say when Supabase is still running an older copy.
+const fnVersion = src => Number((String(src).match(/FN_VERSION = (\d+)/) || [])[1] || 1);
+const ASSISTANT_V = fnVersion(ASSISTANT_FN), REMINDERS_V = fnVersion(REMINDERS_FN);
 const THEMES = ['auto','light','dark'];
 // The Sunday that Fresh start installs when "Sundays are rest days" is on.
 const REST_SUNDAY = [
@@ -56,6 +60,24 @@ const CADENCE = [
 ];
 const DOW = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
 const WEEK_ORDER = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+const DOW_LONG = {Sun:'Sunday', Mon:'Monday', Tue:'Tuesday', Wed:'Wednesday', Thu:'Thursday', Fri:'Friday', Sat:'Saturday'};
+// What a block can be. "session:<type>" is pickleball court time: checking it off logs a session.
+// The third value limits a type to one-off items ('day') or to the weekly plan ('week').
+const ITEM_TYPES = [
+  ['event','Appointment or event','day'],
+  ['session:Drill','Pickleball: drill'],
+  ['session:Competitive','Pickleball: competitive'],
+  ['session:Rec play','Pickleball: rec play'],
+  ['session:Tournament','Pickleball: tournament'],
+  ['session:Lesson','Pickleball: lesson'],
+  ['task','To-do block'],
+  ['gym','Gym'],
+  ['mobility','Mobility'],
+  ['watch','Pro video or study'],
+  ['calls','Call block','week'],
+  ['marker','Just a note, no checkbox'],
+];
+const ONEOFF_TAG = {event:'EVENT', task:'TO-DO', gym:'GYM', mobility:'MOBILITY', watch:'STUDY', marker:'NOTE'};
 
 /* ---------- state ---------- */
 const S = {
@@ -129,9 +151,50 @@ const roadmapFor = d => { let cur = null; roadmap().forEach(w => { if (w.start <
 const dayOf = d => S.data.days[d] || {};
 const restDays = () => { const r = profile().restDays; return Array.isArray(r) ? r : ['Sun']; };
 const eventsOn = d => Object.entries(S.data.events || {}).map(([id, e]) => ({id, ...e})).filter(e => e.date === d && e.start).sort((a,b) => a.start < b.start ? -1 : 1);
-const eventItem = e => ({key:'ev-' + e.id, start:e.start, end:e.end || e.start, tag:'EVENT', text:e.title + (e.where ? ' · ' + e.where : ''), kind:'event', eventId:e.id, notes:e.notes});
-// Everything on a given day: the weekly schedule plus one-off calendar events, in time order.
-const itemsFor = d => [...scheduleFor(d), ...eventsOn(d).map(eventItem)].sort((a,b) => toMin(a.start) - toMin(b.start));
+const byStart = (a, b) => toMin(a.start) - toMin(b.start);
+const hhmm = m => { m = Math.max(0, Math.min(24*60 - 1, Math.round(m))); return `${pad(Math.floor(m/60))}:${pad(m % 60)}`; };
+const isHM = v => /^([01]\d|2[0-3]):[0-5]\d$/.test(String(v || ''));
+const minsOf = i => Math.max(0, toMin(i.end || i.start) - toMin(i.start));
+// A one-off item (events collection) as a block. It can be any type: an appointment, court time, gym…
+const eventItem = e => {
+  const kind = e.kind && e.kind !== 'event' ? e.kind : 'event', mins = minsOf(e);
+  return {key:'ev-' + e.id, start:e.start, end:e.end || e.start, kind, eventId:e.id, oneoff:true, notes:e.notes,
+    tag: kind === 'session' ? (e.sessionType || 'Court time') : (ONEOFF_TAG[kind] || 'EVENT'),
+    text: e.title + (e.where ? ' · ' + e.where : ''),
+    sessionType: kind === 'session' ? (e.sessionType || 'Drill') : undefined,
+    hours: kind === 'session' ? (Math.round(mins / 30) / 2 || 1) : undefined,
+    minutes: ['mobility','watch'].includes(kind) && mins ? mins : undefined};
+};
+// One-off moves for a date: days/<date>.moves = {key: {start, end}}. null means back to the usual time.
+const movesOn = d => dayOf(d).moves || {};
+// Everything on a given day: the weekly schedule with that date's moves, plus one-off items, in time order.
+const itemsFor = d => {
+  const mv = movesOn(d);
+  return [...scheduleFor(d).map(i => { const m = mv[i.key]; return m && m.start ? {...i, start:m.start, end:m.end || i.end, movedFrom:i.start, movedFromEnd:i.end} : i; }),
+    ...eventsOn(d).map(eventItem)].sort(byStart);
+};
+const templateDay = dow => clone(((cfg().schedule || {}).days || {})[dow] || []);
+const templateItem = (dow, key) => (((cfg().schedule || {}).days || {})[dow] || []).find(i => i.key === key);
+const typeOf = i => i.kind === 'session' ? 'session:' + (i.sessionType || 'Drill') : (i.kind || 'task');
+const splitType = v => { const [kind, st] = String(v || 'task').split(':'); return {kind, sessionType: kind === 'session' ? (st || 'Drill') : undefined}; };
+const carryable = kind => ['task','gym','mobility','watch','session','dupr'].includes(kind);
+const itemName = i => i.tag || String(i.text || '').split(/[.:,·]/)[0].trim().slice(0, 32) || 'Block';
+const listNames = xs => { const n = xs.map(itemName); return n.length <= 2 ? n.join(' and ') : n.slice(0, -1).join(', ') + ' and ' + n[n.length - 1]; };
+// The other blocks that share any time with start–end on a date.
+function overlaps(date, start, end, exceptKey) {
+  const s = toMin(start), e = Math.max(toMin(end || start), s + 1);
+  return itemsFor(date).filter(i => { const a = toMin(i.start), b = Math.max(toMin(i.end || i.start), a + 1); return i.key !== exceptKey && a < e && s < b; });
+}
+function daysLabel(days) {
+  const set = WEEK_ORDER.filter(x => days.includes(x));
+  if (set.length === 7) return 'every day';
+  if (set.join() === 'Mon,Tue,Wed,Thu,Fri') return 'every weekday';
+  if (set.length === 1) return 'every ' + DOW_LONG[set[0]];
+  return set.slice(0, -1).join(', ') + ' and ' + set[set.length - 1];
+}
+const nextDow = (from, dow) => { for (let n = 0; n < 7; n++) { const d = addDays(from, n); if (dowOf(d) === dow) return d; } return from; };
+const fmtDayLong = s => s ? parseISO(s).toLocaleDateString('en-US',{weekday:'long', month:'long', day:'numeric'}) : '';
+const dayWord = d => d === todayISO() ? 'today' : d === addDays(todayISO(), 1) ? 'tomorrow' : fmtDay(d);
 const isRestDay = d => restDays().includes(dowOf(d));
 const isCheckable = i => i.kind !== 'marker';
 const dialsFor = (d, region) => (dayOf(d).calls || []).filter(c => c.dial && (!region || c.region === region)).length;
@@ -206,6 +269,62 @@ function delDoc(col, id) {
   return enqueue(col + '/' + id, () => db.collection(col).doc(id).delete());
 }
 const patchDay = (d, patch) => patchDoc('days', d, deepMerge({date:d}, patch));
+// Undo for schedule edits: a list of writes that put things back.
+function runOps(ops) { (ops || []).forEach(op => { if (op.set) setDoc(...op.set); else if (op.patch) patchDoc(...op.patch); else if (op.del) delDoc(...op.del); }); }
+
+/* ---------- moving blocks ---------- */
+// Move a block on one date ('day'), or in the weekly plan for that weekday ('week').
+// One-off items move themselves. Returns a short description for the toast, or '' when nothing moved.
+function moveBlock(date, key, start, end, scope) {
+  const i = itemsFor(date).find(x => x.key === key);
+  if (!i || !isHM(start)) return '';
+  if (!isHM(end) || toMin(end) < toMin(start)) end = start;
+  const when = `${fmtTap(start)}${end !== start ? '–' + fmtTap(end) : ''}`;
+  if (i.eventId) {
+    const e = (S.data.events || {})[i.eventId]; if (!e) return '';
+    S.lastUndo = {type:'restore', ops:[{set:['events', i.eventId, clone(e)]}]};
+    setDoc('events', i.eventId, {...e, start, end, updatedAt:Date.now()});
+    return `Moved ${itemName(i)} to ${when}.`;
+  }
+  const dow = dowOf(date);
+  if (scope === 'week') {
+    const arr = templateDay(dow), ti = arr.find(x => x.key === key); if (!ti) return '';
+    const prevMove = movesOn(date)[key];
+    S.lastUndo = {type:'restore', ops:[{patch:['config', 'schedule', {days:{[dow]:templateDay(dow)}}]}, ...(prevMove ? [{patch:['days', date, {moves:{[key]:prevMove}}]}] : [])]};
+    ti.start = start; ti.end = end;
+    if (ti.kind === 'session') ti.hours = Math.round((toMin(end) - toMin(start)) / 30) / 2 || ti.hours;
+    patchDoc('config', 'schedule', {days:{[dow]:arr.sort(byStart)}});
+    if (prevMove) patchDay(date, {moves:{[key]:null}});
+    return `Moved ${itemName(i)} to ${when} every ${DOW_LONG[dow]}.`;
+  }
+  const ti = templateItem(dow, key); if (!ti) return '';
+  S.lastUndo = {type:'restore', ops:[{patch:['days', date, {moves:{[key]:movesOn(date)[key] || null}}]}]};
+  const usual = ti.start === start && (ti.end || ti.start) === end;
+  patchDay(date, {moves:{[key]: usual ? null : {start, end}}});
+  return usual ? `${itemName(i)} is back at ${when}.` : `Moved ${itemName(i)} to ${when}, ${dayWord(date)} only.`;
+}
+function moveBy(date, key, mins, scope) {
+  const i = itemsFor(date).find(x => x.key === key); if (!i) return;
+  const len = minsOf(i), start = hhmm(toMin(i.start) + mins);
+  const msg = moveBlock(date, key, start, hhmm(Math.min(toMin(start) + len, 24*60 - 1)), scope);
+  if (msg) toast(msg, true);
+}
+// The Starts / Ends boxes in a block sheet. Changing the start keeps the length.
+function moveTime(el) {
+  const d = el.dataset, date = d.date || todayISO(), i = itemsFor(date).find(x => x.key === d.key);
+  if (!i || !isHM(el.value)) return;
+  let start = i.start, end = i.end || i.start;
+  if (el.id === 'mv-start') { start = el.value; end = hhmm(Math.min(toMin(start) + minsOf(i), 24*60 - 1)); }
+  else { end = el.value; if (toMin(end) < toMin(start)) { toast('The end is before the start. Change the start first.'); return; } }
+  const msg = moveBlock(date, d.key, start, end, (S.modal && S.modal.scope) || 'day');
+  if (msg) toast(msg, true);
+}
+function resetMove(date, key) {
+  const ti = templateItem(dowOf(date), key); if (!ti) return;
+  S.lastUndo = {type:'restore', ops:[{patch:['days', date, {moves:{[key]:movesOn(date)[key] || null}}]}]};
+  patchDay(date, {moves:{[key]:null}});
+  toast(`${itemName(ti)} is back at ${fmtTap(ti.start)}.`, true);
+}
 
 /* ---------- fresh start ---------- */
 // The Monday the app went live. The first load after this version applies a fresh start
@@ -346,7 +465,7 @@ function viewToday() {
     rest ? `<div class="rest-banner ord-2"><div class="eyebrow">Rest day</div><b>Church, rest and pickleball.</b><div class="meta">Nothing counts as late today.${carried.length ? ` ${plural(carried.length,'to-do')} will be waiting for you tomorrow.` : ''}</div></div>` : '',
     `<div class="progress ord-3 ${pct === 100 ? 'good' : ''}"><div class="bar"><i style="width:${pct}%"></i></div><span class="meta mono">${doneN}/${checkable.length} blocks</span>${behind ? `<span class="pill warn">${behind} behind</span>` : ''}${carried.length && !rest ? `<span class="pill bad">${carried.length} carried over</span>` : ''}</div>`,
     nowCard(items, t),
-    `<section class="card ord-7"><div class="card-h"><h2>Today's plan</h2><div class="btnrow"><span class="meta">${esc(dowOf(t))} schedule</span><button class="btn sm ghost" data-act="event-new" data-date="${t}">+ Event</button></div></div>${items.map(i => planRow(i, t, day)).join('')}</section>`,
+    `<section class="card ord-7"><div class="card-h"><h2>Today's plan</h2><div class="btnrow"><button class="btn sm" data-act="sched-open" data-date="${t}">Edit</button><button class="btn sm" data-act="add-open" data-date="${t}">+ Add</button></div></div>${items.map(i => planRow(i, t, day)).join('')}</section>`,
   ];
   const side = [
     amCard(t, day),
@@ -364,7 +483,7 @@ function tipBanner() {
   let done = false; try { done = !!localStorage.getItem('lcc-tip-done'); } catch(e) {}
   if (done) return '';
   const desktop = window.matchMedia && matchMedia('(min-width: 980px)').matches;
-  return `<div class="tip"><span><b>Tap any block, to-do or number</b> for the story behind it.${desktop ? ' Keys: <kbd>1</kbd>–<kbd>5</kbd> tabs, <kbd>/</kbd> search leads, <kbd>n</kbd> new to-do, <kbd>e</kbd> new event, <kbd>c</kbd> start calling, <kbd>a</kbd> ask.' : ' During a call block, tap <b>Start calling</b> and work one lead at a time.'}</span><button class="btn sm ghost" data-act="tip-done">Got it</button></div>`;
+  return `<div class="tip"><span><b>Tap any block, to-do or number</b> for the story behind it.${desktop ? ' Keys: <kbd>1</kbd>–<kbd>5</kbd> tabs, <kbd>/</kbd> search leads, <kbd>n</kbd> new to-do, <kbd>s</kbd> schedule, <kbd>e</kbd> add to your plan, <kbd>c</kbd> start calling, <kbd>a</kbd> ask.' : ' During a call block, tap <b>Start calling</b> and work one lead at a time.'}</span><button class="btn sm ghost" data-act="tip-done">Got it</button></div>`;
 }
 function nowCard(items, t) {
   const m = nowMin();
@@ -411,15 +530,17 @@ function planRow(i, t, day) {
     const rec = s && num(s.games) ? `Record ${num(s.won)||0}-${num(s.games)-(num(s.won)||0)} · ` : '';
     subs.push(`${rec}<a data-act="session-edit" data-id="${sid}">${s && (num(s.games) || s.workOn || s.wentWell) ? 'Edit session' : 'Add record + notes'}</a>`);
   }
+  if (i.movedFrom) subs.push(`Moved from ${fmtTap(i.movedFrom)}, today only.`);
   if (skipped) subs.push('Skipped today. No make-up.');
   else if (i.carry && !done) subs.push('Moves to tomorrow if not done.');
-  const menu = S.openItem === i.key ? `<div class="menu">${skipped
+  const canSkip = isCheckable(i) && !['checkin','checkout'].includes(i.kind);
+  const menu = S.openItem === i.key ? `<div class="menu"><span class="meta">Push back</span>${[[15,'15 min'],[30,'30 min'],[60,'1 hour']].map(([m,l]) => `<button class="btn sm" data-act="move-by" data-key="${esc(i.key)}" data-date="${t}" data-m="${m}" data-scope="day">${l}</button>`).join('')}<button class="btn sm ghost" data-act="block" data-key="${esc(i.key)}">Move…</button>${!canSkip ? '' : skipped
       ? `<button class="btn sm" data-act="skip" data-key="${esc(i.key)}" data-on="0">Unskip</button>`
       : `<button class="btn sm" data-act="skip" data-key="${esc(i.key)}" data-on="1">Skip today (no make-up)</button>`}</div>` : '';
   return `<div class="row ${!isCheckable(i) ? 'marker' : ''} ${done ? 'done' : ''} ${isNow ? 'is-now' : ''} ${late ? 'late' : ''}">
     <div class="time" data-act="block" data-key="${esc(i.key)}">${fmtT(i.start)}</div>${box}
-    <div class="txt" data-act="block" data-key="${esc(i.key)}" role="button" tabindex="0">${i.tag ? `<span class="tag ${i.kind === 'event' ? 'ev' : ''}">${esc(i.tag)}</span>` : ''}${esc(i.text)}${subs.map(s => `<div class="sub">${s}</div>`).join('')}</div>
-    ${isCheckable(i) && !['checkin','checkout'].includes(i.kind) ? `<button class="more" data-act="item-menu" data-key="${esc(i.key)}" aria-label="More options">⋯</button>` : '<span></span>'}
+    <div class="txt" data-act="block" data-key="${esc(i.key)}" role="button" tabindex="0">${i.tag ? `<span class="tag ${i.eventId ? 'ev' : ''}">${esc(i.tag)}</span>` : ''}${esc(i.text)}${subs.map(s => `<div class="sub">${s}</div>`).join('')}</div>
+    <button class="more" data-act="item-menu" data-key="${esc(i.key)}" aria-label="Move or skip ${esc(itemName(i))}">⋯</button>
     ${menu}</div>`;
 }
 function taskRow(x, t) {
@@ -462,7 +583,7 @@ function amCard(t, day) {
     </form></section>`;
 }
 function dayAuto(t) {
-  const day = dayOf(t), sched = scheduleFor(t), ch = day.checks || {};
+  const day = dayOf(t), sched = itemsFor(t), ch = day.checks || {};
   const top = ((day.am || {}).top3 || []).filter(x => x.t);
   const sess = Object.values(S.data.sessions).filter(s => s.date === t);
   return {
@@ -629,6 +750,8 @@ function undo() {
     u.tasks.forEach(id => delDoc('tasks', id));
   } else if (u.type === 'task') {
     setDoc('tasks', u.id, u.prev);
+  } else if (u.type === 'restore') {
+    runOps(u.ops);
   }
   toast('Undone.');
 }
@@ -640,7 +763,7 @@ function dayStatsFor(d) {
   (day.calls || []).forEach(c => { if (c.dial) st.dials++; if (c.convo) st.convos++; if (c.demo) st.demos++; if (c.dm) st.dms++; });
   st.proposals += num(pm.proposals)||0; st.deals += num(pm.deals)||0; st.mockups += num(pm.mockups)||0; st.dms += num(pm.dms)||0; st.cash += num(pm.cash)||0; st.pro += num(pm.proExtra)||0;
   if (day.am && day.am.savedAt) st.checkins++; if (pm.savedAt) st.checkouts++;
-  scheduleFor(d).forEach(i => { if (!ch[i.key]) return; if (i.kind === 'gym') st.gym++; if (i.kind === 'mobility') st.mobility += i.minutes||15; if (i.kind === 'watch') st.pro += i.minutes||30; });
+  itemsFor(d).forEach(i => { if (!ch[i.key]) return; if (i.kind === 'gym') st.gym++; if (i.kind === 'mobility') st.mobility += i.minutes||15; if (i.kind === 'watch') st.pro += i.minutes||30; });
   Object.values(S.data.sessions).forEach(s => { if (s.date === d) { if (s.type === 'Drill') st.drill++; if (['Competitive','Tournament'].includes(s.type)) st.competitive++; } });
   return st;
 }
@@ -697,9 +820,9 @@ function viewWeek() {
         <div class="fld"><label for="rv-leak">Biggest leak this week</label><input class="in" id="rv-leak" data-draft value="${esc(draft('rv-leak', review.leak))}" placeholder="e.g. popping up resets from the transition zone"></div>
         <div class="fld"><label for="rv-fix">One fix for next week</label><input class="in" id="rv-fix" data-draft value="${esc(draft('rv-fix', review.fix))}" placeholder="Shows on every drill block next week"></div>
         <div class="btnrow"><button class="btn primary" type="submit">Save review</button>${review.savedAt ? '<span class="meta">Saved</span>' : ''}</div></form></section></div>
-    <section class="card"><div class="card-h"><h2>Exact schedule</h2><span class="meta">Same every week</span></div>
+    <section class="card"><div class="card-h"><h2>Day by day</h2><button class="btn sm" data-act="sched-open" data-date="${selDate}">Edit</button></div>
       <div class="daychips">${WEEK_ORDER.map(d => `<button class="${d === sel ? 'on' : ''}" data-act="week-day" data-d="${d}">${d}</button>`).join('')}</div>
-      <div style="margin-top:6px">${scheduleFor(selDate).map(i => `<div class="row ${!isCheckable(i) ? 'marker' : ''}"><div class="time">${fmtT(i.start)}</div>${isCheckable(i) ? `<span class="ck ${isDone(i, selDate) ? 'on' : ''}" aria-hidden="true" style="cursor:default"></span>` : '<span class="dot"></span>'}<div class="txt">${i.tag ? `<span class="tag">${esc(i.tag)}</span>` : ''}${esc(i.text)}${i.carry ? '<div class="sub">Moves to the next day if missed.</div>' : ''}</div><span></span></div>`).join('')}</div></section>`;
+      <div style="margin-top:6px">${itemsFor(selDate).map(i => `<div class="row ${!isCheckable(i) ? 'marker' : ''}"><div class="time">${fmtT(i.start)}</div>${isCheckable(i) ? `<span class="ck ${isDone(i, selDate) ? 'on' : ''}" aria-hidden="true" style="cursor:default"></span>` : '<span class="dot"></span>'}<div class="txt" data-act="block" data-key="${esc(i.key)}" data-date="${selDate}" role="button" tabindex="0">${i.tag ? `<span class="tag ${i.eventId ? 'ev' : ''}">${esc(i.tag)}</span>` : ''}${esc(i.text)}${i.movedFrom ? `<div class="sub">Moved from ${fmtTap(i.movedFrom)} this day.</div>` : i.eventId ? '<div class="sub">Just this day.</div>' : i.carry ? '<div class="sub">Moves to the next day if missed.</div>' : ''}</div><span></span></div>`).join('')}</div></section>`;
 }
 function moneyCard(t) {
   const m = cfg().money || {}, p = profile(), gate = p.gate || {saved:10000, monthly:3000, date:'2026-12-01'};
@@ -867,7 +990,10 @@ function viewPlan() {
   return `
     ${planOverview(t)}
     <div class="two-eq"><div class="col">
-    <section class="card"><div class="card-h"><h2>Add a to-do</h2><button class="btn sm ghost" data-act="event-new">+ Event</button></div>${addTaskForm('pt', t)}</section>
+    <section class="card"><div class="card-h"><h2>Your schedule</h2><div class="btnrow"><button class="btn sm" data-act="sched-open">Edit</button><button class="btn sm" data-act="add-open">+ Add</button></div></div>
+      <div class="meta">Move, add or take out blocks for one day or for every week. Or tap Ask and say it, like "move my drill to 6 tomorrow".</div>
+      <div class="daychips" style="margin-top:8px">${WEEK_ORDER.map(x => `<button data-act="sched-open" data-date="${nextDow(t, x)}">${x}</button>`).join('')}</div></section>
+    <section class="card"><div class="card-h"><h2>Add a to-do</h2></div>${addTaskForm('pt', t)}</section>
     <section class="card"><div class="card-h"><h2>Coming up</h2><span class="meta">${plural(upcoming.length,'to-do')}</span></div>
       ${Object.keys(groups).length ? Object.keys(groups).sort().map(d => { const g = groups[d]; return `<h3>${d === t ? 'Today' : esc(fmtDay(d))}</h3>${g.events.map(e => `<div class="trow ev"><span class="evdot" aria-hidden="true"></span><div class="min0"><div class="txt" data-act="event-edit" data-id="${esc(e.id)}" role="button" tabindex="0"><span class="mono">${fmtTap(e.start)}${e.end && e.end !== e.start ? '–' + fmtTap(e.end) : ''}</span> ${esc(e.title)}</div>${e.where ? `<div class="meta">${esc(e.where)}</div>` : ''}</div></div>`).join('')}${g.tasks.map(x => `<div class="trow"><button class="ck" data-act="task-toggle" data-id="${esc(x.id)}" aria-label="Done: ${esc(x.title)}"></button><div class="min0"><div class="txt" data-act="task-open" data-id="${esc(x.id)}" role="button" tabindex="0">${esc(x.title)}</div><div class="btnrow" style="margin-top:6px">${x.area ? `<span class="pill">${esc(x.area)}</span>` : ''}<input class="in" type="date" value="${esc(x.due)}" data-act="task-date" data-id="${esc(x.id)}" aria-label="Move date" style="width:auto;padding:4px 8px;font-size:14px"><button class="btn sm ghost" data-act="task-drop" data-id="${esc(x.id)}">Drop</button></div></div></div>`).join('')}`; }).join('') : '<div class="meta">Nothing scheduled.</div>'}</section></div>
     <section class="card"><div class="card-h"><h2>Roadmap</h2><span class="meta">To the move, then DUPR 5.5</span></div>
@@ -1025,7 +1151,7 @@ function settingsCard() {
       <div class="btnrow"><button class="btn sm" data-act="export">Download</button>${importControl('btn sm')}</div></div>
     <div class="srow"><div class="lbl">Account<small>${esc(S.email || '')}</small></div>
       <div class="btnrow"><button class="btn sm ghost" data-act="signout">Sign out</button>${configSource === 'device' ? '<button class="btn sm ghost" data-act="disconnect">Disconnect</button>' : ''}</div></div>
-    <div class="meta" style="margin-top:10px">Laptop keys: <span class="kbd">1</span>–<span class="kbd">5</span> tabs · <span class="kbd">/</span> search leads · <span class="kbd">n</span> new to-do · <span class="kbd">c</span> start calling · <span class="kbd">e</span> new event · <span class="kbd">a</span> ask · <span class="kbd">Esc</span> close</div>
+    <div class="meta" style="margin-top:10px">Laptop keys: <span class="kbd">1</span>–<span class="kbd">5</span> tabs · <span class="kbd">/</span> search leads · <span class="kbd">n</span> new to-do · <span class="kbd">c</span> start calling · <span class="kbd">s</span> schedule · <span class="kbd">e</span> add to your plan · <span class="kbd">a</span> ask · <span class="kbd">Esc</span> close</div>
     <div class="meta" style="margin-top:6px">Version ${esc(APP_VERSION)}${S.updateApp ? ' · <a data-act="update-app">Update ready, tap to reload</a>' : ''}</div>
   </section>`;
 }
@@ -1033,18 +1159,22 @@ function settingsCard() {
 const closeOnly = title => `<div class="card-h"><h2>${esc(title)}</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div><div class="meta">Nothing to show here right now.</div>`;
 const linkBtn = (name, label) => { const l = (profile().links || {})[name]; return l ? `<a class="btn sm" href="${esc(l)}" target="_blank" rel="noopener">${label}</a>` : ''; };
 const KIND_LABEL = {marker:'Marker', task:'Task block', checkin:'Check-in', checkout:'Check-out', calls:'Call block', session:'Court time', gym:'Gym', mobility:'Mobility', watch:'Study', dupr:'DUPR', event:'Calendar event'};
-function blockSheet(key) {
-  const t = todayISO(), i = itemsFor(t).find(x => x.key === key);
+function blockSheet(key, date) {
+  const today = todayISO(), t = date || today, isToday = t === today;
+  const i = itemsFor(t).find(x => x.key === key);
   if (!i) return closeOnly('Block');
-  const done = isCheckable(i) && isDone(i, t), skipped = isSkipped(i, t), m = nowMin(), rest = isRestDay(t);
-  const status = !isCheckable(i) ? '' : skipped ? '<span class="pill">Skipped today</span>' : done ? '<span class="pill good">Done</span>' : (toMin(i.end || i.start) <= m && !rest) ? '<span class="pill warn">Behind</span>' : (toMin(i.start) <= m ? '<span class="pill acc">Now</span>' : `<span class="pill">In ${fmtMins(toMin(i.start) - m)}</span>`);
-  const kindLabel = KIND_LABEL[i.kind] || i.kind;
+  const back = S.modal && S.modal.back === 'sched' ? `<button class="btn sm ghost" data-act="sched-open" data-date="${t}">‹ Back</button>` : '';
+  const done = isToday && isCheckable(i) && isDone(i, t), skipped = isSkipped(i, t), m = nowMin(), rest = isRestDay(t);
+  const status = !isToday ? `<span class="pill">${esc(fmtDayLong(t))}</span>${skipped ? ' <span class="pill">Off this day</span>' : ''}`
+    : !isCheckable(i) ? '' : skipped ? '<span class="pill">Skipped today</span>' : done ? '<span class="pill good">Done</span>' : (toMin(i.end || i.start) <= m && !rest) ? '<span class="pill warn">Behind</span>' : (toMin(i.start) <= m ? '<span class="pill acc">Now</span>' : `<span class="pill">In ${fmtMins(toMin(i.start) - m)}</span>`);
+  const kindLabel = i.eventId ? (i.kind === 'event' ? 'Just this day' : `${KIND_LABEL[i.kind] || i.kind}, just this day`) : (KIND_LABEL[i.kind] || i.kind);
   const startDate = profile().startDate || '0000-00-00';
-  const hist = [1,2,3,4].map(n => { const d = addDays(t, -7*n); if (d < startDate) return null; const sched = scheduleFor(d).find(x => x.key === key); return sched ? {d, done:isDone(sched, d), skipped:isSkipped(sched, d)} : null; }).filter(Boolean).reverse();
+  const hist = !isToday ? [] : [1,2,3,4].map(n => { const d = addDays(t, -7*n); if (d < startDate) return null; const sched = scheduleFor(d).find(x => x.key === key); return sched ? {d, done:isDone(sched, d), skipped:isSkipped(sched, d)} : null; }).filter(Boolean).reverse();
   const histHtml = hist.length ? `<div class="hist">${hist.map(h => `<span class="hdot ${h.done ? 'on' : h.skipped ? 'skip' : ''}" title="${esc(fmtDay(h.d))}: ${h.done ? 'done' : h.skipped ? 'skipped' : 'missed'}"></span>`).join('')}<span class="meta">Last ${plural(hist.length, dowOf(t))}: ${hist.filter(h => h.done).length} done</span></div>` : '';
   const T = targets(), st = weekStats(weekStartOf(t));
   let panel = '';
-  if (i.kind === 'calls') panel = `<div class="auto"><div><b>${dialsFor(t, i.region)}/${i.quota}</b><span>${regionName(i.region)} dials today</span></div><div><b>${callsCount(t,'convo')}</b><span>owner talks today</span></div><div><b>${st.dials}/${T.dials || 150}</b><span>dials this week</span></div></div><div class="meta">Each result you tap counts the dial and books the next touch: call, call in 2 days, DM in 2 more, call in 3, last email in 6.</div><div class="btnrow"><button class="btn primary" data-act="view" data-v="calls">Open calls</button></div>`;
+  if (!isToday) panel = '';
+  else if (i.kind === 'calls') panel = `<div class="auto"><div><b>${dialsFor(t, i.region)}/${i.quota}</b><span>${regionName(i.region)} dials today</span></div><div><b>${callsCount(t,'convo')}</b><span>owner talks today</span></div><div><b>${st.dials}/${T.dials || 150}</b><span>dials this week</span></div></div><div class="meta">Each result you tap counts the dial and books the next touch: call, call in 2 days, DM in 2 more, call in 3, last email in 6.</div><div class="btnrow"><button class="btn primary" data-act="view" data-v="calls">Open calls</button></div>`;
   else if (i.kind === 'session') {
     const sid = `auto-${t}-${key}`, s = S.data.sessions[sid], f = lastFix(t);
     panel = `${f ? `<div class="week-banner"><div class="eyebrow">This week's fix</div><b>${esc(f)}</b></div>` : ''}<div class="auto"><div><b>${st.drill}/${T.drill || 5}</b><span>drill sessions this week</span></div><div><b>${st.competitive}/${T.competitive || 3}</b><span>competitive this week</span></div><div><b>${s && num(s.games) ? `${num(s.won) || 0}-${num(s.games) - (num(s.won) || 0)}` : '–'}</b><span>today's record</span></div></div>${s ? `<div class="btnrow"><button class="btn sm" data-act="session-edit" data-id="${sid}">${num(s.games) || s.workOn || s.wentWell ? 'Edit today\'s session' : 'Add record + notes'}</button></div>` : '<div class="meta">Check it off and a session is logged for you. Add your record and notes after.</div>'}`;
@@ -1056,16 +1186,33 @@ function blockSheet(key) {
   else if (i.kind === 'checkout') panel = `<div class="btnrow"><button class="btn primary" data-act="goto" data-id="pm-card">Go to the check-out</button></div>`;
   else if (i.kind === 'dupr') { const dl = duprList(), last = dl[dl.length - 1]; panel = `<div class="auto"><div><b>${last ? num(last.rating).toFixed(3) : '–'}</b><span>latest DUPR</span></div></div><div class="btnrow"><button class="btn primary" data-act="view" data-v="log">Log today's DUPR</button></div>`; }
   else if (i.kind === 'task' && i.area) panel = `<div class="meta">Counts toward ${esc(i.area)}.${i.carry ? ' If it is not done today it comes back tomorrow as a make-up.' : ''}</div>`;
-  else if (i.kind === 'event') { const ev = (S.data.events || {})[i.eventId] || {}; panel = `${ev.notes ? `<p class="note">${esc(ev.notes)}</p>` : ''}<div class="btnrow"><button class="btn" data-act="event-edit" data-id="${esc(i.eventId)}">Edit event</button><button class="btn ghost" data-act="event-ics" data-id="${esc(i.eventId)}">Add to my calendar</button></div>`; }
-  const acts = isCheckable(i) && !['checkin','checkout','dupr'].includes(i.kind)
-    ? `<div class="btnrow">${done ? `<button class="btn ghost" data-act="check" data-key="${esc(key)}">Undo</button>` : `<button class="btn primary" data-act="check" data-key="${esc(key)}">Mark done</button>`}${skipped ? `<button class="btn" data-act="skip" data-key="${esc(key)}" data-on="0">Unskip</button>` : `<button class="btn ghost" data-act="skip" data-key="${esc(key)}" data-on="1">Skip today (no make-up)</button>`}</div>` : '';
-  return `<div class="card-h"><h2>${esc(i.tag || kindLabel)}</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
+  if (i.eventId) { const ev = (S.data.events || {})[i.eventId] || {}; panel += `${ev.notes ? `<p class="note">${esc(ev.notes)}</p>` : ''}<div class="btnrow"><button class="btn" data-act="event-edit" data-id="${esc(i.eventId)}">Edit event</button><button class="btn ghost" data-act="event-ics" data-id="${esc(i.eventId)}">Add to my calendar</button></div>`; }
+  const canAct = isCheckable(i) && !['checkin','checkout','dupr'].includes(i.kind);
+  const acts = !canAct ? '' : `<div class="btnrow">${isToday ? (done ? `<button class="btn ghost" data-act="check" data-key="${esc(key)}">Undo</button>` : `<button class="btn primary" data-act="check" data-key="${esc(key)}">Mark done</button>`) : ''}${skipped
+    ? `<button class="btn" data-act="skip" data-key="${esc(key)}" data-date="${t}" data-on="0">${isToday ? 'Unskip' : 'Put it back on ' + esc(fmtDay(t))}</button>`
+    : `<button class="btn ghost" data-act="skip" data-key="${esc(key)}" data-date="${t}" data-on="1">${isToday ? 'Skip today (no make-up)' : 'Take it off ' + esc(fmtDay(t))}</button>`}</div>`;
+  const over = overlaps(t, i.start, i.end || i.start, i.key);
+  const overHtml = over.length ? `<div class="over"><span class="meta">Overlaps</span>${over.map(o => `<button class="chip" data-act="block" data-key="${esc(o.key)}" data-date="${t}">${esc(fmtTap(o.start))} ${esc(itemName(o))}</button>`).join('')}</div>` : '';
+  const editRow = i.eventId ? '' : `<div class="btnrow"><button class="btn ghost" data-act="block-edit" data-key="${esc(key)}" data-date="${t}">Change it or take it out of your week</button></div>`;
+  return `<div class="card-h"><h2>${esc(i.tag || kindLabel)}</h2><div class="btnrow">${back}<button class="btn sm ghost" data-act="modal-close">Close</button></div></div>
     <div class="meta mono">${fmtTap(i.start)}${i.end && i.end !== i.start ? ' – ' + fmtTap(i.end) : ''} · ${esc(kindLabel)}${i.carry ? ' · moves to tomorrow if missed' : ''}</div>
     <p style="margin:0;font-size:16px">${esc(i.text)}</p>
     ${status ? `<div>${status}</div>` : ''}
+    ${acts}
+    ${movePanel(i, t)}
+    ${overHtml}
     ${panel}
     ${histHtml}
-    ${acts}`;
+    ${editRow}`;
+}
+// The "Move it" box: nudge buttons, exact times, and whether the change is for this day or every week.
+function movePanel(i, t) {
+  const scope = i.eventId ? 'day' : ((S.modal && S.modal.scope) || 'day');
+  const dow = dowOf(t);
+  return `<div class="movebox"><div class="card-h"><h3>Move it</h3>${i.movedFrom ? `<span class="meta">Usually ${fmtTap(i.movedFrom)} · <a data-act="move-reset" data-key="${esc(i.key)}" data-date="${t}">Put it back</a></span>` : ''}</div>
+    ${i.eventId ? '' : `<div class="seg scope" role="group" aria-label="Which days"><button type="button" class="${scope === 'day' ? 'on' : ''}" data-act="move-scope" data-s="day" aria-pressed="${scope === 'day'}">Only ${esc(dayWord(t))}</button><button type="button" class="${scope === 'week' ? 'on' : ''}" data-act="move-scope" data-s="week" aria-pressed="${scope === 'week'}">Every ${DOW_LONG[dow]}</button></div>`}
+    <div class="nudges">${[[-30,'−30'],[-15,'−15'],[15,'+15'],[30,'+30'],[60,'+60']].map(([m, l]) => `<button type="button" class="btn sm" data-act="move-by" data-key="${esc(i.key)}" data-date="${t}" data-m="${m}" aria-label="${m < 0 ? 'Earlier' : 'Later'} by ${Math.abs(m)} minutes">${l}</button>`).join('')}<span class="meta">minutes</span></div>
+    <div class="grid2"><div class="fld"><label for="mv-start">Starts</label><input class="in" type="time" id="mv-start" value="${esc(i.start)}" data-act="move-time" data-key="${esc(i.key)}" data-date="${t}"></div><div class="fld"><label for="mv-end">Ends</label><input class="in" type="time" id="mv-end" value="${esc(i.end || i.start)}" data-act="move-time" data-key="${esc(i.key)}" data-date="${t}"></div></div></div>`;
 }
 function taskSheet(id) {
   const x = S.data.tasks[id]; if (!x) return closeOnly('To-do');
@@ -1137,7 +1284,7 @@ async function notifCheck() {
     if (r.status === 404) S.notif = {fn:'missing'};
     else if (r.status === 401 || r.status === 403) S.notif = {fn:'error', msg:'The function is there but still checks for a login. Open its settings and turn off "Verify JWT".'};
     else if (!r.ok) { const txt = await r.text().catch(() => ''); let m = ''; try { m = JSON.parse(txt).error || ''; } catch(e) { m = txt; } S.notif = {fn:'error', msg:`The function answered ${r.status}. ${String(m).slice(0, 160)}`}; }
-    else { const j = await r.json(); const age = j.lastRun ? (Date.now() - Date.parse(j.lastRun)) / 60000 : Infinity; S.notif = {fn:'ok', cron: age <= 3 ? 'ok' : 'idle', lastRun:j.lastRun, subscriptions:j.subscriptions}; }
+    else { const j = await r.json(); const age = j.lastRun ? (Date.now() - Date.parse(j.lastRun)) / 60000 : Infinity; S.notif = {fn:'ok', cron: age <= 3 ? 'ok' : 'idle', lastRun:j.lastRun, subscriptions:j.subscriptions, version:Number(j.version) || 1}; }
   } catch (e) { S.notif = {fn:'error', msg:"Couldn't reach the function. Check your connection and that the function is deployed."}; }
   render();
 }
@@ -1187,7 +1334,7 @@ function notifSheet() {
     : on ? `On for this device${sub.tz ? ', ' + esc(sub.tz) : ''}.` : 'Your browser will ask once for permission, then a test notification is sent.';
   return `<div class="card-h"><h2>Phone notifications</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
     <p class="meta" style="margin:0;color:var(--ink-2)">A tiny function in your own Supabase project checks the clock every minute and nudges this device before each block. Set it up once; every device after that is just step 3.</p>
-    ${step(1, 'Create the function', `In Supabase open <b>Edge Functions</b> › <b>Deploy a new function</b> › <b>Via Editor</b>. Name it <span class="kbd">reminders</span>, replace all the code with the copied code, and <b>Deploy</b>. Then open the function's <b>Settings</b> and turn <b>off</b> "Verify JWT".<div class="btnrow" style="margin-top:6px"><button class="btn sm" data-act="copy-fn">Copy the code</button><button class="btn sm ghost" data-act="notif-check">${st.checking ? 'Checking…' : 'Check'}</button>${st.fn === 'ok' ? '<span class="pill good">Found</span>' : st.fn === 'missing' ? '<span class="pill warn">Not found yet</span>' : st.fn === 'error' ? '<span class="pill bad">Problem</span>' : ''}</div>${st.fn === 'error' && st.msg ? `<div class="err" style="margin-top:6px">${esc(st.msg)}</div>` : ''}`, st.fn === 'ok')}
+    ${step(1, 'Create the function', `In Supabase open <b>Edge Functions</b> › <b>Deploy a new function</b> › <b>Via Editor</b>. Name it <span class="kbd">reminders</span>, replace all the code with the copied code, and <b>Deploy</b>. Then open the function's <b>Settings</b> and turn <b>off</b> "Verify JWT".<div class="btnrow" style="margin-top:6px"><button class="btn sm" data-act="copy-fn">Copy the code</button><button class="btn sm ghost" data-act="notif-check">${st.checking ? 'Checking…' : 'Check'}</button>${st.fn === 'ok' ? ((st.version || 1) < REMINDERS_V ? '<span class="pill warn">Update needed</span>' : '<span class="pill good">Found</span>') : st.fn === 'missing' ? '<span class="pill warn">Not found yet</span>' : st.fn === 'error' ? '<span class="pill bad">Problem</span>' : ''}</div>${st.fn === 'ok' && (st.version || 1) < REMINDERS_V ? '<div class="meta" style="margin-top:6px">Supabase is running an older copy, so moved blocks would nudge at their usual time. Copy the code, open the <b>reminders</b> function, replace all of its code, Deploy, then tap Check.</div>' : ''}${st.fn === 'error' && st.msg ? `<div class="err" style="margin-top:6px">${esc(st.msg)}</div>` : ''}`, st.fn === 'ok' && (st.version || 1) >= REMINDERS_V)}
     ${step(2, 'Run it every minute', `In Supabase open <b>Integrations</b> › <b>Cron</b> (enable it if asked) › <b>Create job</b>. Name <span class="kbd">reminders</span>, schedule <span class="kbd">* * * * *</span>, type <b>Supabase Edge Function</b>, pick <b>reminders</b>, method <b>POST</b>, Create. Prefer SQL? Copy it and run it in the SQL Editor instead.<div class="btnrow" style="margin-top:6px"><button class="btn sm ghost" data-act="copy-sql">Copy the SQL</button>${st.cron === 'ok' ? '<span class="pill good">Running</span>' : st.cron === 'idle' ? '<span class="pill warn">Not running yet. Check again in two minutes.</span>' : ''}</div>`, st.cron === 'ok')}
     ${step(3, 'Turn it on for this device', three, on)}
     <div class="btnrow">
@@ -1197,21 +1344,91 @@ function notifSheet() {
     ${st.msg && st.fn !== 'error' ? `<div class="${st.kind === 'ok' ? 'ok-box' : 'err'}">${esc(st.msg)}</div>` : ''}
     <div class="meta">Calendar alarms are the no-setup alternative: <a data-act="calendar">Add to calendar</a> gives you a weekly calendar with an alarm before every block.</div>`;
 }
-/* ----- calendar events ----- */
+/* ----- your schedule: move, add and change blocks, for one day or every week ----- */
+function typeSelect(id, value, scope) {
+  const opts = ITEM_TYPES.filter(([, , only]) => !only || only === scope);
+  if (!opts.some(([v]) => v === value)) value = scope === 'day' ? 'event' : 'task';
+  return `<select class="in" id="${id}" data-draft data-rerender>${opts.map(([v, l]) => `<option value="${esc(v)}" ${v === value ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>`;
+}
+const toggleRow = (id, on, label) => `<div class="btnrow"><button type="button" class="ck ${on ? 'on' : ''}" data-act="toggle-draft" data-k="${id}" data-v="${on ? 1 : 0}" aria-pressed="${on}" aria-label="${esc(label)}"></button><span>${esc(label)}</span></div>`;
+const dayPicker = (act, sel, has) => `<div class="daychips">${WEEK_ORDER.map(x => `<button type="button" class="${sel.includes(x) ? 'on' : ''}" data-act="${act}" data-d="${x}" aria-pressed="${sel.includes(x)}">${x}${has && has.includes(x) ? '<i class="hasdot"></i>' : ''}</button>`).join('')}</div>`;
+function schedSheet() {
+  const today = todayISO(), date = S.modal.date || today;
+  const items = itemsFor(date), dow = dowOf(date);
+  const chips = [0,1,2,3,4,5,6].map(n => { const d = addDays(today, n); return `<button class="chip ${d === date ? 'on' : ''}" data-act="sched-open" data-date="${d}">${n === 0 ? 'Today' : n === 1 ? 'Tomorrow' : esc(fmtDay(d))}</button>`; }).join('');
+  const other = date < today || date > addDays(today, 6);
+  return `<div class="card-h"><h2>Your schedule</h2><button class="btn sm ghost" data-act="modal-close">Done</button></div>
+    <div class="chips">${chips}${other ? `<button class="chip on">${esc(fmtDay(date))}</button>` : ''}</div>
+    <div class="schedhead"><b>${esc(fmtDayLong(date))}</b>${isRestDay(date) ? ' <span class="pill">Rest day</span>' : ''}<label class="pickday meta">Another day <input class="in" type="date" id="sc-date" value="${date}"></label></div>
+    <div class="meta">Tap a block to move it, change it or take it off. A move can be for this day only or for every ${DOW_LONG[dow]}.</div>
+    <div class="sched">${items.map(i => schedRow(i, date)).join('') || '<div class="meta">Nothing planned.</div>'}</div>
+    <div class="btnrow"><button class="btn primary" data-act="add-open" data-date="${date}" data-back="sched">+ Add to ${esc(dayWord(date))}</button><button class="btn" data-act="add-open" data-date="${date}" data-scope="week" data-back="sched">+ Add to every ${DOW_LONG[dow]}</button></div>`;
+}
+function schedRow(i, date) {
+  const skipped = isCheckable(i) && isSkipped(i, date);
+  const notes = [i.movedFrom ? `<span class="pill acc">Moved from ${fmtTap(i.movedFrom)}</span>` : '', i.eventId ? '<span class="pill good">Just this day</span>' : '', skipped ? '<span class="pill">Off this day</span>' : ''].filter(Boolean).join(' ');
+  return `<button type="button" class="srow-b ${skipped ? 'skipped' : ''} ${i.kind === 'marker' ? 'marker' : ''}" data-act="block" data-key="${esc(i.key)}" data-date="${date}" data-back="sched">
+    <span class="time mono">${fmtTap(i.start)}${i.end && i.end !== i.start ? `<br>${fmtTap(i.end)}` : ''}</span>
+    <span class="min0"><span class="txtc">${i.tag ? `<span class="tag ${i.eventId ? 'ev' : ''}">${esc(i.tag)}</span>` : ''}${esc(i.text)}</span>${notes ? `<span class="sub">${notes}</span>` : ''}</span>
+    <span class="chev" aria-hidden="true">›</span></button>`;
+}
+// What, when, type, where and details: shared by the Add form and the one-off edit form.
+function itemFields(o) {
+  return `<div class="fld"><label for="ev-title">What</label><input class="in" id="ev-title" data-draft value="${esc(o.title)}" placeholder="${o.scope === 'week' ? 'Gym, pickleball, study' : 'Pickleball, dentist, demo with Lisa'}" autocomplete="off"></div>
+    ${o.scope === 'day' ? `<div class="fld"><label for="ev-date">Date</label><input class="in" type="date" id="ev-date" data-draft ${o.dateRerender ? 'data-rerender' : ''} value="${esc(o.date)}"></div>` : ''}
+    <div class="grid2"><div class="fld"><label for="ev-start">Starts</label><input class="in" type="time" id="ev-start" data-draft value="${esc(o.start)}"></div><div class="fld"><label for="ev-end">Ends</label><input class="in" type="time" id="ev-end" data-draft value="${esc(o.end)}"></div></div>
+    <div class="fld"><label for="ad-type">Type</label>${typeSelect('ad-type', o.type, o.scope)}</div>
+    ${o.scope === 'day' ? `<div class="fld"><label for="ev-where">Where</label><input class="in" id="ev-where" data-draft value="${esc(o.where)}" placeholder="Address, Zoom, the courts"></div>` : ''}
+    <div class="fld"><label for="ev-notes">Details</label><textarea class="in" id="ev-notes" data-draft placeholder="Optional">${esc(o.notes)}</textarea></div>`;
+}
+function addForm() {
+  const m = S.modal, scope = m.scope === 'week' ? 'week' : 'day';
+  const date = draft('ev-date', m.date || todayISO()), dow = dowOf(/^\d{4}-\d{2}-\d{2}$/.test(date) ? date : todayISO());
+  const type = draft('ad-type', scope === 'day' ? 'event' : 'task'), kind = splitType(type).kind;
+  const sel = m.days && m.days.length ? m.days : [dow];
+  const carry = S.drafts['ad-carry'] !== undefined ? S.drafts['ad-carry'] : false;
+  const back = m.back === 'sched' ? `<button class="btn sm ghost" data-act="sched-open" data-date="${m.date}">‹ Back</button>` : '';
+  return `<div class="card-h"><h2>Add to your plan</h2><div class="btnrow">${back}<button class="btn sm ghost" data-act="modal-close">Close</button></div></div>
+    <div class="seg scope" role="group" aria-label="Which days"><button type="button" class="${scope === 'day' ? 'on' : ''}" data-act="add-scope" data-s="day" aria-pressed="${scope === 'day'}">Just one day</button><button type="button" class="${scope === 'week' ? 'on' : ''}" data-act="add-scope" data-s="week" aria-pressed="${scope === 'week'}">Every week</button></div>
+    <form class="stack" data-form="add">
+      ${itemFields({scope, title:draft('ev-title'), date, start:draft('ev-start'), end:draft('ev-end'), type, where:draft('ev-where'), notes:draft('ev-notes'), dateRerender:true})}
+      ${scope === 'week' ? `<div class="fld"><label>Repeats on</label>${dayPicker('ad-day', sel)}</div>${carryable(kind) ? toggleRow('ad-carry', carry, 'If you miss it, it comes back the next day as a make-up') : ''}` : ''}
+      <div class="meta">${scope === 'day' ? "It shows in that day's plan and nudges you like any block." : `It becomes part of ${esc(daysLabel(sel))} from now on.`}${kind === 'session' ? ' Check it off when you play and the session counts toward your week.' : ''}</div>
+      <div class="btnrow"><button class="btn primary" type="submit">Add</button></div>
+    </form>`;
+}
 function eventForm() {
-  const id = S.modal.id, e = (S.data.events || {})[id] || {date:S.modal.date || todayISO(), start:'', end:'', title:'', where:'', notes:''};
-  const isNew = !(S.data.events || {})[id];
+  const id = S.modal.id, e = (S.data.events || {})[id];
+  if (!e) return closeOnly('Event');
   const f = (k, def) => draft('ev-' + k, def);
-  return `<div class="card-h"><h2>${isNew ? 'Add to your calendar' : 'Edit event'}</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
+  const type = draft('ad-type', e.kind && e.kind !== 'event' ? (e.kind === 'session' ? 'session:' + (e.sessionType || 'Drill') : e.kind) : 'event');
+  return `<div class="card-h"><h2>Edit</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
     <form class="stack" data-form="event-edit" data-id="${esc(id)}">
-      <div class="fld"><label for="ev-title">What</label><input class="in" id="ev-title" data-draft value="${esc(f('title', e.title))}" placeholder="Demo with Lisa, dentist, tournament…"></div>
-      <div class="grid3"><div class="fld"><label for="ev-date">Date</label><input class="in" type="date" id="ev-date" data-draft value="${esc(f('date', e.date))}"></div>
-        <div class="fld"><label for="ev-start">Starts</label><input class="in" type="time" id="ev-start" data-draft value="${esc(f('start', e.start))}"></div>
-        <div class="fld"><label for="ev-end">Ends</label><input class="in" type="time" id="ev-end" data-draft value="${esc(f('end', e.end))}"></div></div>
-      <div class="fld"><label for="ev-where">Where</label><input class="in" id="ev-where" data-draft value="${esc(f('where', e.where))}" placeholder="Address, Zoom, the courts"></div>
-      <div class="fld"><label for="ev-notes">Notes</label><textarea class="in" id="ev-notes" data-draft>${esc(f('notes', e.notes))}</textarea></div>
-      <div class="meta">It shows in that day's plan, counts as a block you can check off, nudges you like any block, and can be added to your phone's calendar.</div>
-      <div class="btnrow"><button class="btn primary" type="submit">${isNew ? 'Add event' : 'Save'}</button>${!isNew ? `<button class="btn" type="button" data-act="event-ics" data-id="${esc(id)}">Add to my calendar</button>${S.confirm === 'ev-del' ? `<button class="btn badb" type="button" data-act="event-delete" data-id="${esc(id)}">Yes, delete it</button>` : '<button class="btn ghost" type="button" data-act="confirm" data-c="ev-del">Delete</button>'}` : ''}</div>
+      ${itemFields({scope:'day', title:f('title', e.title), date:f('date', e.date), start:f('start', e.start), end:f('end', e.end), type, where:f('where', e.where), notes:f('notes', e.notes)})}
+      <div class="btnrow"><button class="btn primary" type="submit">Save</button><button class="btn" type="button" data-act="event-ics" data-id="${esc(id)}">Add to my calendar</button>${S.confirm === 'ev-del' ? `<button class="btn badb" type="button" data-act="event-delete" data-id="${esc(id)}">Yes, delete it</button>` : '<button class="btn ghost" type="button" data-act="confirm" data-c="ev-del">Delete</button>'}</div>
+    </form>`;
+}
+// Change a block of the weekly plan: label, details, times, type, and which weekdays get the change.
+function blockEditForm() {
+  const m = S.modal, date = m.date || todayISO(), dow = dowOf(date), ti = templateItem(dow, m.key);
+  if (!ti) return closeOnly('Block');
+  const f = (k, def) => draft('be-' + k, def);
+  const special = ['checkin','checkout','dupr'].includes(ti.kind);
+  const type = special ? typeOf(ti) : draft('ad-type', typeOf(ti)), kind = splitType(type).kind;
+  const has = WEEK_ORDER.filter(x => templateItem(x, m.key));
+  const sel = m.days && m.days.length ? m.days : [dow];
+  const carry = S.drafts['be-carry'] !== undefined ? S.drafts['be-carry'] : !!ti.carry;
+  return `<div class="card-h"><h2>Change ${esc(itemName(ti))}</h2><div class="btnrow"><button class="btn sm ghost" data-act="block" data-key="${esc(m.key)}" data-date="${date}">‹ Back</button><button class="btn sm ghost" data-act="modal-close">Close</button></div></div>
+    <form class="stack" data-form="block-edit">
+      <div class="fld"><label for="be-tag">Label</label><input class="in" id="be-tag" data-draft value="${esc(f('tag', ti.tag))}" placeholder="A short name, like GYM or PLAY" autocomplete="off"></div>
+      <div class="fld"><label for="be-text">Details</label><textarea class="in" id="be-text" data-draft>${esc(f('text', ti.text))}</textarea></div>
+      <div class="grid2"><div class="fld"><label for="be-start">Starts</label><input class="in" type="time" id="be-start" data-draft value="${esc(f('start', ti.start))}"></div><div class="fld"><label for="be-end">Ends</label><input class="in" type="time" id="be-end" data-draft value="${esc(f('end', ti.end || ti.start))}"></div></div>
+      ${special ? '' : `<div class="fld"><label for="ad-type">Type</label>${typeSelect('ad-type', type, 'week')}</div>`}
+      ${kind === 'calls' ? `<div class="grid2"><div class="fld"><label for="be-quota">Dials</label><input class="in" id="be-quota" data-draft inputmode="numeric" value="${esc(f('quota', ti.quota || 10))}"></div><div class="fld"><label for="be-region">Leads</label><select class="in" id="be-region" data-draft>${[['IA','Iowa'],['AZ','Arizona'],['','Any']].map(([v, l]) => `<option value="${v}" ${String(f('region', ti.region || '')) === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div></div>` : ''}
+      ${carryable(kind) ? toggleRow('be-carry', carry, 'If you miss it, it comes back the next day as a make-up') : ''}
+      <div class="fld"><label>Apply to</label>${dayPicker('be-day', sel, has)}<div class="meta">${has.length > 1 ? 'A dot means that day has this block too. ' : ''}Pick more days to change them as well. A day without it gets a copy.</div></div>
+      <div class="btnrow"><button class="btn primary" type="submit">Save for ${esc(daysLabel(sel))}</button>${S.confirm === 'be-del' ? `<button class="btn badb" type="button" data-act="block-remove">Yes, take it out of ${esc(daysLabel(sel))}</button>` : '<button class="btn ghost" type="button" data-act="confirm" data-c="be-del">Take it out</button>'}</div>
+      <div class="meta">To skip it just once, go back and use Skip or Take it off.</div>
     </form>`;
 }
 
@@ -1242,9 +1459,10 @@ async function askAssistant(text) {
     const now = new Date();
     const r = await fetch(assistantUrl(), {method:'POST', headers:{'Content-Type':'application/json', 'Authorization':'Bearer ' + token},
       body:JSON.stringify({message:text, history, tz:Intl.DateTimeFormat().resolvedOptions().timeZone, today:todayISO(), now:`${pad(now.getHours())}:${pad(now.getMinutes())}`})});
-    if (r.status === 404) throw new Error("The assistant isn't set up yet. Open Plan › This device › Assistant for the three steps.");
+    if (r.status === 404) { S.assist = {fn:'missing'}; throw new Error("The assistant isn't set up yet. Tap Set it up above for the three steps."); }
     const j = await r.json().catch(() => ({}));
     if (!r.ok || j.error) throw new Error(j.error || `The assistant answered ${r.status}.`);
+    S.assist = {fn:'ok', hasKey:true, model:j.model, version:Number(j.version) || 1};
     const cur = chatDoc().messages || [];
     setDoc('chat', 'main', {messages:[...cur, {role:'assistant', content:j.reply || '(no answer)', at:Date.now(), actions:j.actions || []}].slice(-40)});
     if (j.actions && j.actions.length && db) db.refresh().catch(() => {});
@@ -1266,10 +1484,15 @@ function chatMic() {
 }
 function chatSheet() {
   const msgs = chatDoc().messages || [];
-  const sugg = ['What should I focus on right now?', "How's my week against the targets?", 'Who should I call first today?', 'Add a to-do for tomorrow: ', 'Put a demo on my calendar Thursday at 2'];
+  const st = S.assist || {};
+  const setup = st.fn === 'missing' ? ['The assistant is not set up yet. It runs in your own Supabase project with your own Anthropic key: three steps, about five minutes.', 'Set it up']
+    : st.fn === 'ok' && !st.hasKey ? ['One step left: add your Anthropic key as a secret in Supabase.', 'Finish setup']
+    : st.fn === 'ok' && (st.version || 1) < ASSISTANT_V ? ['A newer assistant is ready. Paste the new code over the old one in Supabase so it can move your schedule.', 'Update it'] : null;
+  const sugg = ['What should I focus on right now?', 'I have pickleball 12 to 2 today', 'Move my drill to 6 am tomorrow', 'Push everything after lunch 30 minutes', "How's my week against the targets?", 'Add a to-do for tomorrow: '];
   return `<div class="card-h"><h2>Ask</h2><div class="btnrow"><button class="btn sm ghost" data-act="chat-clear" ${msgs.length ? '' : 'disabled'}>Clear</button><button class="btn sm ghost" data-act="modal-close">Close</button></div></div>
+    ${setup ? `<div class="setupcard"><span>${esc(setup[0])}</span><button class="btn sm primary" data-act="assistant-setup">${setup[1]}</button></div>` : ''}
     <div class="chat" id="chat-log">
-      ${msgs.length ? msgs.map(m => `<div class="msg ${m.role}"><div class="bubble">${fmtChat(m.content)}</div>${m.actions && m.actions.length ? `<div class="done-acts">${m.actions.map(a => `<span class="pill good">${esc(a)}</span>`).join('')}</div>` : ''}</div>`).join('') : '<div class="meta">Ask about your day, your numbers or a lead, or tell me to add something. I can see your plan, to-dos, calls, calendar and week, and I can add to-dos and events for you.</div>'}
+      ${msgs.length ? msgs.map(m => `<div class="msg ${m.role}"><div class="bubble">${fmtChat(m.content)}</div>${m.actions && m.actions.length ? `<div class="done-acts">${m.actions.map(a => `<span class="pill good">${esc(a)}</span>`).join('')}</div>` : ''}</div>`).join('') : '<div class="meta">Ask about your day, your numbers or a lead, or tell me to add something. I can see your plan, to-dos, calls and week, and I can move, add and skip blocks, check things off, and log your check-in and sessions.</div>'}
       ${S.chatBusy ? '<div class="msg assistant"><div class="bubble thinking">Thinking…</div></div>' : ''}
       ${S.chatErr ? `<div class="err">${esc(S.chatErr)}</div>` : ''}
     </div>
@@ -1280,24 +1503,25 @@ function chatSheet() {
       <button class="btn primary" type="submit" ${S.chatBusy ? 'disabled' : ''}>Send</button>
     </form>`;
 }
-async function assistantCheck() {
-  S.assist = {...(S.assist || {}), checking:true}; render();
+async function assistantCheck(quiet) {
+  if (!assistantUrl()) return;
+  if (!quiet) { S.assist = {...(S.assist || {}), checking:true}; render(); }
   try {
     const r = await fetch(assistantUrl() + '?status=1');
     if (r.status === 404) S.assist = {fn:'missing'};
     else if (r.status === 401 || r.status === 403) S.assist = {fn:'error', msg:'The function is there but still checks for a login. Open its settings and turn off "Verify JWT".'};
     else if (!r.ok) S.assist = {fn:'error', msg:`The function answered ${r.status}.`};
-    else { const j = await r.json(); S.assist = {fn:'ok', hasKey:!!j.hasKey, model:j.model}; }
+    else { const j = await r.json(); S.assist = {fn:'ok', hasKey:!!j.hasKey, model:j.model, version:Number(j.version) || 1}; }
   } catch (e) { S.assist = {fn:'error', msg:"Couldn't reach the function. Check your connection and that it is deployed."}; }
   render();
 }
 function assistantSheet() {
-  const st = S.assist || {};
+  const st = S.assist || {}, outdated = st.fn === 'ok' && (st.version || 1) < ASSISTANT_V;
   const step = (n, title, body, ok) => `<div class="step ${ok ? 'ok' : ''}"><div class="num">${ok ? '✓' : n}</div><div class="min0"><b>${title}</b><div class="meta" style="color:var(--ink-2)">${body}</div></div></div>`;
   return `<div class="card-h"><h2>Assistant</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
     <p class="meta" style="margin:0;color:var(--ink-2)">Talk to Claude inside the app. It runs in your own Supabase project with your own Anthropic key, sees your live data, and can add to-dos and calendar events for you. Three steps, once. If a request is ever declined by Anthropic's safety filters, it automatically retries on a fallback model.</p>
     ${step(1, 'Get an Anthropic API key', 'At <b>console.anthropic.com</b>: add a few dollars of credit under Billing, then <b>Settings › API keys › Create key</b>. Copy it.', !!st.hasKey)}
-    ${step(2, 'Create the function', `In Supabase open <b>Edge Functions</b> › <b>Deploy a new function</b> › <b>Via Editor</b>. Name it <span class="kbd">assistant</span>, replace all the code with the copied code, and <b>Deploy</b>. Then open the function's <b>Settings</b> and turn <b>off</b> "Verify JWT".<div class="btnrow" style="margin-top:6px"><button class="btn sm" data-act="copy-assistant">Copy the code</button><button class="btn sm ghost" data-act="assistant-check">${st.checking ? 'Checking…' : 'Check'}</button>${st.fn === 'ok' ? '<span class="pill good">Found</span>' : st.fn === 'missing' ? '<span class="pill warn">Not found yet</span>' : st.fn === 'error' ? '<span class="pill bad">Problem</span>' : ''}</div>${st.fn === 'error' && st.msg ? `<div class="err" style="margin-top:6px">${esc(st.msg)}</div>` : ''}`, st.fn === 'ok')}
+    ${step(2, 'Create the function', `In Supabase open <b>Edge Functions</b> › <b>Deploy a new function</b> › <b>Via Editor</b>. Name it <span class="kbd">assistant</span>, replace all the code with the copied code, and <b>Deploy</b>. Then open the function's <b>Settings</b> and turn <b>off</b> "Verify JWT".<div class="btnrow" style="margin-top:6px"><button class="btn sm" data-act="copy-assistant">Copy the code</button><button class="btn sm ghost" data-act="assistant-check">${st.checking ? 'Checking…' : 'Check'}</button>${st.fn === 'ok' ? (outdated ? '<span class="pill warn">Update needed</span>' : '<span class="pill good">Found</span>') : st.fn === 'missing' ? '<span class="pill warn">Not found yet</span>' : st.fn === 'error' ? '<span class="pill bad">Problem</span>' : ''}</div>${outdated ? '<div class="meta" style="margin-top:6px">Supabase is running an older copy that cannot move your schedule. Copy the code, open the <b>assistant</b> function, replace all of its code, Deploy, then tap Check.</div>' : ''}${st.fn === 'error' && st.msg ? `<div class="err" style="margin-top:6px">${esc(st.msg)}</div>` : ''}`, st.fn === 'ok' && !outdated)}
     ${step(3, 'Give it the key', `In Supabase open <b>Edge Functions</b> › <b>Secrets</b> (or Project Settings › Edge Functions). Add a secret named <span class="kbd">ANTHROPIC_API_KEY</span> with the key from step 1. Then tap Check again.${st.fn === 'ok' ? (st.hasKey ? ' <span class="pill good">Key is set</span>' : ' <span class="pill warn">No key yet</span>') : ''}`, st.fn === 'ok' && !!st.hasKey)}
     <div class="btnrow">${st.fn === 'ok' && st.hasKey ? '<button class="btn primary" data-act="ask">Open the assistant</button>' : ''}<span class="meta">Model: ${esc(st.model || 'claude-opus-5-5')}. Each question costs a few cents.</span></div>`;
 }
@@ -1305,7 +1529,7 @@ function assistantSheet() {
 /* ----- calling mode: one lead at a time ----- */
 function callSheet() {
   const t = todayISO(), cm = S.callMode || {}, m = nowMin();
-  const blocks = scheduleFor(t).filter(i => i.kind === 'calls');
+  const blocks = itemsFor(t).filter(i => i.kind === 'calls');
   const block = (cm.region ? blocks.find(i => i.region === cm.region) : null) || blocks.find(i => toMin(i.start) <= m && m < toMin(i.end)) || blocks.find(i => toMin(i.start) > m) || blocks[0] || null;
   const region = cm.region || (block ? block.region : '') || '';
   const due = leadsDue(t).sort(leadSortDue).filter(l => l.type !== 'Cold' || !region || l.region === region);
@@ -1338,8 +1562,16 @@ async function signOut() {
 function renderModal() {
   const el = document.getElementById('modal');
   if (!S.modal) { el.hidden = true; el.innerHTML = ''; return; }
+  const a = document.activeElement;
+  const keep = a && a.id && el.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) ? {id:a.id, s:a.selectionStart, e:a.selectionEnd} : null;
+  const sig = [S.modal.type, S.modal.key || S.modal.id || '', S.modal.date || ''].join('|');
+  const old = el.querySelector('.sheet'), top = old && el.dataset.sig === sig ? old.scrollTop : 0;
+  const ty = S.modal.type;
   el.hidden = false;
-  el.innerHTML = `<div class="sheet" role="dialog" aria-modal="true">${S.modal.type === 'session' ? sessionForm() : S.modal.type === 'fresh' ? freshForm() : S.modal.type === 'block' ? blockSheet(S.modal.key) : S.modal.type === 'task' ? taskSheet(S.modal.id) : S.modal.type === 'mile' ? mileSheet(S.modal.id) : S.modal.type === 'stat' ? statSheet(S.modal.id) : S.modal.type === 'notif' ? notifSheet() : S.modal.type === 'call' ? callSheet() : S.modal.type === 'event' ? eventForm() : S.modal.type === 'chat' ? chatSheet() : S.modal.type === 'assist' ? assistantSheet() : leadEditForm()}</div>`;
+  el.innerHTML = `<div class="sheet ${ty === 'sched' ? 'wide' : ''}" role="dialog" aria-modal="true">${ty === 'session' ? sessionForm() : ty === 'fresh' ? freshForm() : ty === 'block' ? blockSheet(S.modal.key, S.modal.date) : ty === 'task' ? taskSheet(S.modal.id) : ty === 'mile' ? mileSheet(S.modal.id) : ty === 'stat' ? statSheet(S.modal.id) : ty === 'notif' ? notifSheet() : ty === 'call' ? callSheet() : ty === 'event' ? eventForm() : ty === 'chat' ? chatSheet() : ty === 'assist' ? assistantSheet() : ty === 'sched' ? schedSheet() : ty === 'add' ? addForm() : ty === 'blockedit' ? blockEditForm() : leadEditForm()}</div>`;
+  el.dataset.sig = sig;
+  if (top) el.querySelector('.sheet').scrollTop = top;
+  if (keep) { const n = document.getElementById(keep.id); if (n) { n.focus({preventScroll:true}); try { if (keep.s != null) n.setSelectionRange(keep.s, keep.e); } catch(e) {} } }
 }
 function sessionForm() {
   const id = S.modal.id, s = S.data.sessions[id] || {date:todayISO(), type:'Drill', hours:2};
@@ -1432,7 +1664,7 @@ function handle(act, el, ev) {
     case 'goto': { if (S.modal) { S.modal = null; render(); } const tgt = document.getElementById(d.id); if (tgt) { tgt.scrollIntoView({behavior:'smooth', block:'start'}); const f = tgt.querySelector('input'); if (f) setTimeout(() => f.focus({preventScroll:true}), 350); } break; }
     case 'check': toggleCheck(d.key); break;
     case 'item-menu': S.openItem = S.openItem === d.key ? null : d.key; render(); break;
-    case 'skip': patchDay(t, {skips:{[d.key]: d.on === '1'}}); S.openItem = null; render(); break;
+    case 'skip': patchDay(d.date || t, {skips:{[d.key]: d.on === '1'}}); S.openItem = null; render(); break;
     case 'task-toggle': taskToggle(d.id); if (S.modal && S.modal.type === 'task') S.modal = null; break;
     case 'task-tomorrow': { const x = S.data.tasks[d.id]; if (!x) break; S.lastUndo = {type:'task', id:d.id, prev:clone(x)}; patchDoc('tasks', d.id, {due:addDays(t,1), origDue:x.origDue || x.due}); if (S.modal && S.modal.type === 'task') S.modal = null; toast('Moved to tomorrow.', true); break; }
     case 'task-drop': { const x = S.data.tasks[d.id]; if (!x) break; S.lastUndo = {type:'task', id:d.id, prev:clone(x)}; patchDoc('tasks', d.id, {dropped:true, droppedOn:t}); if (S.modal && S.modal.type === 'task') S.modal = null; toast('Dropped.', true); break; }
@@ -1464,11 +1696,36 @@ function handle(act, el, ev) {
     case 'call-start': S.leadForm = null; S.callMode = {region:d.region || null, skipped:[]}; S.modal = {type:'call'}; render(); break;
     case 'call-skip': if (S.callMode) S.callMode.skipped = [...(S.callMode.skipped || []), d.id]; render(); break;
     case 'tip-done': try { localStorage.setItem('lcc-tip-done', '1'); } catch(e) {} render(); break;
-    case 'event-new': clearDrafts('ev-'); S.confirm = null; S.modal = {type:'event', id:'ev-' + Date.now().toString(36), date:d.date || todayISO()}; render(); break;
-    case 'event-edit': clearDrafts('ev-'); S.confirm = null; S.modal = {type:'event', id:d.id}; render(); break;
+    case 'event-new': handle('add-open', el, ev); break;
+    case 'event-edit': clearDrafts('ev-'); clearDrafts('ad-'); S.confirm = null; S.modal = {type:'event', id:d.id}; render(); break;
+    case 'sched-open': S.openItem = null; S.confirm = null; S.modal = {type:'sched', date:d.date || t}; render(); break;
+    case 'add-open': {
+      clearDrafts('ev-'); clearDrafts('ad-'); S.confirm = null; S.openItem = null;
+      const date = d.date || t;
+      S.modal = {type:'add', date, scope:d.scope === 'week' ? 'week' : 'day', days:[dowOf(date)], back:d.back || null};
+      render(); if (!coarsePointer()) setTimeout(() => { const b = document.getElementById('ev-title'); if (b) b.focus(); }, 60);
+      break;
+    }
+    case 'add-scope': if (S.modal) { S.modal.scope = d.s === 'week' ? 'week' : 'day'; const ty = S.drafts['ad-type']; if (ty && !ITEM_TYPES.some(([v, , only]) => v === ty && (!only || only === S.modal.scope))) delete S.drafts['ad-type']; } render(); break;
+    case 'ad-day': case 'be-day': if (S.modal) { const cur = S.modal.days && S.modal.days.length ? S.modal.days : [dowOf(S.modal.date || t)]; S.modal.days = cur.includes(d.d) ? cur.filter(x => x !== d.d) : [...cur, d.d]; if (S.confirm === 'be-del') S.confirm = null; } render(); break;
+    case 'toggle-draft': S.drafts[d.k] = !(d.v === '1'); render(); break;
+    case 'move-scope': if (S.modal) S.modal.scope = d.s === 'week' ? 'week' : 'day'; render(); break;
+    case 'move-by': moveBy(d.date || t, d.key, Number(d.m) || 0, d.scope || (S.modal && S.modal.type === 'block' && S.modal.scope) || 'day'); S.openItem = null; render(); break;
+    case 'move-reset': resetMove(d.date || t, d.key); render(); break;
+    case 'block-edit': { clearDrafts('be-'); clearDrafts('ad-'); S.confirm = null; const date = d.date || t; S.modal = {type:'blockedit', key:d.key, date, days:[dowOf(date)], back:(S.modal && S.modal.back) || null}; render(); break; }
+    case 'block-remove': {
+      const m = S.modal || {}, date = m.date || t, sel = m.days && m.days.length ? m.days : [dowOf(date)];
+      const name = itemName(templateItem(dowOf(date), m.key) || {tag:'It'});
+      const changes = {}, prev = {}; let n = 0;
+      sel.forEach(x => { prev[x] = templateDay(x); changes[x] = templateDay(x).filter(y => y.key !== m.key); if (changes[x].length !== prev[x].length) n++; });
+      if (n) { patchDoc('config', 'schedule', {days:changes}); S.lastUndo = {type:'restore', ops:[{patch:['config', 'schedule', {days:prev}]}]}; }
+      clearDrafts('be-'); clearDrafts('ad-'); S.confirm = null;
+      S.modal = m.back === 'sched' ? {type:'sched', date} : null;
+      toast(n ? `Took ${name} out of ${daysLabel(sel)}.` : 'Nothing to take out on those days.', !!n); render(); break;
+    }
     case 'event-delete': delDoc('events', d.id); closeModal(); toast('Event deleted.'); render(); break;
     case 'event-ics': exportEvent(d.id); toast('Calendar file saved. Open it to add the event.'); break;
-    case 'ask': S.modal = {type:'chat'}; S.chatErr = null; render(); chatScroll(); setTimeout(() => { const b = document.getElementById('chat-in'); if (b && !coarsePointer()) b.focus(); }, 60); break;
+    case 'ask': S.modal = {type:'chat'}; S.chatErr = null; render(); chatScroll(); if (!S.assist || S.assist.fn !== 'ok') assistantCheck(true); setTimeout(() => { const b = document.getElementById('chat-in'); if (b && !coarsePointer()) b.focus(); }, 60); break;
     case 'chat-suggest': if (/[:：]\s*$/.test(d.text)) { S.drafts['chat-in'] = d.text; render(); setTimeout(() => { const b = document.getElementById('chat-in'); if (b) { b.focus(); b.setSelectionRange(b.value.length, b.value.length); } }, 30); } else askAssistant(d.text); break;
     case 'chat-clear': setDoc('chat', 'main', {messages:[]}); S.chatErr = null; render(); break;
     case 'chat-mic': chatMic(); break;
@@ -1477,7 +1734,11 @@ function handle(act, el, ev) {
     case 'copy-assistant': navigator.clipboard.writeText(ASSISTANT_FN).then(() => toast('Function code copied. Paste it into the Supabase editor.'), () => toast("Couldn't copy. Open supabase/functions/assistant/index.ts in the repo instead.")); break;
     case 'undo': undo(); render(); break;
     case 'fresh-start': clearDrafts('fs-'); S.modal = {type:'fresh'}; render(); break;
-    case 'block': S.openItem = null; S.modal = {type:'block', key:d.key}; render(); break;
+    case 'block': {
+      const prev = S.modal; S.openItem = null; S.confirm = null;
+      S.modal = {type:'block', key:d.key, date:d.date || t, scope:'day', back:d.back || (prev && prev.type === 'sched' ? 'sched' : prev && ['block','blockedit'].includes(prev.type) ? prev.back : null) || null};
+      render(); break;
+    }
     case 'task-open': clearDrafts('tk-'); S.confirm = null; S.modal = {type:'task', id:d.id}; render(); break;
     case 'task-delete': delDoc('tasks', d.id); S.modal = null; S.confirm = null; toast('Deleted.'); render(); break;
     case 'mile': S.modal = {type:'mile', id:d.id}; render(); break;
@@ -1597,9 +1858,86 @@ function submit(form) {
       const title = String(v('ev-title')).trim(), date = v('ev-date'), start = v('ev-start'), end = v('ev-end');
       if (!title) { toast('Give it a name first.'); return; }
       if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) { toast('Pick a date.'); return; }
-      if (!/^\d{2}:\d{2}$/.test(start)) { toast('Pick a start time.'); return; }
-      setDoc('events', id, {...old, title, date, start, end:/^\d{2}:\d{2}$/.test(end) ? end : '', where:String(v('ev-where')).trim(), notes:String(v('ev-notes')).trim(), createdAt:old.createdAt || Date.now(), updatedAt:Date.now()});
-      closeModal(); clearDrafts('ev-'); toast(old.title ? 'Event saved.' : `On your calendar: ${fmtDay(date)} at ${fmtTap(start)}.`); render(); break;
+      if (!isHM(start)) { toast('Pick a start time.'); return; }
+      if (isHM(end) && toMin(end) < toMin(start)) { toast('The end is before the start.'); return; }
+      const ty = splitType(v('ad-type') || 'event');
+      const doc = {...old, title, date, start, end:isHM(end) ? end : '', where:String(v('ev-where')).trim(), notes:String(v('ev-notes')).trim(), createdAt:old.createdAt || Date.now(), updatedAt:Date.now()};
+      delete doc.kind; delete doc.sessionType;
+      if (ty.kind !== 'event') { doc.kind = ty.kind; if (ty.sessionType) doc.sessionType = ty.sessionType; }
+      S.lastUndo = old.title ? {type:'restore', ops:[{set:['events', id, clone(old)]}]} : {type:'restore', ops:[{del:['events', id]}]};
+      setDoc('events', id, doc);
+      closeModal(); clearDrafts('ev-'); clearDrafts('ad-'); toast(old.title ? 'Saved.' : `Added ${title}, ${dayWord(date)} at ${fmtTap(start)}.`, true); render(); break;
+    }
+    case 'add': {
+      const m = S.modal || {}, scope = m.scope === 'week' ? 'week' : 'day';
+      const title = String(v('ev-title')).trim(), start = v('ev-start'), endIn = v('ev-end');
+      if (!title) { toast('Give it a name first.'); return; }
+      if (!isHM(start)) { toast('Pick a start time.'); return; }
+      if (isHM(endIn) && toMin(endIn) < toMin(start)) { toast('The end is before the start.'); return; }
+      const end = isHM(endIn) ? endIn : hhmm(Math.min(toMin(start) + 60, 24*60 - 1));
+      const ty = splitType(v('ad-type') || (scope === 'day' ? 'event' : 'task'));
+      const back = m.back === 'sched';
+      if (scope === 'day') {
+        const date = v('ev-date') || m.date || t;
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) { toast('Pick a date.'); return; }
+        const id = 'ev-' + Date.now().toString(36);
+        const doc = {title, date, start, end, where:String(v('ev-where')).trim(), notes:String(v('ev-notes')).trim(), createdAt:Date.now(), updatedAt:Date.now()};
+        if (ty.kind !== 'event') { doc.kind = ty.kind; if (ty.sessionType) doc.sessionType = ty.sessionType; }
+        setDoc('events', id, doc);
+        S.lastUndo = {type:'restore', ops:[{del:['events', id]}]};
+        const over = overlaps(date, start, end, 'ev-' + id);
+        clearDrafts('ev-'); clearDrafts('ad-'); S.confirm = null;
+        S.modal = back ? {type:'sched', date} : null;
+        toast(`Added ${title}, ${dayWord(date)} at ${fmtTap(start)}.${over.length ? ` It overlaps ${listNames(over)}. Tap one to move it.` : ''}`, true);
+      } else {
+        const sel = m.days && m.days.length ? m.days : [dowOf(m.date || t)];
+        const item = {key:'b' + Date.now().toString(36), start, end, tag:title, text:String(v('ev-notes')).trim(), kind:ty.kind};
+        if (ty.kind === 'session') { item.sessionType = ty.sessionType; item.hours = Math.round((toMin(end) - toMin(start)) / 30) / 2 || 1; }
+        if (ty.kind === 'calls') { item.quota = 10; item.region = ''; }
+        if (['mobility','watch'].includes(ty.kind)) item.minutes = Math.max(5, toMin(end) - toMin(start));
+        if (carryable(ty.kind) && S.drafts['ad-carry'] === true) item.carry = true;
+        const changes = {}, prev = {};
+        sel.forEach(x => { prev[x] = templateDay(x); changes[x] = [...templateDay(x), clone(item)].sort(byStart); });
+        patchDoc('config', 'schedule', {days:changes});
+        S.lastUndo = {type:'restore', ops:[{patch:['config', 'schedule', {days:prev}]}]};
+        clearDrafts('ev-'); clearDrafts('ad-'); S.confirm = null;
+        S.modal = back ? {type:'sched', date:m.date || t} : null;
+        toast(`Added ${title} to ${daysLabel(sel)} at ${fmtTap(start)}.`, true);
+      }
+      render(); break;
+    }
+    case 'block-edit': {
+      const m = S.modal || {}, date = m.date || t, dow = dowOf(date), ti = templateItem(dow, m.key);
+      if (!ti) { closeModal(); render(); return; }
+      const sel = m.days && m.days.length ? m.days : [dow];
+      const tag = String(v('be-tag')).trim(), text = String(v('be-text')).trim(), start = v('be-start'), endIn = v('be-end');
+      if (!tag && !text) { toast('Give it a label or some details.'); return; }
+      if (!isHM(start)) { toast('Pick a start time.'); return; }
+      if (isHM(endIn) && toMin(endIn) < toMin(start)) { toast('The end is before the start.'); return; }
+      const end = isHM(endIn) ? endIn : start;
+      const special = ['checkin','checkout','dupr'].includes(ti.kind);
+      const ty = special ? {kind:ti.kind, sessionType:ti.sessionType} : splitType(v('ad-type') || typeOf(ti));
+      const next = {...ti, tag, text, start, end, kind:ty.kind};
+      ['sessionType','hours','quota','region','carry','minutes'].forEach(k => delete next[k]);
+      if (ty.kind === 'session') { next.sessionType = ty.sessionType; next.hours = Math.round((toMin(end) - toMin(start)) / 30) / 2 || ti.hours || 1; }
+      if (ty.kind === 'calls') { next.quota = Number(v('be-quota')) || ti.quota || 10; next.region = String(v('be-region') || ''); }
+      if (['mobility','watch'].includes(ty.kind)) next.minutes = Math.max(5, toMin(end) - toMin(start));
+      if (carryable(ty.kind) && (S.drafts['be-carry'] !== undefined ? S.drafts['be-carry'] : !!ti.carry)) next.carry = true;
+      // The fields that changed on this day's copy are what every selected day gets.
+      const changed = Object.keys({...ti, ...next}).filter(k => JSON.stringify(next[k]) !== JSON.stringify(ti[k]));
+      const changes = {}, prev = {};
+      sel.forEach(x => {
+        prev[x] = templateDay(x);
+        const arr = templateDay(x), idx = arr.findIndex(y => y.key === m.key);
+        if (idx >= 0) { const y = {...arr[idx]}; changed.forEach(k => { if (next[k] === undefined) delete y[k]; else y[k] = next[k]; }); arr[idx] = y; }
+        else arr.push(clone(next));
+        changes[x] = arr.sort(byStart);
+      });
+      patchDoc('config', 'schedule', {days:changes});
+      S.lastUndo = {type:'restore', ops:[{patch:['config', 'schedule', {days:prev}]}]};
+      clearDrafts('be-'); clearDrafts('ad-'); S.confirm = null;
+      S.modal = {type:'block', key:m.key, date, scope:'day', back:m.back || null};
+      toast(`Saved for ${daysLabel(sel)}.`, true); render(); break;
     }
     case 'chat': { const txt = v('chat-in'); askAssistant(txt); break; }
     case 'task-edit': {
@@ -1633,6 +1971,9 @@ document.addEventListener('input', ev => {
 });
 document.addEventListener('change', ev => {
   const el = ev.target;
+  if (el.dataset && el.dataset.act === 'move-time') { moveTime(el); render(); return; }
+  if (el.id === 'sc-date' && el.value) { S.modal = {type:'sched', date:el.value}; render(); return; }
+  if (el.hasAttribute && el.hasAttribute('data-rerender')) { S.drafts[el.id] = el.value; render(); return; }
   if (el.id === 'fs-date') { S.drafts['fs-date'] = el.value; render(); return; }
   if (el.id === 'nt-lead') { S.drafts['nt-lead'] = el.value; if (pushDoc()) { patchDoc('push', deviceId(), {lead:Number(el.value), updatedAt:Date.now()}); toast('Saved.'); } return; }
   if (el.id === 'import-file' && el.files && el.files[0]) { importFile(el.files[0]); el.value = ''; return; }
@@ -1650,7 +1991,8 @@ document.addEventListener('keydown', ev => {
   else if (ev.key === '/') { ev.preventDefault(); setView('calls'); setTimeout(() => { const s = document.getElementById('lead-search'); if (s) s.focus(); }, 0); }
   else if (ev.key === 'n') { ev.preventDefault(); if (!['today','plan'].includes(S.view)) setView('today'); setTimeout(() => { const f = document.getElementById(S.view === 'plan' ? 'pt-title' : 'qt-title'); if (f) { f.scrollIntoView({block:'center'}); f.focus(); } }, 0); }
   else if (ev.key === 'c') { ev.preventDefault(); handle('call-start', {dataset:{}}, ev); render(); }
-  else if (ev.key === 'e') { ev.preventDefault(); handle('event-new', {dataset:{}}, ev); }
+  else if (ev.key === 'e') { ev.preventDefault(); handle('add-open', {dataset:{}}, ev); }
+  else if (ev.key === 's') { ev.preventDefault(); handle('sched-open', {dataset:{}}, ev); }
   else if (ev.key === 'a') { ev.preventDefault(); handle('ask', {dataset:{}}, ev); }
 });
 // Drop a backup file anywhere on the page to import it.

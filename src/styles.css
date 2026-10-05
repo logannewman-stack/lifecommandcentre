@@ -331,6 +331,36 @@ body.dropping::after{content:"Drop your backup file to import it";position:fixed
 .chatbar textarea{min-height:42px;max-height:140px;resize:none}
 @media (min-width:640px){.chat{max-height:60vh}}
 
+/* schedule editing */
+/* the sheet scrolls as a whole, so rows like the day chips must never be squashed */
+.sheet > *{flex-shrink:0}
+.movebox{border:1px solid var(--line);border-radius:14px;padding:10px 12px 12px;display:flex;flex-direction:column;gap:10px;background:var(--surface)}
+.movebox .card-h{margin:0;flex-wrap:wrap}
+.movebox h3{margin:0}
+.seg.scope{flex-wrap:nowrap}
+.seg.scope button{flex:1;padding:10px 8px;font-size:14px;line-height:1.2}
+.nudges{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.nudges .btn{min-width:52px;font-variant-numeric:tabular-nums;font-family:var(--f-mono)}
+.over{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.over .chip{font-weight:500;padding:5px 11px}
+.menu .meta{align-self:center;margin-right:2px}
+.schedhead{display:flex;flex-wrap:wrap;align-items:center;gap:8px;justify-content:space-between}
+.pickday{display:inline-flex;align-items:center;gap:6px}
+.pickday .in{width:auto;padding:5px 8px;font-size:14px}
+.sched{display:flex;flex-direction:column}
+.srow-b{display:grid;grid-template-columns:62px minmax(0,1fr) 14px;gap:10px;align-items:start;text-align:left;width:100%;padding:11px 4px;border:0;border-top:1px solid var(--line);background:none;color:inherit;font:inherit;cursor:pointer;border-radius:0}
+.srow-b:hover{background:var(--surface-2)}
+.srow-b:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.srow-b .time{font-size:12.5px;line-height:1.35;color:var(--ink-3);padding-top:2px}
+.srow-b .txtc{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.srow-b.marker .txtc{color:var(--ink-3)}
+.srow-b.skipped .txtc{text-decoration:line-through;color:var(--ink-3)}
+.srow-b .sub{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
+.srow-b .chev{color:var(--ink-3);font-size:20px;line-height:1;padding-top:1px}
+.daychips button .hasdot{display:inline-block;width:5px;height:5px;border-radius:99px;background:currentColor;margin-left:4px;vertical-align:middle;opacity:.75}
+.setupcard{border:1px dashed var(--line);border-radius:12px;padding:10px 12px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between}
+@media (min-width:640px){.sheet.wide{max-width:680px}}
+
 /* small phones */
 @media (max-width:420px){.row{grid-template-columns:46px 28px minmax(0,1fr) auto;gap:7px}.auto{grid-template-columns:repeat(2,minmax(0,1fr))}.stats{grid-template-columns:1fr}.grid3{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media (prefers-reduced-motion:no-preference){.bar>i{transition:width .3s ease}}
