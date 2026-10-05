@@ -8,6 +8,7 @@ import './styles.css';
 import { registerSW } from 'virtual:pwa-register';
 import { supabase, config as sbConfig, configSource, saveConfig, clearConfig } from './supabase.js';
 import { createDb } from './db.js';
+import { parseQuick } from './quickadd.js';
 import REMINDERS_FN from '../supabase/functions/reminders/index.ts?raw';
 import CRON_SQL from '../supabase/functions/reminders/cron.sql?raw';
 import ASSISTANT_FN from '../supabase/functions/assistant/index.ts?raw';
@@ -197,7 +198,8 @@ function daysLabel(days) {
 const nextDow = (from, dow) => { for (let n = 0; n < 7; n++) { const d = addDays(from, n); if (dowOf(d) === dow) return d; } return from; };
 const fmtDayLong = s => s ? parseISO(s).toLocaleDateString('en-US',{weekday:'long', month:'long', day:'numeric'}) : '';
 const dayWord = d => d === todayISO() ? 'today' : d === addDays(todayISO(), 1) ? 'tomorrow' : fmtDay(d);
-const isRestDay = d => restDays().includes(dowOf(d));
+// Rest days come from the profile; any single day can also be taken off (days/<date>.off).
+const isRestDay = d => restDays().includes(dowOf(d)) || !!dayOf(d).off;
 const isCheckable = i => i.kind !== 'marker';
 const dialsFor = (d, region) => (dayOf(d).calls || []).filter(c => c.dial && (!region || c.region === region)).length;
 const callsCount = (d, f) => (dayOf(d).calls || []).filter(c => c[f]).length;
@@ -373,15 +375,68 @@ function applyFreshStart(date, sun) {
   if (sun) patchDoc('config', 'schedule', {days:{Sun:REST_SUNDAY}});
   return {moved, dropped, leadsMoved};
 }
+// Both one-time runs decide once per page load and record themselves before any other write:
+// a sync update can briefly hand back the stored copy of meta while later writes are queued.
+let autoFreshChecked = false, restartChecked = false;
 function maybeAutoFreshStart() {
+  if (autoFreshChecked) return false;
+  autoFreshChecked = true;
   const setup = S.data.meta.setup || {}, roll = S.data.meta.rollover || {};
   if (setup.freshStart || roll.freshStart) return false;
   if ((profile().startDate || '') >= AUTO_FRESH_DATE) return false;
   const t = todayISO(), date = t > AUTO_FRESH_DATE ? t : AUTO_FRESH_DATE;
+  patchDoc('meta', 'setup', {freshStart:date, at:new Date().toISOString(), version:APP_VERSION});
   const r = applyFreshStart(date, true);
-  setDoc('meta', 'setup', {freshStart:date, at:new Date().toISOString(), version:APP_VERSION});
   toast(`Fresh start: the plan begins ${fmtDay(date)}. ${plural(r.moved,'to-do')} and ${plural(r.leadsMoved,'follow-up')} moved there. Sundays are rest days.`);
   return true;
+}
+
+// Asked for on Monday, Oct 5: "start everything tomorrow". Monday held work on the Leah Roling
+// app (InnerBoard OS) and three pickleball sessions (6 to 8, 12 to 2, 4:30 to 6:30). On the first
+// load on or before Tuesday this runs once: a fresh start on Tuesday that leaves Sunday's plan
+// alone, Monday as a day off, and Monday's work recorded. Every write checks first, so nothing
+// you already logged is doubled. Recorded in meta/setup.restart.
+const RESTART_DATE = '2026-10-06';
+function maybeRestart() {
+  if (restartChecked) return false;
+  restartChecked = true;
+  const setup = S.data.meta.setup || {};
+  if (setup.restart || todayISO() > RESTART_DATE) return false;
+  patchDoc('meta', 'setup', {restart:RESTART_DATE, restartAt:new Date().toISOString(), version:APP_VERSION});
+  const mon = addDays(RESTART_DATE, -1);
+  const r = applyFreshStart(RESTART_DATE, false);
+  patchDay(mon, {off:true});
+  const logged = logMonday(mon);
+  toast(`Fresh start: everything begins ${todayISO() === RESTART_DATE ? 'today' : 'tomorrow'}, ${fmtDay(RESTART_DATE)}. Monday is a day off${logged ? `. Logged ${logged}` : ''}. ${plural(r.moved, 'to-do')} and ${plural(r.leadsMoved, 'follow-up')} moved to ${fmtDay(RESTART_DATE)}.`, false, {act:'toast-close', label:'Got it', sticky:true});
+  return true;
+}
+function logMonday(mon) {
+  const sess = S.data.sessions || {}, ch = dayOf(mon).checks || {};
+  const parts = [];
+  let n = 0;
+  const logBlock = (key, type, hours) => {
+    const sid = `auto-${mon}-${key}`;
+    if (!sess[sid]) { setDoc('sessions', sid, {date:mon, type, hours, rated:false, auto:true, createdAt:Date.now()}); }
+    if (!ch[key]) patchDay(mon, {checks:{[key]:true}});
+    n++;
+  };
+  for (const key of ['drill', 'play']) {
+    const b = scheduleFor(mon).find(i => i.key === key && i.kind === 'session');
+    if (b) logBlock(key, b.sessionType || 'Rec play', b.hours || 2);
+  }
+  const noon = eventsOn(mon).map(eventItem).find(i => i.kind === 'session' && toMin(i.start) >= 11*60 && toMin(i.start) <= 13*60);
+  const other = Object.entries(S.data.sessions || {}).some(([id, x]) => x && x.date === mon && id !== `auto-${mon}-drill` && id !== `auto-${mon}-play`);
+  if (noon) logBlock(noon.key, noon.sessionType || 'Rec play', noon.hours || 2);
+  else if (!other) { setDoc('sessions', `s-${mon}-noon`, {date:mon, type:'Rec play', hours:2, rated:false, notes:'12 to 2 pm', createdAt:Date.now()}); n++; }
+  else n++;
+  if (n) parts.push(`your ${n === 1 ? 'pickleball session' : n + ' pickleball sessions'}`);
+  const wid = `w-${mon}-innerboard`;
+  if (!S.data.tasks[wid]) setDoc('tasks', wid, {title:'Updates on the Leah Roling app (InnerBoard OS)', due:mon, origDue:mon, area:'Build', notes:'', done:true, doneOn:mon, kind:'task', createdAt:Date.now()});
+  const leadId = S.data.leads['leah-roling-innerboard-os'] ? 'leah-roling-innerboard-os' : Object.keys(S.data.leads).find(id => /roling/i.test(S.data.leads[id].name || ''));
+  const line = `${mon.slice(5).replace('-', '/')}: Worked on app updates.`;
+  if (leadId && !String(S.data.leads[leadId].notes || '').includes(line)) patchDoc('leads', leadId, {notes:(S.data.leads[leadId].notes ? S.data.leads[leadId].notes + '\n' : '') + line, updatedAt:Date.now()});
+  parts.push('the InnerBoard app work');
+  return parts.join(' and ');
 }
 
 /* ---------- rollover automation ---------- */
@@ -390,6 +445,7 @@ const allLoaded = () => COLS.every(c => S.got[c]);
 function maybeRollover() {
   if (!db || !allLoaded() || rolling || !cfg().schedule || !db.status().loaded) return;
   maybeAutoFreshStart();
+  maybeRestart();
   const y = addDays(todayISO(), -1);
   const through = (S.data.meta.rollover || {}).through;
   if (through && through >= y) return;
@@ -487,16 +543,18 @@ function viewToday() {
   // the ord-* classes put everything back in one sensible order.
   const main = [
     wk ? `<div class="week-banner ord-1"><div class="eyebrow">This week</div><b>${esc(wk.focus)}</b>${wk.musts ? `<details><summary>Must-dos this week</summary><div class="meta" style="margin-top:4px;color:var(--ink-2)">${esc(wk.musts)}</div></details>` : ''}</div>` : '',
-    rest ? `<div class="rest-banner ord-2"><div class="eyebrow">Rest day</div><b>Church, rest and pickleball.</b><div class="meta">Nothing counts as late today.${carried.length ? ` ${plural(carried.length,'to-do')} will be waiting for you tomorrow.` : ''}</div></div>` : '',
+    rest && day.off ? `<div class="rest-banner ord-2"><div class="eyebrow">Day off</div><b>Today doesn't count.</b><div class="meta">Nothing is late and nothing turns into a make-up.${profile().startDate === addDays(t, 1) ? ' Everything starts fresh tomorrow.' : ''} Check off anything you did anyway.</div><div class="btnrow" style="margin-top:8px"><button class="btn sm ghost" data-act="day-off" data-on="0">It's not a day off</button></div></div>`
+    : rest ? `<div class="rest-banner ord-2"><div class="eyebrow">Rest day</div><b>Church, rest and pickleball.</b><div class="meta">Nothing counts as late today.${carried.length ? ` ${plural(carried.length,'to-do')} will be waiting for you tomorrow.` : ''}</div></div>` : '',
     `<div class="progress ord-3 ${pct === 100 ? 'good' : ''}"><div class="bar"><i style="width:${pct}%"></i></div><span class="meta mono">${doneN}/${checkable.length} blocks</span>${behind ? `<button class="pill warn tap" data-act="catchup" title="Sort out what you missed">${behind} behind · Catch up</button>` : ''}${carried.length && !rest ? `<span class="pill bad">${carried.length} carried over</span>` : ''}</div>`,
     nowCard(items, t),
-    `<section class="card ord-7"><div class="card-h"><h2>Today's plan</h2><div class="btnrow"><button class="btn sm" data-act="sched-open" data-date="${t}">Edit</button><button class="btn sm" data-act="add-open" data-date="${t}">+ Add</button></div></div>${items.map(i => planRow(i, t, day)).join('')}</section>`,
+    `<section class="card ord-7"><div class="card-h"><h2>Today's plan</h2><div class="btnrow"><button class="btn sm" data-act="sched-open" data-date="${t}">Edit</button><button class="btn sm" data-act="quick-open">+ Add</button></div></div>${items.map(i => planRow(i, t, day)).join('')}</section>`,
   ];
   const side = [
     amCard(t, day),
-    carried.length && !rest ? `<section class="card ord-6"><div class="card-h"><h2>Carried over</h2><span class="meta">Not done yet, so they moved to today</span></div>${carried.map(x => taskRow(x, t)).join('')}</section>` : '',
+    carried.length && !rest ? `<section class="card ord-6"><div class="card-h"><h2>Carried over</h2><span class="meta">Not done yet, so they moved to today</span></div>${taskList(carried, t)}</section>` : '',
     `<section class="card ord-8"><div class="card-h"><h2>To-dos due today</h2><span class="meta">${due.length ? plural(due.length,'item') : 'All clear'}</span></div>
-      ${due.map(x => taskRow(x, t)).join('') || '<div class="meta">Nothing else due today.</div>'}
+      ${due.length + carried.length > 6 && !rest ? `<div class="overload"><span>${due.length + carried.length} to-dos today${carried.length ? ', counting the carried-over ones. That' : ''} is a lot.</span><button class="btn sm" data-act="spread">Spread over the week</button></div>` : ''}
+      ${taskList(due, t) || '<div class="meta">Nothing else due today.</div>'}
       ${addTaskForm('qt', t)}
       ${doneTasks.length ? `<details style="margin-top:8px"><summary>Done today (${doneTasks.length})</summary>${doneTasks.map(x => taskRow(x, t)).join('')}</details>` : ''}
     </section>`,
@@ -505,10 +563,11 @@ function viewToday() {
   return installBanner() + tipBanner() + `<div class="two"><div class="main">${main.join('')}</div><div class="side">${side.join('')}</div></div>`;
 }
 function tipBanner() {
-  let done = false; try { done = !!localStorage.getItem('lcc-tip2-done'); } catch(e) {}
+  let done = false; try { done = !!localStorage.getItem('lcc-tip3-done'); } catch(e) {}
   if (done) return '';
   const desktop = window.matchMedia && matchMedia('(min-width: 980px)').matches;
-  return `<div class="tip"><span><b>Tap any block</b> for the story behind it.${desktop ? ' <b>Rest your pointer on a block</b> to push it back, reschedule or cancel it. Keys: <kbd>1</kbd>–<kbd>5</kbd> tabs, <kbd>/</kbd> search leads, <kbd>n</kbd> new to-do, <kbd>s</kbd> schedule, <kbd>e</kbd> add to your plan, <kbd>c</kbd> start calling, <kbd>a</kbd> ask.' : ' <b>Swipe a block left</b> to push it back, reschedule or cancel it, or <b>right</b> to mark it done.'}</span><button class="btn sm ghost" data-act="tip-done">Got it</button></div>`;
+  const add = ' <b>+ Add</b> understands plain words, like “Pickleball Thu 6-8am” or “Call Lisa tomorrow”.';
+  return `<div class="tip"><span><b>Tap any block</b> for the story behind it.${desktop ? ` <b>Rest your pointer on a block or a to-do</b> to push it back, reschedule or cancel it.${add} Keys: <kbd>1</kbd>–<kbd>5</kbd> tabs, <kbd>/</kbd> search leads, <kbd>n</kbd> new to-do, <kbd>s</kbd> schedule, <kbd>e</kbd> add, <kbd>c</kbd> start calling, <kbd>a</kbd> ask.` : ` <b>Swipe a block or a to-do left</b> to push it back, reschedule or cancel it, or <b>right</b> to mark it done.${add}`}</span><button class="btn sm ghost" data-act="tip-done">Got it</button></div>`;
 }
 function nowCard(items, t) {
   const m = nowMin();
@@ -582,22 +641,60 @@ function planRow(i, t, day) {
     <button class="more" data-act="item-menu" data-key="${k}" aria-label="Reschedule or cancel ${esc(itemName(i))}">⋯</button>
     ${qa}${menu}</div></div>`;
 }
-function taskRow(x, t) {
+function taskRow(x, t, grouped) {
   const late = !x.done && x.due && x.due < t && !isRestDay(t) ? daysBetween(x.due, t) : 0;
   const bits = [];
   if (late) bits.push(`<span class="pill bad">${late === 1 ? '1 day late' : late + ' days late'}</span>`);
   if (x.kind === 'makeup') bits.push('<span class="pill warn">Make-up</span>');
-  if (x.area) bits.push(`<span class="pill">${esc(x.area)}</span>`);
+  if (x.area && !grouped) bits.push(`<span class="pill">${esc(x.area)}</span>`);
+  if (!x.done && x.due && x.due > t) bits.push(`<span class="pill">${esc(fmtDay(x.due))}</span>`);
   if (x.notes) bits.push(esc(x.notes));
-  return `<div class="trow ${x.done ? 'done' : ''}"><button class="ck ${x.done ? 'on' : ''}" data-act="task-toggle" data-id="${esc(x.id)}" aria-pressed="${!!x.done}" aria-label="Done: ${esc(x.title)}"></button>
-    <div class="min0"><div class="txt" data-act="task-open" data-id="${esc(x.id)}" role="button" tabindex="0">${esc(x.title)}</div>${bits.length ? `<div class="meta">${bits.join(' ')}</div>` : ''}</div>
-    ${!x.done ? `<div class="acts"><button class="btn sm" data-act="task-tomorrow" data-id="${esc(x.id)}">Tomorrow</button><button class="btn sm ghost" data-act="task-drop" data-id="${esc(x.id)}">Drop</button></div>` : ''}</div>`;
+  const k = esc(x.id), key = 't:' + x.id, open = S.swipeKey === key, ti = open ? '0' : '-1';
+  const acts = x.done ? [] : [`<button class="sa push" data-act="task-tomorrow" data-id="${k}" tabindex="${ti}">Tomorrow</button>`, `<button class="sa resched" data-act="task-open" data-id="${k}" tabindex="${ti}">Pick a day</button>`, `<button class="sa cancel" data-act="task-drop" data-id="${k}" tabindex="${ti}">Drop</button>`];
+  const qa = x.done ? '' : `<div class="qa" aria-hidden="true"><button class="btn sm" data-act="task-tomorrow" data-id="${k}" tabindex="-1">Tomorrow</button><button class="btn sm" data-act="task-open" data-id="${k}" tabindex="-1">Pick a day</button><button class="btn sm ghost" data-act="task-drop" data-id="${k}" tabindex="-1">Drop</button></div>`;
+  const flash = S.flash && S.flash.key === key && Date.now() - S.flash.at < 1600 ? 'flash' : '';
+  return `<div class="swipe ${open ? 'open' : ''}" data-key="${esc(key)}" data-task="${k}" data-done="1" style="--acts-w:${acts.length * 84}px">
+    <div class="swipe-done" aria-hidden="true">${x.done ? 'Undo' : 'Done'}</div>${acts.length ? `<div class="swipe-acts" ${open ? '' : 'aria-hidden="true"'}>${acts.join('')}</div>` : ''}
+    <div class="trow ${x.done ? 'done' : ''} ${flash}"><button class="ck ${x.done ? 'on' : ''}" data-act="task-toggle" data-id="${k}" aria-pressed="${!!x.done}" aria-label="Done: ${esc(x.title)}"></button>
+    <div class="min0"><div class="txt" data-act="task-open" data-id="${k}" role="button" tabindex="0">${esc(x.title)}</div>${bits.length ? `<div class="meta">${bits.join(' ')}</div>` : ''}</div>${qa}</div></div>`;
+}
+// Long lists are grouped by area, with your check-out fix first.
+const TASK_GROUPS = ['Fix','Sales','Build','Pickleball','Body','Money','Move','DoD','Other'];
+function taskList(list, t) {
+  if (list.length <= 5) return list.map(x => taskRow(x, t)).join('');
+  const groups = {};
+  list.forEach(x => { const g = x.kind === 'fix' ? 'Fix' : (TASK_GROUPS.includes(x.area) ? x.area : 'Other'); (groups[g] = groups[g] || []).push(x); });
+  return TASK_GROUPS.filter(g => groups[g]).map(g => `<div class="tg-h"><span>${g === 'Fix' ? 'Your fix' : esc(g)}</span><span>${groups[g].length}</span></div>${groups[g].map(x => taskRow(x, t, true)).join('')}`).join('');
+}
+// Most important first: your fix, top 3, make-ups, then whatever has waited longest.
+const taskRank = x => x.kind === 'fix' ? 0 : x.kind === 'top3' ? 1 : x.kind === 'makeup' ? 2 : 3;
+const taskPriority = (a, b) => taskRank(a) - taskRank(b) || String(a.origDue || a.due).localeCompare(String(b.origDue || b.due)) || TASK_GROUPS.indexOf(a.area) - TASK_GROUPS.indexOf(b.area);
+// Keep the five most important for today and move the rest onto the next work days, five a day.
+function spreadTasks(t) {
+  const list = [...tasksCarried(t), ...tasksDue(t)].sort(taskPriority);
+  const move = list.slice(5); if (!move.length) return null;
+  const ops = []; let d = t, i = 0, first = null;
+  for (let guard = 0; i < move.length && guard < 90; guard++) {
+    d = addDays(d, 1);
+    if (isRestDay(d)) continue;
+    let room = 5 - tasksDue(d).length;
+    while (room-- > 0 && i < move.length) {
+      const x = move[i++];
+      ops.push({set:['tasks', x.id, clone(S.data.tasks[x.id])]});
+      patchDoc('tasks', x.id, {due:d, origDue:x.origDue || x.due});
+      first = first || d;
+    }
+  }
+  S.lastUndo = {type:'restore', ops};
+  return {n:ops.length, first, last:d};
 }
 function addTaskForm(p, defDate) {
-  return `<form class="btnrow" data-form="task" data-p="${p}" style="margin-top:10px">
-    <input class="in" id="${p}-title" data-draft placeholder="Add a to-do" value="${esc(draft(p+'-title'))}" style="flex:1 1 180px">
-    <input class="in" type="date" id="${p}-date" data-draft value="${esc(draft(p+'-date', defDate))}" style="flex:0 1 160px">
-    <button class="btn primary" type="submit">Add</button></form>`;
+  const txt = draft(p + '-title'), date = draft(p + '-date', defDate);
+  return `<form class="stack qform" data-form="task" data-p="${p}">
+    <div class="btnrow"><input class="in" id="${p}-title" data-draft data-quick data-fallback="${p}-date" placeholder="Add anything: Call Lisa tomorrow, Gym 6pm" value="${esc(txt)}" style="flex:1 1 180px" autocomplete="off">
+    <input class="in" type="date" id="${p}-date" data-draft value="${esc(date)}" style="flex:0 1 160px" aria-label="Due date when you don't type one">
+    <button class="btn primary" type="submit">Add</button></div>
+    <div class="qprev" id="${p}-title-prev" aria-live="polite">${txt.trim() ? quickPreview(quickPlan(txt, date), p + '-title') : ''}</div></form>`;
 }
 function amCard(t, day) {
   const am = day.am || {};
@@ -1029,7 +1126,7 @@ function viewPlan() {
   return `
     ${planOverview(t)}
     <div class="two-eq"><div class="col">
-    <section class="card"><div class="card-h"><h2>Your schedule</h2><div class="btnrow"><button class="btn sm" data-act="sched-open">Edit</button><button class="btn sm" data-act="add-open">+ Add</button></div></div>
+    <section class="card"><div class="card-h"><h2>Your schedule</h2><div class="btnrow"><button class="btn sm" data-act="sched-open">Edit</button><button class="btn sm" data-act="quick-open">+ Add</button></div></div>
       <div class="meta">Move, add or take out blocks for one day or for every week. Or tap Ask and say it, like "move my drill to 6 tomorrow".</div>
       <div class="daychips" style="margin-top:8px">${WEEK_ORDER.map(x => `<button data-act="sched-open" data-date="${nextDow(t, x)}">${x}</button>`).join('')}</div></section>
     <section class="card"><div class="card-h"><h2>Add a to-do</h2></div>${addTaskForm('pt', t)}</section>
@@ -1260,7 +1357,8 @@ function catchupSheet() {
     ${list.length ? `<p class="meta" style="margin:0">These are past their time and not checked off. Mark what you did, reschedule what you still want to do, and cancel the rest. Canceled blocks don't come back tomorrow as make-ups.</p>
     <div class="cu">${list.map(row).join('')}</div>
     ${cancelable.length > 1 ? '<div class="btnrow"><button class="btn ghost" data-act="catchup-cancel">Cancel the rest for today</button></div>' : ''}`
-    : '<div class="card empty"><b>You\'re caught up.</b><br>Everything before now is done or canceled.</div>'}`;
+    : '<div class="card empty"><b>You\'re caught up.</b><br>Everything before now is done or canceled.</div>'}
+    <div class="cu-foot"><span class="meta">Today not happening?</span><button class="btn sm" data-act="day-off" data-on="1">Make today a day off</button><button class="btn sm" data-act="fresh-tomorrow">Start fresh tomorrow</button></div>`;
 }
 // The Reschedule box: nudge buttons, exact times, another day, and whether the change is for this day or every week.
 function movePanel(i, t) {
@@ -1403,6 +1501,73 @@ function notifSheet() {
     ${st.msg && st.fn !== 'error' ? `<div class="${st.kind === 'ok' ? 'ok-box' : 'err'}">${esc(st.msg)}</div>` : ''}
     <div class="meta">Calendar alarms are the no-setup alternative: <a data-act="calendar">Add to calendar</a> gives you a weekly calendar with an alarm before every block.</div>`;
 }
+/* ----- smart add: one line in, the right thing out ----- */
+const hhmmNow = () => { const n = new Date(); return `${pad(n.getHours())}:${pad(n.getMinutes())}`; };
+function quickPlan(text, fallbackDate) {
+  const p = parseQuick(text, todayISO(), hhmmNow());
+  if (p.kind === 'task' && !p.date) p.date = /^\d{4}-\d{2}-\d{2}$/.test(fallbackDate || '') ? fallbackDate : todayISO();
+  return p;
+}
+const QUICK_HINT = 'Type it the way you would say it. A time puts it on your plan, no time makes it a to-do, and "every" makes it weekly.';
+function quickPreview(p, srcId) {
+  if (!p || !String(p.title || '').trim()) return '';
+  const label = p.kind === 'task' ? 'To-do' : p.type === 'session' ? 'Pickleball · ' + (p.sessionType || 'Rec play') : p.type === 'gym' ? 'Gym' : p.type === 'mobility' ? 'Mobility' : p.type === 'watch' ? 'Study' : p.kind === 'weekly' ? 'Block' : 'Event';
+  const every = p.days ? (daysLabel(p.days).startsWith('every') ? daysLabel(p.days) : 'every ' + daysLabel(p.days)) : '';
+  const when = p.kind === 'weekly' ? `${every}${p.start ? ', ' + fmtTap(p.start) + '–' + fmtTap(p.end) : ' · add a time'}`
+    : p.kind === 'oneoff' ? `${dayWord(p.date)}, ${fmtTap(p.start)}–${fmtTap(p.end)}` : `due ${dayWord(p.date)}${p.area !== 'Other' ? ' · ' + p.area : ''}`;
+  const where = p.kind === 'weekly' ? ' · your weekly plan' : p.kind === 'oneoff' ? " · that day's plan" : '';
+  return `<span class="qk ${p.kind}">${esc(label)}</span> <b>${esc(p.title)}</b> · ${esc(when)}${esc(where)}${p.kind !== 'task' && srcId ? ` <a data-act="quick-as-task" data-src="${esc(srcId)}">Just a to-do</a>` : ''}`;
+}
+// Files what quickPlan understood. Returns the message for the toast, or null when it needs a time first.
+function addQuick(p) {
+  if (p.kind === 'task') {
+    const id = 'u-' + Date.now().toString(36);
+    setDoc('tasks', id, {title:p.title, due:p.date, origDue:p.date, area:p.area || 'Other', done:false, kind:'task', createdAt:Date.now()});
+    S.lastUndo = {type:'restore', ops:[{del:['tasks', id]}]}; S.flash = {key:'t:' + id, at:Date.now()};
+    return `Added to-do: ${p.title}, due ${dayWord(p.date)}.`;
+  }
+  if (p.kind === 'oneoff') {
+    const id = 'ev-' + Date.now().toString(36);
+    const doc = {title:p.title, date:p.date, start:p.start, end:p.end, where:'', notes:'', createdAt:Date.now(), updatedAt:Date.now()};
+    if (p.type !== 'event') { doc.kind = p.type; if (p.sessionType) doc.sessionType = p.sessionType; }
+    setDoc('events', id, doc);
+    S.lastUndo = {type:'restore', ops:[{del:['events', id]}]}; S.flash = {key:'ev-' + id, at:Date.now()};
+    const over = overlaps(p.date, p.start, p.end, 'ev-' + id);
+    return `Added ${p.title}, ${dayWord(p.date)} at ${fmtTap(p.start)}.${over.length ? ` It overlaps ${listNames(over)}.` : ''}`;
+  }
+  if (!p.start) return null;
+  const item = {key:'b' + Date.now().toString(36), start:p.start, end:p.end, tag:p.title, text:'', kind:p.type === 'event' ? 'task' : p.type};
+  if (item.kind === 'session') { item.sessionType = p.sessionType || 'Drill'; item.hours = Math.round((toMin(p.end) - toMin(p.start)) / 30) / 2 || 1; }
+  if (['mobility','watch'].includes(item.kind)) item.minutes = Math.max(5, toMin(p.end) - toMin(p.start));
+  const changes = {}, prev = {};
+  p.days.forEach(x => { prev[x] = templateDay(x); changes[x] = [...templateDay(x), clone(item)].sort(byStart); });
+  patchDoc('config', 'schedule', {days:changes});
+  S.lastUndo = {type:'restore', ops:[{patch:['config', 'schedule', {days:prev}]}]}; S.flash = {key:item.key, at:Date.now()};
+  return `Added ${p.title} to ${daysLabel(p.days)} at ${fmtTap(p.start)}.`;
+}
+// Opens the detailed form with what the line said, for anything the box can't do in one go.
+function quickToForm(p, back) {
+  clearDrafts('ev-'); clearDrafts('ad-');
+  const date = p.date || todayISO();
+  S.drafts['ev-title'] = p.title === 'Untitled' ? '' : p.title;
+  if (p.kind !== 'weekly') S.drafts['ev-date'] = date;
+  if (p.start) { S.drafts['ev-start'] = p.start; S.drafts['ev-end'] = p.end; }
+  S.drafts['ad-type'] = p.type === 'session' ? 'session:' + (p.sessionType || 'Rec play') : ['gym','mobility','watch'].includes(p.type) ? p.type : p.kind === 'weekly' ? 'task' : 'event';
+  S.confirm = null;
+  S.modal = {type:'add', date, scope:p.kind === 'weekly' ? 'week' : 'day', days:p.days || [dowOf(date)], back:back || null};
+}
+function quickSheet() {
+  const txt = draft('qa-in');
+  const ex = ['Call Lisa tomorrow', 'Pickleball Thu 6-8am', 'Dentist Friday 2pm', 'Gym every Mon, Wed, Fri 6:30pm', 'Send the proposal Wednesday'];
+  return `<div class="card-h"><h2>Add</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
+    <form class="stack" data-form="quick">
+      <input class="in big" id="qa-in" data-draft data-quick value="${esc(txt)}" placeholder="What do you want to add?" autocomplete="off" enterkeyhint="done">
+      <div class="qprev hint" id="qa-in-prev" aria-live="polite">${txt.trim() ? quickPreview(quickPlan(txt), 'qa-in') : esc(QUICK_HINT)}</div>
+      <div class="btnrow"><button class="btn primary" type="submit">Add</button><button class="btn ghost" type="button" data-act="quick-more">More options</button></div>
+    </form>
+    <div class="chips multi">${ex.map(e => `<button class="chip" data-act="quick-example" data-text="${esc(e)}">${esc(e)}</button>`).join('')}</div>`;
+}
+
 /* ----- your schedule: move, add and change blocks, for one day or every week ----- */
 function typeSelect(id, value, scope) {
   const opts = ITEM_TYPES.filter(([, , only]) => !only || only === scope);
@@ -1627,7 +1792,7 @@ function renderModal() {
   const old = el.querySelector('.sheet'), top = old && el.dataset.sig === sig ? old.scrollTop : 0;
   const ty = S.modal.type;
   el.hidden = false;
-  el.innerHTML = `<div class="sheet ${ty === 'sched' ? 'wide' : ''}" role="dialog" aria-modal="true">${ty === 'session' ? sessionForm() : ty === 'fresh' ? freshForm() : ty === 'block' ? blockSheet(S.modal.key, S.modal.date) : ty === 'task' ? taskSheet(S.modal.id) : ty === 'mile' ? mileSheet(S.modal.id) : ty === 'stat' ? statSheet(S.modal.id) : ty === 'notif' ? notifSheet() : ty === 'call' ? callSheet() : ty === 'event' ? eventForm() : ty === 'chat' ? chatSheet() : ty === 'assist' ? assistantSheet() : ty === 'sched' ? schedSheet() : ty === 'add' ? addForm() : ty === 'blockedit' ? blockEditForm() : ty === 'catchup' ? catchupSheet() : leadEditForm()}</div>`;
+  el.innerHTML = `<div class="sheet ${ty === 'sched' ? 'wide' : ''}" role="dialog" aria-modal="true">${ty === 'session' ? sessionForm() : ty === 'fresh' ? freshForm() : ty === 'block' ? blockSheet(S.modal.key, S.modal.date) : ty === 'task' ? taskSheet(S.modal.id) : ty === 'mile' ? mileSheet(S.modal.id) : ty === 'stat' ? statSheet(S.modal.id) : ty === 'notif' ? notifSheet() : ty === 'call' ? callSheet() : ty === 'event' ? eventForm() : ty === 'chat' ? chatSheet() : ty === 'assist' ? assistantSheet() : ty === 'sched' ? schedSheet() : ty === 'add' ? addForm() : ty === 'blockedit' ? blockEditForm() : ty === 'catchup' ? catchupSheet() : ty === 'quick' ? quickSheet() : leadEditForm()}</div>`;
   el.dataset.sig = sig;
   if (top) el.querySelector('.sheet').scrollTop = top;
   if (keep) { const n = document.getElementById(keep.id); if (n) { n.focus({preventScroll:true}); try { if (keep.s != null) n.setSelectionRange(keep.s, keep.e); } catch(e) {} } }
@@ -1745,8 +1910,8 @@ function handle(act, el, ev) {
       render(); break;
     }
     case 'task-toggle': taskToggle(d.id); if (S.modal && S.modal.type === 'task') S.modal = null; break;
-    case 'task-tomorrow': { const x = S.data.tasks[d.id]; if (!x) break; S.lastUndo = {type:'task', id:d.id, prev:clone(x)}; patchDoc('tasks', d.id, {due:addDays(t,1), origDue:x.origDue || x.due}); if (S.modal && S.modal.type === 'task') S.modal = null; toast('Moved to tomorrow.', true); break; }
-    case 'task-drop': { const x = S.data.tasks[d.id]; if (!x) break; S.lastUndo = {type:'task', id:d.id, prev:clone(x)}; patchDoc('tasks', d.id, {dropped:true, droppedOn:t}); if (S.modal && S.modal.type === 'task') S.modal = null; toast('Dropped.', true); break; }
+    case 'task-tomorrow': { const x = S.data.tasks[d.id]; if (!x) break; S.lastUndo = {type:'task', id:d.id, prev:clone(x)}; patchDoc('tasks', d.id, {due:addDays(t,1), origDue:x.origDue || x.due}); if (S.modal && S.modal.type === 'task') S.modal = null; toast(`Moved "${x.title.slice(0, 40)}" to tomorrow.`, true); break; }
+    case 'task-drop': { const x = S.data.tasks[d.id]; if (!x) break; S.lastUndo = {type:'task', id:d.id, prev:clone(x)}; patchDoc('tasks', d.id, {dropped:true, droppedOn:t}); if (S.modal && S.modal.type === 'task') S.modal = null; toast(`Dropped "${x.title.slice(0, 40)}".`, true); break; }
     case 'top3': { const am = clone(dayOf(t).am || {}); const arr = am.top3 || []; const n = +d.i; if (!arr[n]) break; arr[n].done = !arr[n].done; patchDay(t, {am:{top3:arr}}); break; }
     case 'energy': S.drafts['am-energy'] = d.n; render(); break;
     case 'am-edit': S.editAM = true; clearDrafts('am-'); render(); break;
@@ -1774,7 +1939,7 @@ function handle(act, el, ev) {
     case 'modal-close': closeModal(); render(); break;
     case 'call-start': S.leadForm = null; S.callMode = {region:d.region || null, skipped:[]}; S.modal = {type:'call'}; render(); break;
     case 'call-skip': if (S.callMode) S.callMode.skipped = [...(S.callMode.skipped || []), d.id]; render(); break;
-    case 'tip-done': try { localStorage.setItem('lcc-tip2-done', '1'); } catch(e) {} render(); break;
+    case 'tip-done': try { localStorage.setItem('lcc-tip3-done', '1'); } catch(e) {} render(); break;
     case 'event-new': handle('add-open', el, ev); break;
     case 'event-edit': clearDrafts('ev-'); clearDrafts('ad-'); S.confirm = null; S.modal = {type:'event', id:d.id}; render(); break;
     case 'sched-open': S.openItem = null; S.confirm = null; S.modal = {type:'sched', date:d.date || t}; render(); break;
@@ -1840,6 +2005,31 @@ function handle(act, el, ev) {
     case 'goto-settings': setView('plan'); setTimeout(() => { const el = document.getElementById('settings'); if (el) el.scrollIntoView({behavior:'smooth', block:'start'}); }, 60); break;
     case 'theme': theme = THEMES.includes(d.t) ? d.t : 'auto'; applyTheme(); render(); break;
     case 'update-app': if (S.updateApp) { S.toast = null; renderToast(); S.updateApp(); } break;
+    case 'toast-close': S.toast = null; renderToast(); break;
+    case 'quick-open': S.openItem = null; S.confirm = null; S.modal = {type:'quick'}; render(); setTimeout(() => { const b = document.getElementById('qa-in'); if (b) b.focus(); }, 60); break;
+    case 'quick-example': S.drafts['qa-in'] = d.text; render(); setTimeout(() => { const b = document.getElementById('qa-in'); if (b) { b.focus(); b.setSelectionRange(b.value.length, b.value.length); } }, 30); break;
+    case 'quick-more': { const txt = String(S.drafts['qa-in'] || '').trim(); clearDrafts('qa-'); quickToForm(txt ? quickPlan(txt) : {kind:'oneoff', type:'event', title:'', date:t}); render(); break; }
+    case 'quick-as-task': {
+      const src = d.src, txt = String(S.drafts[src] || (document.getElementById(src) || {}).value || '').trim(); if (!txt) break;
+      const fb = src === 'qa-in' ? t : (S.drafts[src.replace('-title', '-date')] || (document.getElementById(src.replace('-title', '-date')) || {}).value || t);
+      const q = quickPlan(txt, fb);
+      const msg = addQuick({kind:'task', title:txt.charAt(0).toUpperCase() + txt.slice(1), date:q.kind === 'task' ? q.date : fb, area:q.area});
+      clearDrafts(src.replace(/-(title|in)$/, '-')); if (src === 'qa-in') S.modal = null;
+      toast(msg, true); render(); break;
+    }
+    case 'spread': { const r = spreadTasks(t); if (r) toast(`Kept the 5 most important for today and spread ${plural(r.n, 'to-do')} over ${fmtDay(r.first)} to ${fmtDay(r.last)}.`, true); render(); break; }
+    case 'day-off': {
+      const on = d.on === '1', prev = !!dayOf(t).off;
+      S.lastUndo = {type:'restore', ops:[{patch:['days', t, {off:prev}]}]};
+      patchDay(t, {off:on});
+      if (on && S.modal && S.modal.type === 'catchup') S.modal = null;
+      toast(on ? "Today is a day off. Nothing is late and nothing turns into a make-up." : 'Today counts again.', true); render(); break;
+    }
+    case 'fresh-tomorrow': {
+      const tm = addDays(t, 1), r = applyFreshStart(tm, false);
+      patchDay(t, {off:true}); S.modal = null; S.lastUndo = null;
+      toast(`Fresh start tomorrow, ${fmtDay(tm)}. Today is a day off. ${plural(r.moved, 'to-do')} and ${plural(r.leadsMoved, 'follow-up')} moved there.`); render(); break;
+    }
     case 'disconnect': if (confirm('Disconnect this device from your Supabase project? You will need to paste the URL and key again.')) { clearConfig(); if (db) db.destroy({wipe:true}); Promise.resolve(supabase && supabase.auth.signOut()).catch(() => {}).then(() => location.reload()); } break;
   }
 }
@@ -1870,10 +2060,19 @@ function submit(form) {
       break;
     }
     case 'task': {
-      const p = form.dataset.p, title = String(v(p + '-title')).trim(), due = v(p + '-date') || t;
-      if (!title) { toast('Type the to-do first.'); return; }
-      setDoc('tasks', 'u-' + Date.now().toString(36), {title, due, origDue:due, area:'Other', done:false, kind:'task', createdAt:Date.now()});
-      clearDrafts(p + '-'); toast(due === t ? 'Added to today.' : 'Added for ' + fmtDay(due) + '.'); render(); break;
+      const p = form.dataset.p, text = String(v(p + '-title')).trim(), fallback = v(p + '-date') || t;
+      if (!text) { toast('Type something first.'); return; }
+      const q = quickPlan(text, fallback);
+      if (q.kind === 'weekly' && !q.start) { clearDrafts(p + '-'); quickToForm(q); toast('Pick a time for it.'); render(); return; }
+      const msg = addQuick(q); clearDrafts(p + '-'); toast(msg, true); render(); break;
+    }
+    case 'quick': {
+      const text = String(v('qa-in')).trim();
+      if (!text) { toast('Type something first.'); return; }
+      const q = quickPlan(text, t);
+      clearDrafts('qa-');
+      if (q.kind === 'weekly' && !q.start) { quickToForm(q); toast('Pick a time for it.'); render(); return; }
+      const msg = addQuick(q); S.modal = null; toast(msg, true); render(); break;
     }
     case 'am': {
       const old = (dayOf(t).am || {}).top3 || [];
@@ -2059,8 +2258,8 @@ function closeSwipe(except) {
 }
 document.addEventListener('pointerdown', ev => {
   if (ev.pointerType === 'mouse') return;
-  const row = ev.target.closest('.swipe > .row'); if (!row) return;
-  const wrap = row.parentElement, w = parseFloat(getComputedStyle(wrap).getPropertyValue('--acts-w')) || 250;
+  const row = ev.target.closest('.swipe > .row, .swipe > .trow'); if (!row) return;
+  const wrap = row.parentElement, cw = parseFloat(getComputedStyle(wrap).getPropertyValue('--acts-w')), w = Number.isFinite(cw) ? cw : 250;
   sw = {row, wrap, key:wrap.dataset.key, id:ev.pointerId, x:ev.clientX, y:ev.clientY, w, base:wrap.classList.contains('open') ? -w : 0, canDone:wrap.dataset.done === '1', active:false, pos:0};
 }, {passive:true});
 document.addEventListener('pointermove', ev => {
@@ -2083,8 +2282,12 @@ function endSwipe(ev) {
   if (!s.active) return;
   swipeEnded = Date.now();
   s.row.style.transition = ''; s.row.style.transform = ''; s.wrap.classList.remove('done-ready');
-  if (ev.type === 'pointerup' && s.canDone && s.pos >= 76) { s.wrap.classList.remove('open'); S.swipeKey = null; toggleCheck(s.key); render(); return; }
-  const open = ev.type === 'pointerup' ? s.pos <= -s.w / 2 : s.base < 0;
+  if (ev.type === 'pointerup' && s.canDone && s.pos >= 76) {
+    s.wrap.classList.remove('open'); S.swipeKey = null;
+    if (s.wrap.dataset.task) taskToggle(s.wrap.dataset.task); else toggleCheck(s.key);
+    render(); return;
+  }
+  const open = s.w > 0 && (ev.type === 'pointerup' ? s.pos <= -s.w / 2 : s.base < 0);
   s.wrap.classList.toggle('open', open);
   s.wrap.querySelectorAll('.swipe-acts button').forEach(b => b.tabIndex = open ? 0 : -1);
   S.swipeKey = open ? s.key : (S.swipeKey === s.key ? null : S.swipeKey);
@@ -2096,6 +2299,10 @@ document.addEventListener('input', ev => {
   const el = ev.target;
   if (el.id === 'lead-search') { S.search = el.value; const pos = el.selectionStart; render(); const n = document.getElementById('lead-search'); if (n) { n.focus(); try { n.setSelectionRange(pos, pos); } catch(e) {} } return; }
   if (el.hasAttribute && el.hasAttribute('data-draft') && el.id) S.drafts[el.id] = el.value;
+  if (el.hasAttribute && el.hasAttribute('data-quick')) {
+    const out = document.getElementById(el.id + '-prev'), fb = el.dataset.fallback ? (document.getElementById(el.dataset.fallback) || {}).value : '';
+    if (out) out.innerHTML = el.value.trim() ? quickPreview(quickPlan(el.value, fb), el.id) : (el.id === 'qa-in' ? esc(QUICK_HINT) : '');
+  }
 });
 document.addEventListener('change', ev => {
   const el = ev.target;
@@ -2120,7 +2327,7 @@ document.addEventListener('keydown', ev => {
   else if (ev.key === '/') { ev.preventDefault(); setView('calls'); setTimeout(() => { const s = document.getElementById('lead-search'); if (s) s.focus(); }, 0); }
   else if (ev.key === 'n') { ev.preventDefault(); if (!['today','plan'].includes(S.view)) setView('today'); setTimeout(() => { const f = document.getElementById(S.view === 'plan' ? 'pt-title' : 'qt-title'); if (f) { f.scrollIntoView({block:'center'}); f.focus(); } }, 0); }
   else if (ev.key === 'c') { ev.preventDefault(); handle('call-start', {dataset:{}}, ev); render(); }
-  else if (ev.key === 'e') { ev.preventDefault(); handle('add-open', {dataset:{}}, ev); }
+  else if (ev.key === 'e') { ev.preventDefault(); handle('quick-open', {dataset:{}}, ev); }
   else if (ev.key === 's') { ev.preventDefault(); handle('sched-open', {dataset:{}}, ev); }
   else if (ev.key === 'a') { ev.preventDefault(); handle('ask', {dataset:{}}, ev); }
 });
