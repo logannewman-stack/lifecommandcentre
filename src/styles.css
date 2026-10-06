@@ -237,6 +237,7 @@ nav.tabs .badge{position:absolute;top:4px;left:calc(50% + 6px);min-width:18px;pa
 .sheet{background:var(--surface);width:100%;max-width:560px;max-height:92%;overflow:auto;border-radius:20px 20px 0 0;padding:10px 16px calc(18px + env(safe-area-inset-bottom,0px));display:flex;flex-direction:column;gap:12px;box-shadow:var(--shadow-lg)}
 .sheet::before{content:"";display:block;width:38px;height:4px;border-radius:99px;background:var(--line);margin:0 auto 4px}
 @media (prefers-reduced-motion:no-preference){.sheet{animation:sheet-in .22s cubic-bezier(.2,.8,.2,1)}#modal{animation:fade-in .18s ease}}
+.sheet.still{animation:none}
 @keyframes sheet-in{from{transform:translateY(28px);opacity:.5}to{transform:none;opacity:1}}
 @keyframes fade-in{from{opacity:0}to{opacity:1}}
 @media (min-width:640px){#modal{align-items:center;padding:20px}.sheet{border-radius:20px;padding-top:16px;max-height:88%}.sheet::before{display:none}}
@@ -407,6 +408,71 @@ body.dropping::after{content:"Drop your backup file to import it";position:fixed
 .qprev a{margin-left:6px;white-space:nowrap}
 .in.big{font-size:18px;padding:12px}
 .chips.multi{flex-wrap:wrap;overflow:visible}
+
+/* day strip: today, tomorrow and the rest of the week */
+.daystrip{display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;margin-inline:-16px;padding:2px 16px 4px;scroll-padding-inline:16px}
+.daystrip::-webkit-scrollbar{display:none}
+.daystrip button{flex:none;border:1px solid var(--line);background:var(--surface);color:var(--ink-2);border-radius:99px;padding:7px 13px;font:600 13.5px var(--f-body);cursor:pointer;white-space:nowrap}
+.daystrip button.rest{color:var(--good)}
+.daystrip button.on{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+.daystrip .wk{margin-left:auto;font-family:var(--f-display);font-weight:700;letter-spacing:.08em;text-transform:uppercase;font-size:13px;color:var(--accent);border-color:color-mix(in srgb,var(--accent) 40%,var(--line))}
+@media (min-width:640px){.daystrip{margin-inline:0;padding-inline:0}}
+.dayhead{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:2px 2px 0}
+.dayhead h2{font-size:24px;letter-spacing:.02em;text-transform:none;color:var(--ink);line-height:1.1;margin-top:2px}
+.dayhead .eyebrow{color:var(--accent)}
+.buildbar{display:flex;flex-direction:column;align-items:flex-start;gap:2px;width:100%;text-align:left;border:1px dashed color-mix(in srgb,var(--accent) 45%,var(--line));background:color-mix(in srgb,var(--accent-soft) 55%,var(--surface));color:var(--ink);border-radius:12px;padding:9px 12px;margin:2px 0 8px;font:inherit;cursor:pointer}
+.buildbar b{font-family:var(--f-display);font-weight:700;letter-spacing:.07em;text-transform:uppercase;font-size:14px;color:var(--accent)}
+.buildbar span{font-size:13px;color:var(--ink-2)}
+.buildbar:hover{border-style:solid}
+.buildbar:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.planfoot{display:flex;flex-wrap:wrap;gap:8px;border-top:1px solid var(--line);padding-top:10px;margin-top:2px}
+.ck.idle{cursor:default;opacity:.45}
+
+.canceled-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;border-top:1px solid var(--line);padding-top:9px;margin-top:2px}
+
+/* build my day */
+textarea.in{resize:vertical;line-height:1.4}
+.fld>span{font-size:14px;color:var(--ink-2)}
+.bchips{display:flex;flex-wrap:wrap;gap:6px}
+.bchip{display:inline-flex;gap:5px;align-items:baseline;border-radius:99px;padding:4px 10px;font-size:13px;background:var(--surface-2);color:var(--ink-2)}
+.bchip b{font-weight:600;color:var(--ink)}
+.bchip.start{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.bchip.court{background:var(--good-soft)}
+.bsum{display:flex;flex-direction:column;gap:2px}
+.bsum b{font-family:var(--f-display);font-size:19px;letter-spacing:.02em}
+.bplan{display:flex;flex-direction:column}
+.bprow{display:grid;grid-template-columns:62px minmax(0,1fr);gap:10px;align-items:start;padding:9px 2px;border-top:1px solid var(--line)}
+.bprow:first-child{border-top:0}
+.bprow .time{font-size:12.5px;line-height:1.35;color:var(--ink-3);padding-top:2px}
+.bprow .txtc{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.bprow .sub{display:flex;flex-wrap:wrap;gap:4px;margin-top:4px}
+.bprow.marker .txtc{color:var(--ink-3)}
+.bprow.new{background:color-mix(in srgb,var(--good-soft) 60%,transparent);border-radius:10px;border-top-color:transparent;padding-inline:8px;margin-inline:-6px}
+.bprow.new+.bprow{border-top-color:transparent}
+.bcancel{border-radius:12px;background:var(--surface-2);padding:10px 12px;display:flex;flex-direction:column;gap:3px;font-size:14px}
+.bcancel b{font-family:var(--f-display);letter-spacing:.07em;text-transform:uppercase;font-size:13px;color:var(--ink-3)}
+
+/* your week */
+@media (min-width:640px){.sheet.week{max-width:1180px}}
+.wgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+@media (min-width:1100px){.wgrid{grid-template-columns:repeat(7,minmax(0,1fr))}}
+.wday{border:1px solid var(--line);border-radius:14px;display:flex;flex-direction:column;min-width:0;background:var(--surface)}
+.wday.today{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-soft)}
+.wday-h{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 6px;border:0;background:transparent;color:inherit;font:inherit;text-align:left;padding:9px 10px 6px;cursor:pointer;border-radius:14px 14px 0 0}
+.wday-h:hover{background:var(--surface-2)}
+.wday-h b{font-family:var(--f-display);font-size:18px;letter-spacing:.02em}
+.wday-h>span:not(.pill){font-size:12.5px;color:var(--ink-3)}
+.wday.rest .wday-h b{color:var(--good)}
+.wday-b{display:flex;flex-direction:column;padding:0 4px;flex:1}
+.wrow{display:grid;grid-template-columns:38px minmax(0,1fr) auto;gap:4px;align-items:center;border:0;background:transparent;color:inherit;font:500 13px var(--f-body);text-align:left;padding:4px 6px;border-radius:7px;cursor:pointer}
+.wrow:hover{background:var(--surface-2)}
+.wrow .mono{font-size:11.5px;color:var(--ink-3)}
+.wrow .min0{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--f-display);font-weight:700;letter-spacing:.05em;text-transform:uppercase;font-size:12.5px;color:var(--ink-2)}
+.wrow .min0.ev{color:var(--good)}
+.wrow.skipped .min0{text-decoration:line-through;color:var(--ink-3);font-weight:600}
+.wrow.done .min0{color:var(--ink-3)}
+.wrow .mv{width:6px;height:6px;border-radius:99px;background:var(--accent)}
+.wday-f{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:6px 8px 8px;border-top:1px solid var(--line);margin-top:6px}
 
 /* small phones */
 @media (max-width:420px){.row{grid-template-columns:46px 28px minmax(0,1fr) auto;gap:7px}.auto{grid-template-columns:repeat(2,minmax(0,1fr))}.stats{grid-template-columns:1fr}.grid3{grid-template-columns:repeat(2,minmax(0,1fr))}}

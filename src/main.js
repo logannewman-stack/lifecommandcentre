@@ -9,6 +9,7 @@ import { registerSW } from 'virtual:pwa-register';
 import { supabase, config as sbConfig, configSource, saveConfig, clearConfig } from './supabase.js';
 import { createDb } from './db.js';
 import { parseQuick } from './quickadd.js';
+import { parseDayText, buildDay } from './planday.js';
 import REMINDERS_FN from '../supabase/functions/reminders/index.ts?raw';
 import CRON_SQL from '../supabase/functions/reminders/cron.sql?raw';
 import ASSISTANT_FN from '../supabase/functions/assistant/index.ts?raw';
@@ -87,7 +88,7 @@ const S = {
   got:{},
   view:'today', drafts:{}, openItem:null, editAM:false, editPM:false,
   callFilter:'due', search:'', leadForm:null,
-  weekOffset:0, weekDay:null, modal:null, toast:null, lastUndo:null, confirm:null,
+  weekOffset:0, weekDay:null, day:null, modal:null, toast:null, lastUndo:null, confirm:null,
   sync:null, email:'', installEvt:null, installDismissed:undefined, updateApp:null,
   connectBusy:false, connectErr:null, loginBusy:false, loginErr:null, notif:null, notifBusy:false, callMode:null,
   chatBusy:false, chatErr:null, listening:false, assist:null, swipeKey:null, flash:null
@@ -176,6 +177,8 @@ const itemsFor = d => {
   return [...scheduleFor(d).map(i => { const m = mv[i.key]; return m && m.start ? {...i, start:m.start, end:m.end || i.end, movedFrom:i.start, movedFromEnd:i.end} : i; }),
     ...eventsOn(d).map(eventItem)].sort(byStart);
 };
+// What a day's plan shows: notes (wake up, shower…) that Build my day hid for that date stay out.
+const planItems = d => itemsFor(d).filter(i => i.kind !== 'marker' || !((dayOf(d).skips || {})[i.key]));
 const templateDay = dow => clone(((cfg().schedule || {}).days || {})[dow] || []);
 const templateItem = (dow, key) => (((cfg().schedule || {}).days || {})[dow] || []).find(i => i.key === key);
 const typeOf = i => i.kind === 'session' ? 'session:' + (i.sessionType || 'Drill') : (i.kind || 'task');
@@ -532,7 +535,9 @@ function renderTabs() {
 
 /* ----- TODAY ----- */
 function viewToday() {
-  const t = todayISO(), day = dayOf(t), items = itemsFor(t), rest = isRestDay(t);
+  if (S.day && S.day > todayISO()) return viewDay(S.day);
+  S.day = null;
+  const t = todayISO(), day = dayOf(t), items = planItems(t), rest = isRestDay(t);
   const checkable = items.filter(isCheckable);
   const doneN = checkable.filter(i => isDone(i, t)).length;
   const carried = tasksCarried(t), due = tasksDue(t), doneTasks = tasksDoneOn(t);
@@ -546,8 +551,8 @@ function viewToday() {
     rest && day.off ? `<div class="rest-banner ord-2"><div class="eyebrow">Day off</div><b>Today doesn't count.</b><div class="meta">Nothing is late and nothing turns into a make-up.${profile().startDate === addDays(t, 1) ? ' Everything starts fresh tomorrow.' : ''} Check off anything you did anyway.</div><div class="btnrow" style="margin-top:8px"><button class="btn sm ghost" data-act="day-off" data-on="0">It's not a day off</button></div></div>`
     : rest ? `<div class="rest-banner ord-2"><div class="eyebrow">Rest day</div><b>Church, rest and pickleball.</b><div class="meta">Nothing counts as late today.${carried.length ? ` ${plural(carried.length,'to-do')} will be waiting for you tomorrow.` : ''}</div></div>` : '',
     `<div class="progress ord-3 ${pct === 100 ? 'good' : ''}"><div class="bar"><i style="width:${pct}%"></i></div><span class="meta mono">${doneN}/${checkable.length} blocks</span>${behind ? `<button class="pill warn tap" data-act="catchup" title="Sort out what you missed">${behind} behind · Catch up</button>` : ''}${carried.length && !rest ? `<span class="pill bad">${carried.length} carried over</span>` : ''}</div>`,
-    nowCard(items, t),
-    `<section class="card ord-7"><div class="card-h"><h2>Today's plan</h2><div class="btnrow"><button class="btn sm" data-act="sched-open" data-date="${t}">Edit</button><button class="btn sm" data-act="quick-open">+ Add</button></div></div>${items.map(i => planRow(i, t, day)).join('')}</section>`,
+    nowCard(items.filter(i => !(isCheckable(i) && isSkipped(i, t))), t),
+    `<section class="card ord-7"><div class="card-h"><h2>Today's plan</h2><div class="btnrow"><button class="btn sm" data-act="sched-open" data-date="${t}">Edit</button><button class="btn sm" data-act="quick-open">+ Add</button></div></div>${buildBar(t)}${planList(items, t, day)}</section>`,
   ];
   const side = [
     amCard(t, day),
@@ -560,7 +565,42 @@ function viewToday() {
     </section>`,
     pmCard(t, day)
   ];
-  return installBanner() + tipBanner() + `<div class="two"><div class="main">${main.join('')}</div><div class="side">${side.join('')}</div></div>`;
+  return dayStrip(t) + installBanner() + tipBanner() + `<div class="two"><div class="main">${main.join('')}</div><div class="side">${side.join('')}</div></div>`;
+}
+// Today, tomorrow and the rest of the week, one tap each, plus the whole week at a glance.
+function dayStrip(sel) {
+  const t = todayISO();
+  const chips = [0,1,2,3,4,5,6].map(n => {
+    const d = addDays(t, n), on = d === sel, lbl = n === 0 ? 'Today' : n === 1 ? 'Tomorrow' : `${dowOf(d)} ${parseISO(d).getDate()}`;
+    return `<button class="${on ? 'on' : ''} ${isRestDay(d) ? 'rest' : ''}" data-act="day-go" data-date="${d}" aria-pressed="${on}">${esc(lbl)}</button>`;
+  }).join('');
+  return `<nav class="daystrip" aria-label="Pick a day">${chips}<button class="wk" data-act="week-open">Week</button></nav>`;
+}
+// Canceled blocks fold into one line under the plan; Show puts them back in place.
+function planList(items, d, day) {
+  const off = items.filter(i => isCheckable(i) && isSkipped(i, d));
+  const shown = S.showCanceled ? items : items.filter(i => !off.includes(i));
+  return shown.map(i => planRow(i, d, day)).join('') + (off.length ? `<div class="canceled-foot"><span class="meta">Canceled ${d === todayISO() ? 'today' : 'this day'}: ${esc(listNames(off))}</span><button class="btn sm ghost" data-act="show-canceled">${S.showCanceled ? 'Hide' : 'Show'}</button></div>` : '');
+}
+const buildBar = d => `<button class="buildbar" data-act="build-open" data-date="${d}"><b>${d === todayISO() ? 'Build my day' : 'Build ' + esc(dayWord(d))}</b><span>Say what's set, like "up at 8, pickleball 11, meeting at 1", and the rest fits around it.</span></button>`;
+// Any other day, laid out like Today: its plan, its to-dos, and the same ways to change them.
+function viewDay(d) {
+  const t = todayISO(), day = dayOf(d), items = planItems(d), rest = isRestDay(d), due = tasksDue(d);
+  const blocks = items.filter(isCheckable), canceled = blocks.filter(i => isSkipped(i, d)).length, oneoffs = items.filter(i => i.eventId).length;
+  const name = d === addDays(t, 1) ? 'Tomorrow' : DOW_LONG[dowOf(d)];
+  const main = [
+    `<div class="dayhead ord-1"><div class="min0"><div class="eyebrow">${d === addDays(t, 1) ? 'Tomorrow' : 'Planning ahead'}</div><h2>${esc(fmtDayLong(d))}</h2><div class="meta">${plural(blocks.length - canceled, 'block')}${oneoffs ? ` · ${plural(oneoffs, 'one-off')}` : ''}${canceled ? ` · ${canceled} canceled` : ''} · ${due.length ? plural(due.length, 'to-do') : 'no to-dos'}</div></div><button class="btn sm ghost" data-act="day-go" data-date="${t}">Back to today</button></div>`,
+    day.off ? `<div class="rest-banner ord-2"><div class="eyebrow">Day off</div><b>This day doesn't count.</b><div class="meta">Nothing is late and nothing turns into a make-up.</div><div class="btnrow" style="margin-top:8px"><button class="btn sm ghost" data-act="day-off" data-on="0" data-date="${d}">It's not a day off</button></div></div>`
+      : rest ? `<div class="rest-banner ord-2"><div class="eyebrow">Rest day</div><b>Church, rest and pickleball.</b><div class="meta">Nothing counts as late that day.</div></div>` : '',
+    `<section class="card ord-7"><div class="card-h"><h2>${esc(name)}'s plan</h2><div class="btnrow"><button class="btn sm" data-act="sched-open" data-date="${d}">Edit</button><button class="btn sm" data-act="quick-open" data-date="${d}">+ Add</button></div></div>${buildBar(d)}
+      ${items.length ? planList(items, d, day) : '<div class="meta">Nothing planned.</div>'}
+      ${day.off ? '' : `<div class="planfoot"><button class="btn sm ghost" data-act="day-off" data-on="1" data-date="${d}">Take this day off</button></div>`}</section>`,
+  ];
+  const side = [
+    `<section class="card ord-8"><div class="card-h"><h2>To-dos due ${esc(d === addDays(t, 1) ? 'tomorrow' : fmtDay(d))}</h2><span class="meta">${due.length ? plural(due.length, 'item') : 'None yet'}</span></div>
+      ${taskList(due, d)}${addTaskForm('qd', d)}</section>`,
+  ];
+  return dayStrip(d) + `<div class="two"><div class="main">${main.join('')}</div><div class="side">${side.join('')}</div></div>`;
 }
 function tipBanner() {
   let done = false; try { done = !!localStorage.getItem('lcc-tip3-done'); } catch(e) {}
@@ -598,12 +638,15 @@ function actionFor(i, t, big) {
   return isDone(i,t) ? `<button class="${cls} ghost" data-act="check" data-key="${esc(i.key)}">Undo</button>` : `<button class="${cls}" data-act="check" data-key="${esc(i.key)}">Mark done</button>`;
 }
 function planRow(i, t, day) {
+  // t is the day shown: today, or another day opened from the day strip (no checking off ahead of time).
+  const isToday = t === todayISO(), dd = isToday ? '' : ` data-date="${t}"`;
   const m = nowMin(), done = isCheckable(i) && isDone(i, t), skipped = isSkipped(i, t);
-  const isNow = toMin(i.start) <= m && m < toMin(i.end || i.start);
-  const late = isCheckable(i) && !done && toMin(i.end || i.start) <= m && !isRestDay(t);
+  const isNow = isToday && toMin(i.start) <= m && m < toMin(i.end || i.start);
+  const late = isToday && isCheckable(i) && !done && toMin(i.end || i.start) <= m && !isRestDay(t);
   const k = esc(i.key);
   let box;
   if (!isCheckable(i)) box = `<span class="dot" aria-hidden="true"></span>`;
+  else if (!isToday) box = `<span class="ck idle ${skipped ? 'skip' : ''}" aria-hidden="true"></span>`;
   else if (i.kind === 'checkin' || i.kind === 'checkout') box = `<button class="ck ${done ? 'on' : ''}" data-act="goto" data-id="${i.kind === 'checkin' ? 'am-card' : 'pm-card'}" aria-label="${esc(i.tag || i.text)}"></button>`;
   else if (i.kind === 'dupr' && !done) box = `<button class="ck" data-act="view" data-v="log" aria-label="Log DUPR"></button>`;
   else box = `<button class="ck ${done ? 'on' : ''} ${skipped ? 'skip' : ''}" data-act="check" data-key="${k}" aria-pressed="${done}" aria-label="Done: ${esc(i.tag || i.text)}"></button>`;
@@ -615,29 +658,30 @@ function planRow(i, t, day) {
     const rec = s && num(s.games) ? `Record ${num(s.won)||0}-${num(s.games)-(num(s.won)||0)} · ` : '';
     subs.push(`${rec}<a data-act="session-edit" data-id="${sid}">${s && (num(s.games) || s.workOn || s.wentWell) ? 'Edit session' : 'Add record + notes'}</a>`);
   }
-  if (i.movedFrom) subs.push(`Moved from ${fmtTap(i.movedFrom)}, today only.`);
+  if (i.movedFrom) subs.push(`Moved from ${fmtTap(i.movedFrom)}, ${isToday ? 'today' : 'this day'} only.`);
   if (i.movedFromDay) subs.push(`Moved here from ${esc(fmtDay(i.movedFromDay))}.`);
-  if (skipped) subs.push('Canceled for today. No make-up.');
-  else if (i.carry && !done) subs.push('Moves to tomorrow if not done.');
+  if (skipped) subs.push(isToday ? 'Canceled for today. No make-up.' : 'Canceled this day.');
+  else if (i.carry && !done && isToday) subs.push('Moves to tomorrow if not done.');
   const canCancel = isCheckable(i) && !['checkin','checkout'].includes(i.kind);
-  const canDone = isCheckable(i) && !['checkin','checkout'].includes(i.kind) && !(i.kind === 'dupr' && !done);
+  const canDone = isToday && isCheckable(i) && !['checkin','checkout'].includes(i.kind) && !(i.kind === 'dupr' && !done);
+  const cancelLabel = isToday ? 'Cancel for today' : 'Cancel this day';
   const open = S.swipeKey === i.key;
   const push = (mins, label, cls, extra = '') => `<button class="${cls}" data-act="move-by" data-key="${k}" data-date="${t}" data-m="${mins}" data-scope="day" ${extra}>${label}</button>`;
-  const menu = S.openItem === i.key ? `<div class="menu"><span class="meta">Push back</span>${push(15, '15 min', 'btn sm')}${push(30, '30 min', 'btn sm')}${push(60, '1 hour', 'btn sm')}<button class="btn sm" data-act="block" data-key="${k}">Reschedule…</button>${!canCancel ? '' : skipped
-      ? `<button class="btn sm" data-act="skip" data-key="${k}" data-on="0">Undo cancel</button>`
-      : `<button class="btn sm ghost" data-act="skip" data-key="${k}" data-on="1">Cancel for today</button>`}</div>` : '';
+  const menu = S.openItem === i.key ? `<div class="menu"><span class="meta">Push back</span>${push(15, '15 min', 'btn sm')}${push(30, '30 min', 'btn sm')}${push(60, '1 hour', 'btn sm')}<button class="btn sm" data-act="block" data-key="${k}"${dd}>Reschedule…</button>${!canCancel ? '' : skipped
+      ? `<button class="btn sm" data-act="skip" data-key="${k}" data-on="0"${dd}>Undo cancel</button>`
+      : `<button class="btn sm ghost" data-act="skip" data-key="${k}" data-on="1"${dd}>${cancelLabel}</button>`}</div>` : '';
   // Laptop: quick actions appear when the pointer rests on a row.
-  const qa = `<div class="qa" aria-hidden="true">${push(15, '+15', 'btn sm', 'tabindex="-1"')}${push(30, '+30', 'btn sm', 'tabindex="-1"')}<button class="btn sm" data-act="block" data-key="${k}" tabindex="-1">Reschedule</button>${canCancel && !skipped ? `<button class="btn sm ghost" data-act="skip" data-key="${k}" data-on="1" tabindex="-1">Cancel</button>` : ''}</div>`;
-  // Phone: swipe left for the same actions, right to mark it done.
+  const qa = `<div class="qa" aria-hidden="true">${push(15, '+15', 'btn sm', 'tabindex="-1"')}${push(30, '+30', 'btn sm', 'tabindex="-1"')}<button class="btn sm" data-act="block" data-key="${k}"${dd} tabindex="-1">Reschedule</button>${canCancel && !skipped ? `<button class="btn sm ghost" data-act="skip" data-key="${k}" data-on="1"${dd} tabindex="-1">Cancel</button>` : ''}</div>`;
+  // Phone: swipe left for the same actions, right to mark it done (today only).
   const ti = open ? '0' : '-1';
-  const acts = [push(30, '+30 min', 'sa push', `tabindex="${ti}"`), `<button class="sa resched" data-act="block" data-key="${k}" tabindex="${ti}">Reschedule</button>`];
-  if (canCancel) acts.push(skipped ? `<button class="sa undo" data-act="skip" data-key="${k}" data-on="0" tabindex="${ti}">Undo cancel</button>` : `<button class="sa cancel" data-act="skip" data-key="${k}" data-on="1" tabindex="${ti}">Cancel</button>`);
+  const acts = [push(30, '+30 min', 'sa push', `tabindex="${ti}"`), `<button class="sa resched" data-act="block" data-key="${k}"${dd} tabindex="${ti}">Reschedule</button>`];
+  if (canCancel) acts.push(skipped ? `<button class="sa undo" data-act="skip" data-key="${k}" data-on="0"${dd} tabindex="${ti}">Undo cancel</button>` : `<button class="sa cancel" data-act="skip" data-key="${k}" data-on="1"${dd} tabindex="${ti}">Cancel</button>`);
   const flash = S.flash && S.flash.key === i.key && Date.now() - S.flash.at < 1600 ? 'flash' : '';
   return `<div class="swipe ${open ? 'open' : ''} ${isNow ? 'is-now' : ''}" data-key="${k}" data-done="${canDone ? 1 : 0}" style="--acts-w:${acts.length * 84}px">
     ${canDone ? `<div class="swipe-done" aria-hidden="true">${done ? 'Undo' : 'Done'}</div>` : ''}<div class="swipe-acts" ${open ? '' : 'aria-hidden="true"'}>${acts.join('')}</div>
     <div class="row ${!isCheckable(i) ? 'marker' : ''} ${done ? 'done' : ''} ${isNow ? 'is-now' : ''} ${late ? 'late' : ''} ${flash}">
-    <div class="time" data-act="block" data-key="${k}">${fmtT(i.start)}</div>${box}
-    <div class="txt" data-act="block" data-key="${k}" role="button" tabindex="0">${i.tag ? `<span class="tag ${i.eventId ? 'ev' : ''}">${esc(i.tag)}</span>` : ''}${esc(i.text)}${subs.map(s => `<div class="sub">${s}</div>`).join('')}</div>
+    <div class="time" data-act="block" data-key="${k}"${dd}>${fmtT(i.start)}</div>${box}
+    <div class="txt" data-act="block" data-key="${k}"${dd} role="button" tabindex="0">${i.tag ? `<span class="tag ${i.eventId ? 'ev' : ''}">${esc(i.tag)}</span>` : ''}${esc(i.text)}${subs.map(s => `<div class="sub">${s}</div>`).join('')}</div>
     <button class="more" data-act="item-menu" data-key="${k}" aria-label="Reschedule or cancel ${esc(itemName(i))}">⋯</button>
     ${qa}${menu}</div></div>`;
 }
@@ -650,8 +694,9 @@ function taskRow(x, t, grouped) {
   if (!x.done && x.due && x.due > t) bits.push(`<span class="pill">${esc(fmtDay(x.due))}</span>`);
   if (x.notes) bits.push(esc(x.notes));
   const k = esc(x.id), key = 't:' + x.id, open = S.swipeKey === key, ti = open ? '0' : '-1';
-  const acts = x.done ? [] : [`<button class="sa push" data-act="task-tomorrow" data-id="${k}" tabindex="${ti}">Tomorrow</button>`, `<button class="sa resched" data-act="task-open" data-id="${k}" tabindex="${ti}">Pick a day</button>`, `<button class="sa cancel" data-act="task-drop" data-id="${k}" tabindex="${ti}">Drop</button>`];
-  const qa = x.done ? '' : `<div class="qa" aria-hidden="true"><button class="btn sm" data-act="task-tomorrow" data-id="${k}" tabindex="-1">Tomorrow</button><button class="btn sm" data-act="task-open" data-id="${k}" tabindex="-1">Pick a day</button><button class="btn sm ghost" data-act="task-drop" data-id="${k}" tabindex="-1">Drop</button></div>`;
+  const nextLabel = x.due && x.due > todayISO() ? 'Next day' : 'Tomorrow';
+  const acts = x.done ? [] : [`<button class="sa push" data-act="task-tomorrow" data-id="${k}" tabindex="${ti}">${nextLabel}</button>`, `<button class="sa resched" data-act="task-open" data-id="${k}" tabindex="${ti}">Pick a day</button>`, `<button class="sa cancel" data-act="task-drop" data-id="${k}" tabindex="${ti}">Drop</button>`];
+  const qa = x.done ? '' : `<div class="qa" aria-hidden="true"><button class="btn sm" data-act="task-tomorrow" data-id="${k}" tabindex="-1">${nextLabel}</button><button class="btn sm" data-act="task-open" data-id="${k}" tabindex="-1">Pick a day</button><button class="btn sm ghost" data-act="task-drop" data-id="${k}" tabindex="-1">Drop</button></div>`;
   const flash = S.flash && S.flash.key === key && Date.now() - S.flash.at < 1600 ? 'flash' : '';
   return `<div class="swipe ${open ? 'open' : ''}" data-key="${esc(key)}" data-task="${k}" data-done="1" style="--acts-w:${acts.length * 84}px">
     <div class="swipe-done" aria-hidden="true">${x.done ? 'Undo' : 'Done'}</div>${acts.length ? `<div class="swipe-acts" ${open ? '' : 'aria-hidden="true"'}>${acts.join('')}</div>` : ''}
@@ -956,7 +1001,7 @@ function viewWeek() {
         <div class="fld"><label for="rv-leak">Biggest leak this week</label><input class="in" id="rv-leak" data-draft value="${esc(draft('rv-leak', review.leak))}" placeholder="e.g. popping up resets from the transition zone"></div>
         <div class="fld"><label for="rv-fix">One fix for next week</label><input class="in" id="rv-fix" data-draft value="${esc(draft('rv-fix', review.fix))}" placeholder="Shows on every drill block next week"></div>
         <div class="btnrow"><button class="btn primary" type="submit">Save review</button>${review.savedAt ? '<span class="meta">Saved</span>' : ''}</div></form></section></div>
-    <section class="card"><div class="card-h"><h2>Day by day</h2><button class="btn sm" data-act="sched-open" data-date="${selDate}">Edit</button></div>
+    <section class="card"><div class="card-h"><h2>Day by day</h2><div class="btnrow"><button class="btn sm" data-act="week-open">Next 7 days</button><button class="btn sm" data-act="sched-open" data-date="${selDate}">Edit</button></div></div>
       <div class="daychips">${WEEK_ORDER.map(d => `<button class="${d === sel ? 'on' : ''}" data-act="week-day" data-d="${d}">${d}</button>`).join('')}</div>
       <div style="margin-top:6px">${itemsFor(selDate).map(i => `<div class="row ${!isCheckable(i) ? 'marker' : ''}"><div class="time">${fmtT(i.start)}</div>${isCheckable(i) ? `<span class="ck ${isDone(i, selDate) ? 'on' : ''}" aria-hidden="true" style="cursor:default"></span>` : '<span class="dot"></span>'}<div class="txt" data-act="block" data-key="${esc(i.key)}" data-date="${selDate}" role="button" tabindex="0">${i.tag ? `<span class="tag ${i.eventId ? 'ev' : ''}">${esc(i.tag)}</span>` : ''}${esc(i.text)}${i.movedFrom ? `<div class="sub">Moved from ${fmtTap(i.movedFrom)} this day.</div>` : i.eventId ? '<div class="sub">Just this day.</div>' : i.carry ? '<div class="sub">Moves to the next day if missed.</div>' : ''}</div><span></span></div>`).join('')}</div></section>`;
 }
@@ -1126,7 +1171,7 @@ function viewPlan() {
   return `
     ${planOverview(t)}
     <div class="two-eq"><div class="col">
-    <section class="card"><div class="card-h"><h2>Your schedule</h2><div class="btnrow"><button class="btn sm" data-act="sched-open">Edit</button><button class="btn sm" data-act="quick-open">+ Add</button></div></div>
+    <section class="card"><div class="card-h"><h2>Your schedule</h2><div class="btnrow"><button class="btn sm" data-act="week-open">Week</button><button class="btn sm" data-act="sched-open">Edit</button><button class="btn sm" data-act="quick-open">+ Add</button></div></div>
       <div class="meta">Move, add or take out blocks for one day or for every week. Or tap Ask and say it, like "move my drill to 6 tomorrow".</div>
       <div class="daychips" style="margin-top:8px">${WEEK_ORDER.map(x => `<button data-act="sched-open" data-date="${nextDow(t, x)}">${x}</button>`).join('')}</div></section>
     <section class="card"><div class="card-h"><h2>Add a to-do</h2></div>${addTaskForm('pt', t)}</section>
@@ -1299,7 +1344,7 @@ function blockSheet(key, date) {
   const today = todayISO(), t = date || today, isToday = t === today;
   const i = itemsFor(t).find(x => x.key === key);
   if (!i) return closeOnly('Block');
-  const back = S.modal && S.modal.back === 'sched' ? `<button class="btn sm ghost" data-act="sched-open" data-date="${t}">‹ Back</button>` : S.modal && S.modal.back === 'catchup' ? '<button class="btn sm ghost" data-act="catchup">‹ Back</button>' : '';
+  const back = S.modal && S.modal.back === 'sched' ? `<button class="btn sm ghost" data-act="sched-open" data-date="${t}">‹ Back</button>` : S.modal && S.modal.back === 'catchup' ? '<button class="btn sm ghost" data-act="catchup">‹ Back</button>' : S.modal && S.modal.back === 'week' ? '<button class="btn sm ghost" data-act="week-open">‹ Back</button>' : '';
   const done = isToday && isCheckable(i) && isDone(i, t), skipped = isSkipped(i, t), m = nowMin(), rest = isRestDay(t);
   const status = !isToday ? `<span class="pill">${esc(fmtDayLong(t))}</span>${skipped ? ' <span class="pill">Canceled this day</span>' : ''}`
     : !isCheckable(i) ? '' : skipped ? '<span class="pill">Canceled today</span>' : done ? '<span class="pill good">Done</span>' : (toMin(i.end || i.start) <= m && !rest) ? '<span class="pill warn">Behind</span>' : (toMin(i.start) <= m ? '<span class="pill acc">Now</span>' : `<span class="pill">In ${fmtMins(toMin(i.start) - m)}</span>`);
@@ -1354,7 +1399,8 @@ function catchupSheet() {
   };
   const cancelable = list.filter(i => !['checkin','checkout'].includes(i.kind));
   return `<div class="card-h"><h2>Catch up</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
-    ${list.length ? `<p class="meta" style="margin:0">These are past their time and not checked off. Mark what you did, reschedule what you still want to do, and cancel the rest. Canceled blocks don't come back tomorrow as make-ups.</p>
+    ${list.length ? `<button class="buildbar" data-act="build-open" data-date="${t}"><b>Rebuild the rest of today</b><span>Say what's set from here on. What still matters moves into the time you have; the rest is canceled.</span></button>
+    <p class="meta" style="margin:0">Or one at a time: mark what you did, reschedule what you still want to do, and cancel the rest. Canceled blocks don't come back tomorrow as make-ups.</p>
     <div class="cu">${list.map(row).join('')}</div>
     ${cancelable.length > 1 ? '<div class="btnrow"><button class="btn ghost" data-act="catchup-cancel">Cancel the rest for today</button></div>' : ''}`
     : '<div class="card empty"><b>You\'re caught up.</b><br>Everything before now is done or canceled.</div>'}
@@ -1503,9 +1549,10 @@ function notifSheet() {
 }
 /* ----- smart add: one line in, the right thing out ----- */
 const hhmmNow = () => { const n = new Date(); return `${pad(n.getHours())}:${pad(n.getMinutes())}`; };
+// A line that names no day goes on fallbackDate (the day you're looking at, or the box's date).
 function quickPlan(text, fallbackDate) {
   const p = parseQuick(text, todayISO(), hhmmNow());
-  if (p.kind === 'task' && !p.date) p.date = /^\d{4}-\d{2}-\d{2}$/.test(fallbackDate || '') ? fallbackDate : todayISO();
+  if (p.kind !== 'weekly' && !p.hasDate) p.date = /^\d{4}-\d{2}-\d{2}$/.test(fallbackDate || '') ? fallbackDate : todayISO();
   return p;
 }
 const QUICK_HINT = 'Type it the way you would say it. A time puts it on your plan, no time makes it a to-do, and "every" makes it weekly.';
@@ -1557,15 +1604,120 @@ function quickToForm(p, back) {
   S.modal = {type:'add', date, scope:p.kind === 'weekly' ? 'week' : 'day', days:p.days || [dowOf(date)], back:back || null};
 }
 function quickSheet() {
-  const txt = draft('qa-in');
+  const txt = draft('qa-in'), date = S.modal.date || todayISO(), other = date !== todayISO();
   const ex = ['Call Lisa tomorrow', 'Pickleball Thu 6-8am', 'Dentist Friday 2pm', 'Gym every Mon, Wed, Fri 6:30pm', 'Send the proposal Wednesday'];
-  return `<div class="card-h"><h2>Add</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
+  return `<div class="card-h"><h2>${other ? 'Add to ' + esc(dayWord(date)) : 'Add'}</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
     <form class="stack" data-form="quick">
-      <input class="in big" id="qa-in" data-draft data-quick value="${esc(txt)}" placeholder="What do you want to add?" autocomplete="off" enterkeyhint="done">
-      <div class="qprev hint" id="qa-in-prev" aria-live="polite">${txt.trim() ? quickPreview(quickPlan(txt), 'qa-in') : esc(QUICK_HINT)}</div>
+      <input class="in big" id="qa-in" data-draft data-quick data-date="${date}" value="${esc(txt)}" placeholder="What do you want to add?" autocomplete="off" enterkeyhint="done">
+      <div class="qprev hint" id="qa-in-prev" aria-live="polite">${txt.trim() ? quickPreview(quickPlan(txt, date), 'qa-in') : esc(other ? `${QUICK_HINT} No day named means ${dayWord(date)}.` : QUICK_HINT)}</div>
       <div class="btnrow"><button class="btn primary" type="submit">Add</button><button class="btn ghost" type="button" data-act="quick-more">More options</button></div>
     </form>
     <div class="chips multi">${ex.map(e => `<button class="chip" data-act="quick-example" data-text="${esc(e)}">${esc(e)}</button>`).join('')}</div>`;
+}
+
+/* ----- build my day: say what's set, the rest fits around it ----- */
+function buildPlanFor(date, text) {
+  const t = todayISO(), parsed = parseDayText(text, t, hhmmNow());
+  const items = itemsFor(date).map(i => {
+    const skipped = isSkipped(i, date);
+    return {key:i.key, start:i.start, end:i.end || i.start, kind:i.kind, tag:i.tag, text:i.text, oneoff:!!i.eventId, sessionType:i.sessionType,
+      skipped, done:isCheckable(i) && !skipped && date <= t && isDone(i, date)};
+  });
+  return {parsed, r:buildDay(items, parsed.items, {start:parsed.start, now:date === t ? hhmmNow() : null})};
+}
+const newTag = f => f.type === 'session' ? (f.sessionType || 'Court time') : (ONEOFF_TAG[f.type] || 'EVENT');
+function buildChips(parsed, r, date) {
+  const isToday = date === todayISO();
+  const start = parsed.start && isToday && r.from !== parsed.start ? `Up at ${fmtTap(parsed.start)} · planning from ${fmtTap(r.from)}`
+    : parsed.start ? `Starts ${fmtTap(parsed.start)}` : isToday ? `Planning from now, ${fmtTap(r.from)}` : `Starts ${fmtTap(r.from)}, as planned`;
+  return `<div class="bchips"><span class="bchip start">${esc(start)}</span>${parsed.items.map(x => `<span class="bchip ${x.type === 'session' ? 'court' : ''}"><b>${esc(x.title)}</b> ${fmtTap(x.start)}–${fmtTap(x.end)}</span>`).join('')}</div>`
+    + (parsed.left.length ? `<div class="meta">No time, so not added: ${parsed.left.map(x => esc(x)).join(' · ')}</div>` : '');
+}
+function buildSheet() {
+  const t = todayISO(), m = S.modal, date = m.date && m.date >= t ? m.date : t, txt = draft('bd-in');
+  const {parsed, r} = buildPlanFor(date, txt);
+  const title = date === t ? 'Build my day' : 'Build ' + dayWord(date);
+  const chips = [0,1,2,3,4,5,6].map(n => { const d = addDays(t, n); return `<button class="chip ${d === date ? 'on' : ''}" data-act="build-date" data-date="${d}">${n === 0 ? 'Today' : n === 1 ? 'Tomorrow' : esc(fmtDay(d))}</button>`; }).join('');
+  if (m.step === 'preview') return buildPreview(date, parsed, r, title);
+  const already = planItems(date).filter(i => i.eventId);
+  return `<div class="card-h"><h2>${esc(title)}</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
+    <div class="chips">${chips}</div>
+    <form class="stack" data-form="build">
+      <label class="fld" for="bd-in"><span>When you start and what's set. Anything with a time goes in; the rest of ${date === t ? 'today' : 'the day'}'s plan fits around it.</span></label>
+      <textarea class="in big" id="bd-in" data-draft data-build data-date="${date}" rows="3" placeholder="Up at 8, pickleball 11-1, meeting at 1, pickleball 4-6" enterkeyhint="go">${esc(txt)}</textarea>
+      <div id="bd-in-prev" aria-live="polite">${buildChips(parsed, r, date)}</div>
+      <div class="btnrow"><button class="btn primary" type="submit">Build it</button><span class="meta">You see the new day before anything changes.</span></div>
+    </form>
+    ${already.length ? `<div class="meta">Already set that day and staying put: ${already.map(i => `${esc(itemName(i))} ${fmtTap(i.start)}`).join(' · ')}</div>` : ''}`;
+}
+function buildSummary(r, sep) {
+  const n = {new:0, moved:0, shorter:0};
+  r.plan.forEach(x => { if (n[x.status] !== undefined) n[x.status]++; });
+  return [n.new && `${n.new} added`, n.moved && `${n.moved} moved`, n.shorter && `${n.shorter} shorter`, r.canceled.length && `${r.canceled.length} canceled`].filter(Boolean).join(sep);
+}
+function buildPreview(date, parsed, r, title) {
+  const row = x => {
+    const it = x.item, isNew = x.status === 'new', marker = !isNew && it.kind === 'marker';
+    const tag = isNew ? newTag(it) : it.tag, text = isNew ? it.title : it.text;
+    const pill = isNew ? '<span class="pill good">New</span>' : x.status === 'moved' ? `<span class="pill acc">Was ${fmtTap(x.was)}</span>`
+      : x.status === 'shorter' ? `<span class="pill warn">Shorter · was ${fmtTap(x.was)}</span>` : x.status === 'done' ? '<span class="pill good">Done</span>' : x.status === 'fixed' ? '<span class="pill">Already set</span>' : '';
+    return `<div class="bprow ${marker ? 'marker' : ''} ${x.status}"><span class="time mono">${fmtTap(x.start)}${x.end && x.end !== x.start && !marker ? `<br>${fmtTap(x.end)}` : ''}</span><span class="min0"><span class="txtc">${tag ? `<span class="tag ${isNew || it.oneoff ? 'ev' : ''}">${esc(tag)}</span>` : ''}${esc(text)}</span>${pill ? `<span class="sub">${pill}</span>` : ''}</span></div>`;
+  };
+  const why = {covered:'your court time covers it', room:'no room left'};
+  const canceled = r.canceled.length ? `<div class="bcancel"><b>Canceled for the day</b>${['covered','room'].map(w => { const xs = r.canceled.filter(c => c.why === w); return xs.length ? `<div>${esc(listNames(xs.map(c => c.item)))} <span class="meta">· ${why[w]}</span></div>` : ''; }).join('')}</div>` : '';
+  const sum = buildSummary(r, ' · ') || 'Nothing needs to change';
+  return `<div class="card-h"><h2>${esc(title)}</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
+    <div class="bsum"><b>${esc(sum)}</b><span class="meta">${date === todayISO() ? `From ${fmtTap(r.from)} on.` : esc(fmtDayLong(date)) + '.'} Nothing changes until you tap Use this plan.</span></div>
+    <div class="bplan">${r.plan.map(row).join('') || '<div class="meta">Nothing left on the plan.</div>'}</div>
+    ${canceled}
+    <div class="btnrow"><button class="btn primary" data-act="build-apply" data-date="${date}">Use this plan</button><button class="btn ghost" data-act="build-back">Change it</button></div>`;
+}
+// Writes the plan: new one-offs, that date's moves and cancels. One Undo puts it all back.
+function applyBuild(date) {
+  const {r} = buildPlanFor(date, draft('bd-in'));
+  const day = dayOf(date), pm = day.moves || {}, ps = day.skips || {};
+  const moves = {}, skips = {}, um = {}, us = {}, ops = [], base = Date.now();
+  let added = 0;
+  r.plan.forEach(x => {
+    if (x.status === 'new') {
+      const f = x.item, id = 'ev-' + (base + added++).toString(36);
+      const doc = {title:f.title, date, start:f.start, end:f.end, where:'', notes:'', createdAt:Date.now(), updatedAt:Date.now()};
+      if (f.type && f.type !== 'event') { doc.kind = f.type; if (f.sessionType) doc.sessionType = f.sessionType; }
+      setDoc('events', id, doc); ops.push({del:['events', id]});
+    } else if ((x.status === 'moved' || x.status === 'shorter') && !x.item.oneoff) {
+      const ti = templateItem(dowOf(date), x.key); if (!ti) return;
+      const usual = ti.start === x.start && (ti.end || ti.start) === x.end;
+      moves[x.key] = usual ? null : {start:x.start, end:x.end}; um[x.key] = pm[x.key] || null;
+    }
+  });
+  [...r.canceled.map(c => c.key), ...r.hidden].forEach(k => { skips[k] = true; us[k] = !!ps[k]; });
+  const patch = {}, undo = {};
+  if (Object.keys(moves).length) { patch.moves = moves; undo.moves = um; }
+  if (Object.keys(skips).length) { patch.skips = skips; undo.skips = us; }
+  if (Object.keys(patch).length) { patchDay(date, patch); ops.push({patch:['days', date, undo]}); }
+  S.lastUndo = {type:'restore', ops};
+  return r;
+}
+
+/* ----- your week: the next seven days at a glance ----- */
+function weekSheet() {
+  const t = todayISO(), off = Math.max(0, S.modal.offset || 0), first = addDays(t, off * 7);
+  const days = [0,1,2,3,4,5,6].map(n => addDays(first, n));
+  const col = d => {
+    const items = planItems(d).filter(i => isCheckable(i) || i.eventId), day = dayOf(d), rest = isRestDay(d);
+    const todo = tasksDue(d).length + (d === t ? tasksCarried(t).length : 0);
+    const rows = items.map(i => {
+      const sk = isSkipped(i, d), dn = !sk && d <= t && isDone(i, d);
+      return `<button class="wrow ${sk ? 'skipped' : ''} ${dn ? 'done' : ''}" data-act="block" data-key="${esc(i.key)}" data-date="${d}" data-back="week"><span class="mono">${fmtT(i.start)}</span><span class="min0 ${i.eventId ? 'ev' : ''}">${esc(i.eventId ? ((S.data.events || {})[i.eventId] || {}).title || i.tag : i.tag || itemName(i))}</span>${i.movedFrom || i.movedFromDay ? '<i class="mv" title="Moved for this day"></i>' : ''}</button>`;
+    }).join('');
+    return `<section class="wday ${d === t ? 'today' : ''} ${rest ? 'rest' : ''}">
+      <button class="wday-h" data-act="day-go" data-date="${d}"><b>${dowOf(d)} ${parseISO(d).getDate()}</b><span>${d === t ? 'Today' : d === addDays(t, 1) ? 'Tomorrow' : esc(fmtShort(d))}</span>${day.off ? '<span class="pill">Day off</span>' : rest ? '<span class="pill">Rest</span>' : ''}</button>
+      <div class="wday-b">${rows || '<div class="meta">Nothing planned</div>'}</div>
+      <div class="wday-f"><span class="meta">${todo ? plural(todo, 'to-do') : ''}</span><button class="btn sm ghost" data-act="build-open" data-date="${d}">Build</button></div></section>`;
+  };
+  return `<div class="card-h"><h2>Your week</h2><div class="btnrow"><button class="btn sm" data-act="week-shift" data-d="-1" aria-label="Earlier" ${off ? '' : 'disabled'}>‹</button><span class="meta">${esc(fmtShort(days[0]))} – ${esc(fmtShort(days[6]))}</span><button class="btn sm" data-act="week-shift" data-d="1" aria-label="Later">›</button><button class="btn sm ghost" data-act="modal-close">Close</button></div></div>
+    <div class="meta">Tap a day to open it like Today, or a block to change it.</div>
+    <div class="wgrid">${days.map(col).join('')}</div>`;
 }
 
 /* ----- your schedule: move, add and change blocks, for one day or every week ----- */
@@ -1578,7 +1730,7 @@ const toggleRow = (id, on, label) => `<div class="btnrow"><button type="button" 
 const dayPicker = (act, sel, has) => `<div class="daychips">${WEEK_ORDER.map(x => `<button type="button" class="${sel.includes(x) ? 'on' : ''}" data-act="${act}" data-d="${x}" aria-pressed="${sel.includes(x)}">${x}${has && has.includes(x) ? '<i class="hasdot"></i>' : ''}</button>`).join('')}</div>`;
 function schedSheet() {
   const today = todayISO(), date = S.modal.date || today;
-  const items = itemsFor(date), dow = dowOf(date);
+  const items = planItems(date), dow = dowOf(date);
   const chips = [0,1,2,3,4,5,6].map(n => { const d = addDays(today, n); return `<button class="chip ${d === date ? 'on' : ''}" data-act="sched-open" data-date="${d}">${n === 0 ? 'Today' : n === 1 ? 'Tomorrow' : esc(fmtDay(d))}</button>`; }).join('');
   const other = date < today || date > addDays(today, 6);
   return `<div class="card-h"><h2>Your schedule</h2><button class="btn sm ghost" data-act="modal-close">Done</button></div>
@@ -1788,11 +1940,11 @@ function renderModal() {
   if (!S.modal) { el.hidden = true; el.innerHTML = ''; return; }
   const a = document.activeElement;
   const keep = a && a.id && el.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) ? {id:a.id, s:a.selectionStart, e:a.selectionEnd} : null;
-  const sig = [S.modal.type, S.modal.key || S.modal.id || '', S.modal.date || ''].join('|');
+  const sig = [S.modal.type, S.modal.key || S.modal.id || '', S.modal.date || '', S.modal.step || ''].join('|');
   const old = el.querySelector('.sheet'), top = old && el.dataset.sig === sig ? old.scrollTop : 0;
   const ty = S.modal.type;
   el.hidden = false;
-  el.innerHTML = `<div class="sheet ${ty === 'sched' ? 'wide' : ''}" role="dialog" aria-modal="true">${ty === 'session' ? sessionForm() : ty === 'fresh' ? freshForm() : ty === 'block' ? blockSheet(S.modal.key, S.modal.date) : ty === 'task' ? taskSheet(S.modal.id) : ty === 'mile' ? mileSheet(S.modal.id) : ty === 'stat' ? statSheet(S.modal.id) : ty === 'notif' ? notifSheet() : ty === 'call' ? callSheet() : ty === 'event' ? eventForm() : ty === 'chat' ? chatSheet() : ty === 'assist' ? assistantSheet() : ty === 'sched' ? schedSheet() : ty === 'add' ? addForm() : ty === 'blockedit' ? blockEditForm() : ty === 'catchup' ? catchupSheet() : ty === 'quick' ? quickSheet() : leadEditForm()}</div>`;
+  el.innerHTML = `<div class="sheet ${old ? 'still' : ''} ${ty === 'sched' || ty === 'build' ? 'wide' : ty === 'week' ? 'wide week' : ''}" role="dialog" aria-modal="true">${ty === 'session' ? sessionForm() : ty === 'fresh' ? freshForm() : ty === 'block' ? blockSheet(S.modal.key, S.modal.date) : ty === 'task' ? taskSheet(S.modal.id) : ty === 'mile' ? mileSheet(S.modal.id) : ty === 'stat' ? statSheet(S.modal.id) : ty === 'notif' ? notifSheet() : ty === 'call' ? callSheet() : ty === 'event' ? eventForm() : ty === 'chat' ? chatSheet() : ty === 'assist' ? assistantSheet() : ty === 'sched' ? schedSheet() : ty === 'add' ? addForm() : ty === 'blockedit' ? blockEditForm() : ty === 'catchup' ? catchupSheet() : ty === 'quick' ? quickSheet() : ty === 'build' ? buildSheet() : ty === 'week' ? weekSheet() : leadEditForm()}</div>`;
   el.dataset.sig = sig;
   if (top) el.querySelector('.sheet').scrollTop = top;
   if (keep) { const n = document.getElementById(keep.id); if (n) { n.focus({preventScroll:true}); try { if (keep.s != null) n.setSelectionRange(keep.s, keep.e); } catch(e) {} } }
@@ -1884,7 +2036,7 @@ function taskToggle(id) {
 function handle(act, el, ev) {
   const t = todayISO(), d = el.dataset;
   switch (act) {
-    case 'view': setView(d.v); break;
+    case 'view': if (d.v === 'today' && S.view === 'today') S.day = null; setView(d.v); break;
     case 'goto': { if (S.modal) { S.modal = null; render(); } const tgt = document.getElementById(d.id); if (tgt) { tgt.scrollIntoView({behavior:'smooth', block:'start'}); const f = tgt.querySelector('input'); if (f) setTimeout(() => f.focus({preventScroll:true}), 350); } break; }
     case 'check': toggleCheck(d.key); break;
     case 'item-menu': S.openItem = S.openItem === d.key ? null : d.key; render(); break;
@@ -1906,11 +2058,11 @@ function handle(act, el, ev) {
     }
     case 'move-day': {
       const msg = moveToDay(d.date || t, d.key, d.to);
-      if (msg) { const back = S.modal && S.modal.back; S.modal = back === 'sched' ? {type:'sched', date:d.date || t} : back === 'catchup' ? {type:'catchup'} : null; toast(msg, true); }
+      if (msg) { const back = S.modal && S.modal.back; S.modal = back === 'sched' ? {type:'sched', date:d.date || t} : back === 'catchup' ? {type:'catchup'} : back === 'week' ? {type:'week'} : null; toast(msg, true); }
       render(); break;
     }
     case 'task-toggle': taskToggle(d.id); if (S.modal && S.modal.type === 'task') S.modal = null; break;
-    case 'task-tomorrow': { const x = S.data.tasks[d.id]; if (!x) break; S.lastUndo = {type:'task', id:d.id, prev:clone(x)}; patchDoc('tasks', d.id, {due:addDays(t,1), origDue:x.origDue || x.due}); if (S.modal && S.modal.type === 'task') S.modal = null; toast(`Moved "${x.title.slice(0, 40)}" to tomorrow.`, true); break; }
+    case 'task-tomorrow': { const x = S.data.tasks[d.id]; if (!x) break; const to = addDays(x.due && x.due > t ? x.due : t, 1); S.lastUndo = {type:'task', id:d.id, prev:clone(x)}; patchDoc('tasks', d.id, {due:to, origDue:x.origDue || x.due}); if (S.modal && S.modal.type === 'task') S.modal = null; toast(`Moved "${x.title.slice(0, 40)}" to ${dayWord(to)}.`, true); break; }
     case 'task-drop': { const x = S.data.tasks[d.id]; if (!x) break; S.lastUndo = {type:'task', id:d.id, prev:clone(x)}; patchDoc('tasks', d.id, {dropped:true, droppedOn:t}); if (S.modal && S.modal.type === 'task') S.modal = null; toast(`Dropped "${x.title.slice(0, 40)}".`, true); break; }
     case 'top3': { const am = clone(dayOf(t).am || {}); const arr = am.top3 || []; const n = +d.i; if (!arr[n]) break; arr[n].done = !arr[n].done; patchDay(t, {am:{top3:arr}}); break; }
     case 'energy': S.drafts['am-energy'] = d.n; render(); break;
@@ -1942,7 +2094,7 @@ function handle(act, el, ev) {
     case 'tip-done': try { localStorage.setItem('lcc-tip3-done', '1'); } catch(e) {} render(); break;
     case 'event-new': handle('add-open', el, ev); break;
     case 'event-edit': clearDrafts('ev-'); clearDrafts('ad-'); S.confirm = null; S.modal = {type:'event', id:d.id}; render(); break;
-    case 'sched-open': S.openItem = null; S.confirm = null; S.modal = {type:'sched', date:d.date || t}; render(); break;
+    case 'sched-open': S.openItem = null; S.confirm = null; S.modal = {type:'sched', date:d.date || (S.view === 'today' && S.day) || t}; render(); break;
     case 'add-open': {
       clearDrafts('ev-'); clearDrafts('ad-'); S.confirm = null; S.openItem = null;
       const date = d.date || t;
@@ -1980,7 +2132,7 @@ function handle(act, el, ev) {
     case 'fresh-start': clearDrafts('fs-'); S.modal = {type:'fresh'}; render(); break;
     case 'block': {
       const prev = S.modal; S.openItem = null; S.confirm = null;
-      S.modal = {type:'block', key:d.key, date:d.date || t, scope:'day', back:d.back || (prev && ['sched','catchup'].includes(prev.type) ? prev.type : prev && ['block','blockedit'].includes(prev.type) ? prev.back : null) || null};
+      S.modal = {type:'block', key:d.key, date:d.date || t, scope:'day', back:d.back || (prev && ['sched','catchup','week'].includes(prev.type) ? prev.type : prev && ['block','blockedit'].includes(prev.type) ? prev.back : null) || null};
       render(); break;
     }
     case 'task-open': clearDrafts('tk-'); S.confirm = null; S.modal = {type:'task', id:d.id}; render(); break;
@@ -2006,12 +2158,13 @@ function handle(act, el, ev) {
     case 'theme': theme = THEMES.includes(d.t) ? d.t : 'auto'; applyTheme(); render(); break;
     case 'update-app': if (S.updateApp) { S.toast = null; renderToast(); S.updateApp(); } break;
     case 'toast-close': S.toast = null; renderToast(); break;
-    case 'quick-open': S.openItem = null; S.confirm = null; S.modal = {type:'quick'}; render(); setTimeout(() => { const b = document.getElementById('qa-in'); if (b) b.focus(); }, 60); break;
+    case 'show-canceled': S.showCanceled = !S.showCanceled; render(); break;
+    case 'quick-open': S.openItem = null; S.confirm = null; S.modal = {type:'quick', date:d.date || (S.view === 'today' && S.day) || null}; render(); setTimeout(() => { const b = document.getElementById('qa-in'); if (b) b.focus(); }, 60); break;
     case 'quick-example': S.drafts['qa-in'] = d.text; render(); setTimeout(() => { const b = document.getElementById('qa-in'); if (b) { b.focus(); b.setSelectionRange(b.value.length, b.value.length); } }, 30); break;
-    case 'quick-more': { const txt = String(S.drafts['qa-in'] || '').trim(); clearDrafts('qa-'); quickToForm(txt ? quickPlan(txt) : {kind:'oneoff', type:'event', title:'', date:t}); render(); break; }
+    case 'quick-more': { const txt = String(S.drafts['qa-in'] || '').trim(), qd = (S.modal && S.modal.date) || t; clearDrafts('qa-'); quickToForm(txt ? quickPlan(txt, qd) : {kind:'oneoff', type:'event', title:'', date:qd}); render(); break; }
     case 'quick-as-task': {
       const src = d.src, txt = String(S.drafts[src] || (document.getElementById(src) || {}).value || '').trim(); if (!txt) break;
-      const fb = src === 'qa-in' ? t : (S.drafts[src.replace('-title', '-date')] || (document.getElementById(src.replace('-title', '-date')) || {}).value || t);
+      const fb = src === 'qa-in' ? ((S.modal && S.modal.date) || t) : (S.drafts[src.replace('-title', '-date')] || (document.getElementById(src.replace('-title', '-date')) || {}).value || t);
       const q = quickPlan(txt, fb);
       const msg = addQuick({kind:'task', title:txt.charAt(0).toUpperCase() + txt.slice(1), date:q.kind === 'task' ? q.date : fb, area:q.area});
       clearDrafts(src.replace(/-(title|in)$/, '-')); if (src === 'qa-in') S.modal = null;
@@ -2019,11 +2172,35 @@ function handle(act, el, ev) {
     }
     case 'spread': { const r = spreadTasks(t); if (r) toast(`Kept the 5 most important for today and spread ${plural(r.n, 'to-do')} over ${fmtDay(r.first)} to ${fmtDay(r.last)}.`, true); render(); break; }
     case 'day-off': {
-      const on = d.on === '1', prev = !!dayOf(t).off;
-      S.lastUndo = {type:'restore', ops:[{patch:['days', t, {off:prev}]}]};
-      patchDay(t, {off:on});
+      const date = d.date || t, on = d.on === '1', prev = !!dayOf(date).off, word = dayWord(date);
+      S.lastUndo = {type:'restore', ops:[{patch:['days', date, {off:prev}]}]};
+      patchDay(date, {off:on});
       if (on && S.modal && S.modal.type === 'catchup') S.modal = null;
-      toast(on ? "Today is a day off. Nothing is late and nothing turns into a make-up." : 'Today counts again.', true); render(); break;
+      const Word = word.charAt(0).toUpperCase() + word.slice(1);
+      toast(on ? `${Word} is a day off. Nothing is late and nothing turns into a make-up.` : `${Word} counts again.`, true); render(); break;
+    }
+    case 'day-go': {
+      S.day = d.date && d.date > t ? d.date : null; S.openItem = null; S.swipeKey = null; clearDrafts('qd-');
+      if (S.view !== 'today' || S.modal) setView('today'); else { render(); window.scrollTo(0, 0); }
+      break;
+    }
+    case 'week-open': S.openItem = null; S.confirm = null; S.modal = {type:'week', offset:0}; render(); break;
+    case 'week-shift': if (S.modal) S.modal.offset = Math.max(0, (S.modal.offset || 0) + Number(d.d)); render(); break;
+    case 'build-open': {
+      const date = d.date && d.date >= t ? d.date : (S.view === 'today' && S.day) || t;
+      S.openItem = null; S.confirm = null; if (!S.modal || S.modal.type !== 'build') clearDrafts('bd-');
+      S.modal = {type:'build', date, step:'input'}; render();
+      if (!coarsePointer()) setTimeout(() => { const b = document.getElementById('bd-in'); if (b) b.focus(); }, 60);
+      break;
+    }
+    case 'build-date': if (S.modal) { S.modal.date = d.date; S.modal.step = 'input'; } render(); break;
+    case 'build-back': if (S.modal) S.modal.step = 'input'; render(); setTimeout(() => { const b = document.getElementById('bd-in'); if (b && !coarsePointer()) b.focus(); }, 60); break;
+    case 'build-apply': {
+      const date = d.date || (S.modal && S.modal.date) || t, r = applyBuild(date), bits = buildSummary(r, ', ');
+      clearDrafts('bd-'); S.modal = null; S.showCanceled = false;
+      if (date !== t) S.day = date;
+      if (S.view !== 'today') setView('today');
+      toast(`${date === t ? 'Your day is' : dayWord(date).replace(/^./, c => c.toUpperCase()) + ' is'} rebuilt${bits ? ': ' + bits : ''}.`, true); render(); break;
     }
     case 'fresh-tomorrow': {
       const tm = addDays(t, 1), r = applyFreshStart(tm, false);
@@ -2059,6 +2236,10 @@ function submit(form) {
       }).catch(e => { S.connectBusy = false; S.connectErr = (e && e.message) || "Couldn't reach that URL."; render(); });
       break;
     }
+    case 'build': {
+      if (!S.modal) return;
+      S.modal.step = 'preview'; render(); break;
+    }
     case 'task': {
       const p = form.dataset.p, text = String(v(p + '-title')).trim(), fallback = v(p + '-date') || t;
       if (!text) { toast('Type something first.'); return; }
@@ -2069,7 +2250,7 @@ function submit(form) {
     case 'quick': {
       const text = String(v('qa-in')).trim();
       if (!text) { toast('Type something first.'); return; }
-      const q = quickPlan(text, t);
+      const q = quickPlan(text, (S.modal && S.modal.date) || t);
       clearDrafts('qa-');
       if (q.kind === 'weekly' && !q.start) { quickToForm(q); toast('Pick a time for it.'); render(); return; }
       const msg = addQuick(q); S.modal = null; toast(msg, true); render(); break;
@@ -2299,8 +2480,12 @@ document.addEventListener('input', ev => {
   const el = ev.target;
   if (el.id === 'lead-search') { S.search = el.value; const pos = el.selectionStart; render(); const n = document.getElementById('lead-search'); if (n) { n.focus(); try { n.setSelectionRange(pos, pos); } catch(e) {} } return; }
   if (el.hasAttribute && el.hasAttribute('data-draft') && el.id) S.drafts[el.id] = el.value;
+  if (el.hasAttribute && el.hasAttribute('data-build')) {
+    const out = document.getElementById(el.id + '-prev'), date = el.dataset.date || todayISO();
+    if (out) { const {parsed, r} = buildPlanFor(date, el.value); out.innerHTML = buildChips(parsed, r, date); }
+  }
   if (el.hasAttribute && el.hasAttribute('data-quick')) {
-    const out = document.getElementById(el.id + '-prev'), fb = el.dataset.fallback ? (document.getElementById(el.dataset.fallback) || {}).value : '';
+    const out = document.getElementById(el.id + '-prev'), fb = el.dataset.fallback ? (document.getElementById(el.dataset.fallback) || {}).value : (el.dataset.date || '');
     if (out) out.innerHTML = el.value.trim() ? quickPreview(quickPlan(el.value, fb), el.id) : (el.id === 'qa-in' ? esc(QUICK_HINT) : '');
   }
 });
@@ -2321,14 +2506,17 @@ document.addEventListener('keydown', ev => {
   if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
   const a = document.activeElement;
   if (a && a.id === 'chat-in' && ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); askAssistant(a.value); return; }
+  if (a && a.id === 'bd-in' && ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); const f = a.closest('form'); if (f) f.requestSubmit(); return; }
   const typing = a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT' || a.isContentEditable);
   if (typing || S.modal || S.dbState !== 'ok' || !allLoaded()) return;
   if (ev.key >= '1' && ev.key <= '5') { ev.preventDefault(); setView(VIEWS[+ev.key - 1][0]); }
   else if (ev.key === '/') { ev.preventDefault(); setView('calls'); setTimeout(() => { const s = document.getElementById('lead-search'); if (s) s.focus(); }, 0); }
-  else if (ev.key === 'n') { ev.preventDefault(); if (!['today','plan'].includes(S.view)) setView('today'); setTimeout(() => { const f = document.getElementById(S.view === 'plan' ? 'pt-title' : 'qt-title'); if (f) { f.scrollIntoView({block:'center'}); f.focus(); } }, 0); }
+  else if (ev.key === 'n') { ev.preventDefault(); if (!['today','plan'].includes(S.view)) setView('today'); setTimeout(() => { const f = document.getElementById(S.view === 'plan' ? 'pt-title' : S.day ? 'qd-title' : 'qt-title'); if (f) { f.scrollIntoView({block:'center'}); f.focus(); } }, 0); }
   else if (ev.key === 'c') { ev.preventDefault(); handle('call-start', {dataset:{}}, ev); render(); }
   else if (ev.key === 'e') { ev.preventDefault(); handle('quick-open', {dataset:{}}, ev); }
   else if (ev.key === 's') { ev.preventDefault(); handle('sched-open', {dataset:{}}, ev); }
+  else if (ev.key === 'b') { ev.preventDefault(); handle('build-open', {dataset:{}}, ev); }
+  else if (ev.key === 'w') { ev.preventDefault(); handle('week-open', {dataset:{}}, ev); }
   else if (ev.key === 'a') { ev.preventDefault(); handle('ask', {dataset:{}}, ev); }
 });
 // Drop a backup file anywhere on the page to import it.

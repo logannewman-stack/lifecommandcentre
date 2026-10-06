@@ -23,7 +23,7 @@ const dayName = (w) => DOW.find((d) => w.toLowerCase().startsWith(d.toLowerCase(
 
 // What kind of block a line describes, from its words.
 const TYPE_WORDS = [
-  ['session', /\b(pickle ?ball|drill(?:s|ing)?|dink(?:s|ing)?|open play|rec play|scrimmage|match(?:es)?|tournament|ladder|league|clinic|lessons?|court time)\b/],
+  ['session', /\b(pick(?:le)? ?(?:a )?ball|drill(?:s|ing)?|dink(?:s|ing)?|open play|rec play|scrimmage|match(?:es)?|tournament|ladder|league|clinic|lessons?|court time)\b/],
   ['gym', /\b(gym|lift(?:ing)?|weights|workout|work out|leg day|push day|pull day)\b/],
   ['mobility', /\b(stretch(?:ing)?|mobility|yoga|foam roll(?:ing)?)\b/],
   ['watch', /\b(watch (?:pro|film|tape|video)|film study|video study)\b/],
@@ -38,7 +38,7 @@ const AREA_WORDS = [
   ['DoD', /\b(dod|amiel)\b/],
   ['Money', /\b(pay|paid|bank|invoice|tax|taxes|bill|bills|budget|deposit|collect|money|venmo|transfer)\b|\$\d/],
   ['Move', /\b(move|moving|apartment|lease|scottsdale|rent|truck|pack|packing|movers)\b/],
-  ['Pickleball', /\b(pickle ?ball|drill|dupr|tournament|coach|paddle|court|dink|serve)\b/],
+  ['Pickleball', /\b(pick(?:le)? ?(?:a )?ball|drill|dupr|tournament|coach|paddle|court|dink|serve)\b/],
   ['Body', /\b(gym|weigh|weight|calories?|protein|sleep|workout|run|eat|meal|doctor|dentist|stretch)\b/],
   ['Build', /\b(app|apps|site|website|build|code|bug|deploy|feature|design|innerboard|update|updates|launch)\b/],
   ['Sales', /\b(call|text|email|e-mail|dm|follow ?up|lead|leads|demo|proposal|pitch|client|prospect|mockups?|referrals?|close)\b/],
@@ -65,7 +65,8 @@ function toMinutes(h, m, ap, hint) {
 const apOf = (s) => (s ? s[0].toLowerCase() : null);
 
 export function parseQuick(text, today, now = '12:00') {
-  const raw = String(text || '').trim();
+  // Dictation writes "a.m." and "pick a ball"; read them as am and pickleball.
+  const raw = String(text || '').trim().replace(/\b([ap])\.\s?m\b\.?/gi, '$1m').replace(/\bpick(?:le)?\s?(?:a\s?)?ball\b/gi, 'pickleball');
   let work = ' ' + raw.replace(/\s+/g, ' ') + ' ';
   const low = () => work.toLowerCase();
   const cut = (re) => { const m = low().match(re); if (!m) return null; work = work.slice(0, m.index) + ' ' + work.slice(m.index + m[0].length); return m; };
