@@ -57,10 +57,13 @@ During a call block the NOW card offers **Start calling** (also on the Calls tab
 
 Your week has a plan that repeats (every Monday looks the same), and any single day can differ. Every change asks which one you mean: **Only today** (or that date) or **Every Monday** (or that weekday).
 
+- **Build my day.** When the day looks nothing like the plan, tap **Build my day** on Today's plan (or press `b`) and say what's set, the way you'd say it: "Woke up at 8, pickleball at 11, meeting at 1, pickleball at 4." Those go on the plan, and everything else moves into the free time closest to where it was. Calls go first, then build and other work, then the rest. A long block gets shorter if that's all the room there is, and what doesn't fit is canceled for the day. Your own pickleball replaces the day's planned court time. You see the whole new day before anything changes; **Use this plan** applies it and **Undo** takes it all back. On today it plans from now on; for another day it starts when you say you're up.
+- **Any day, like Today.** The row of days at the top of Today opens tomorrow or any day this week laid out like Today: its plan, its to-dos, **+ Add**, **Build**, and **Take this day off**. **Week** (or `w`) shows the next seven days side by side; tap a day to open it, or a block to change it.
+
 - **Fastest: swipe or hover.** On a phone, swipe a block left for **+30 min**, **Reschedule** and **Cancel**, or swipe it right to mark it done. On a laptop, rest the pointer on a block and the same buttons appear, plus +15. The **⋯** on each row has them too.
 - **Reschedule.** Tap a block, then use the **Reschedule** box: −30 / −15 / +15 / +30 / +60, exact Starts and Ends times (moving the start keeps the length), **Move to tomorrow**, or **another day**. Moving to another day cancels it where it was and puts a one-off copy on the new day, marked "Moved from Mon". A block moved for one day shows "Moved from 7:15" and has **Put it back**.
-- **Cancel.** **Cancel for today** (or **Cancel on** another date) takes a block off that day only. It leaves your week alone and never comes back as a make-up.
-- **Catch up.** When blocks slip by, the **3 behind · Catch up** pill on Today lists them: mark what you did (court time logs the session), reschedule what you still want to do, and cancel the rest in one tap.
+- **Cancel.** **Cancel for today** (or **Cancel on** another date) takes a block off that day only. It leaves your week alone and never comes back as a make-up. Canceled blocks fold into one line under the plan; **Show** puts them back in place.
+- **Catch up.** When blocks slip by, the **3 behind · Catch up** pill on Today lists them: rebuild the rest of the day, or one at a time mark what you did (court time logs the session), reschedule what you still want to do, and cancel the rest in one tap.
 - **Plan another day.** **Edit** on Today's plan (or `s` on a laptop) opens **Your schedule**: tap Today, Tomorrow or any day in the next week, or pick a date, then tap a block to change it for that day.
 - **Add something.** **+ Add** (or `e`) opens one box. Type it the way you would say it, and the line under the box shows what you will get before you press Enter: "Pickleball Thu 6-8am" is court time on Thursday, "Dentist Friday 2pm" is an appointment, "Gym every Mon, Wed, Fri 6:30pm" goes on your weekly plan, and anything without a time is a to-do. **More options** opens the full form (type, day or weekdays, place, notes) with what you typed filled in. Pickleball counts toward your week's drill and competitive numbers when you check it off. If it overlaps other blocks, the app says which.
 - **Change your week for good.** In a block's sheet, **Edit it or remove it from your week** changes the label, details, times and type, and **Apply to** copies the change to other weekdays. **Remove from your week** takes it out of the days you pick.
@@ -79,6 +82,7 @@ Your week has a plan that repeats (every Monday looks the same), and any single 
 The **Ask** button at the bottom right (or `a` on a laptop) opens a chat with Claude that sees your live data: today's and tomorrow's plan and what is done, your weekly plan, to-dos, the call list and pipeline, this week's numbers against the targets, the roadmap, money, body, sessions and DUPR. Ask what to focus on, how the week is going or who to call first, or tell it what to do:
 
 - "I have pickleball 6 to 8, 12 to 2 and 4:30 to 6:30 tomorrow" (it moves or adds court time and tells you what overlaps)
+- "Woke up at 8, pickleball at 11, meeting at 1, pickleball at 4" (it rebuilds the day around them)
 - "Push everything after lunch 30 minutes", "Cancel gym today", "Move gym to tomorrow", "Move check-in to 6:45 every weekday"
 - "I finished drill, went 7 and 3, work on resets", "Weight 218.4, slept 7 hours, energy 8"
 - "Add a to-do for Friday: send the proposal", "Note on Lisa: call back Thursday", "I'm sick, take today off"
@@ -97,7 +101,7 @@ Each question costs a few cents. The function checks that the request comes from
 
 ## Laptop keys
 
-`1` to `5` switch tabs, `/` opens Calls with the search focused, `n` jumps to the new to-do box, `s` opens your schedule, `e` opens **Add**, `c` starts calling, `a` opens Ask, `Esc` closes any sheet.
+`1` to `5` switch tabs, `/` opens Calls with the search focused, `n` jumps to the new to-do box, `s` opens your schedule, `e` opens **Add**, `b` opens **Build my day**, `w` shows your week, `c` starts calling, `a` opens Ask, `Esc` closes any sheet. On another day, `n`, `s`, `e` and `b` work on that day.
 
 ## Reminders
 
