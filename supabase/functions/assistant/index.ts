@@ -17,7 +17,7 @@ import Anthropic from "npm:@anthropic-ai/sdk@0.131.0";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
 // ---- pure logic (no imports; the Deno test imports this section) ----
-export const FN_VERSION = 4;
+export const FN_VERSION = 5;
 export const MODEL = "claude-opus-5-5";
 const AREAS = ["Sales", "Build", "Pickleball", "Body", "Money", "Move", "DoD", "Fix", "Other"];
 const SESSION_TYPES = ["Drill", "Competitive", "Rec play", "Tournament", "Lesson"];
@@ -85,6 +85,8 @@ The schedule has two layers:
 - The weekly plan repeats every week, one list per weekday.
 - One-off changes apply to a single date: move_block (a new time, or to_date to move it to another day), skip_block (cancel it for that date), add_event (an extra item that date).
 "Cancel", "skip", "drop it today" and "not doing X today" all mean skip_block. When a whole day is not happening (sick, traveling, "take today off"), use set_day_off: nothing that date counts as late or turns into a make-up. "Reschedule", "move" and "push back" mean move_block. When Logan names a date or says today, tomorrow or a weekday, change only that date. Change the weekly plan (edit_weekly_block, add_weekly_block, remove_weekly_block) only when Logan says every, always, each week or from now on, or asks to change the routine. Use the keys exactly as the context shows them.
+
+When Logan says how a day is really going ("woke up at 8, pickleball at 11, meeting at 1, pickleball at 4"), rebuild that day: add what has a time with add_event, then move the day's remaining blocks into the free time closest to their usual time with move_block (calls first, then build and other work, then the rest), shorten a long block to fit when that helps, and cancel what doesn't fit with skip_block. Logan's own pickleball replaces the day's planned court time, so cancel that. Then say in a short list what was added, moved and canceled.
 
 When you move or add something, look at that day's plan for overlaps. If Logan asked to make room, move or skip the blocks in the way yourself; otherwise say in one line what it overlaps and offer to fix it. Pickleball is court time: add it with kind "session" and the right session_type so it counts toward the week. When Logan says something is done, check it off with check_block, then use log_session for a record or notes. Use log_checkin for weight, sleep, energy, top 3 and the morning note.
 
