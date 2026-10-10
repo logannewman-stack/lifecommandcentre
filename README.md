@@ -145,10 +145,13 @@ Each campaign is a first email and two follow-ups in the same thread, three and 
 4. In Supabase **Edge Functions → Secrets**, add `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET` and `GMAIL_REFRESH_TOKEN`. `ANTHROPIC_API_KEY` (already there if you set up Ask) sorts the replies and runs the finder.
 5. Deploy `supabase/functions/outreach/index.ts` as an Edge Function named `outreach` (the app's **Copy the code** button), and turn off **Verify JWT**.
 6. Put it on its two schedules: run `supabase/functions/outreach/cron.sql` in the SQL Editor (the app's **Copy the SQL** fills in your project). It sends and reads replies every 10 minutes and runs the finder every 15. Running it again is safe.
+7. Keep your emails out of spam: in the Google Admin console turn on DKIM for logandnewman.com (Apps → Google Workspace → Gmail → Authenticate email), and make sure the domain's DNS has SPF (`v=spf1 include:_spf.google.com ~all`) and DMARC (`_dmarc`, `v=DMARC1; p=none`). The setup sheet has copy buttons.
+
+**See it work before the first day.** **Search now** on the finder card runs one search right away and tells you what it found. **Send me both as a test** in the Start sending sheet puts both first emails in your own inbox, exactly as businesses will get them.
 
 **Your mailing address.** US law (CAN-SPAM) requires a postal address at the bottom of every sales email. It is only a line of text: nothing is ever mailed to it. To keep your home address private, use a PO box or a virtual mailbox (iPostal1 or Anytime Mailbox, about $10 a month, set up online). Nothing sends until one is in **Settings**, which also has the forwarding address, the sending days and hours, the warm-up numbers and your time zone.
 
-**Updating from 1.9 or 2.0:** redeploy the `outreach` function with the new code (version 3, the one that waits for your start day) and run the new `cron.sql` once (it adds the finder's schedule). Your 1.9 contacts become leads in the pipeline the first time you open the app.
+**Updating from 1.9 or 2.0:** redeploy the `outreach` function with the new code (version 4; version 3 and later wait for your start day) and run the new `cron.sql` once (it adds the finder's schedule). Your 1.9 contacts become leads in the pipeline the first time you open the app.
 
 **Good to know:** start with the warm-up as it is; sending a lot from a new mailbox is the fastest way into spam folders. One Gmail inbox sends about 50 emails a day once warmed up, follow-ups included, so the finder's 50 a day keeps it full. More than that takes more inboxes. Keep an eye on the first replies and fix any that were sorted wrong (**Sorted as** on the reply, with Undo). If the engine or the finder hits a problem (an expired Google token, say), the Email tab shows it in red with what to do.
 
