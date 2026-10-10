@@ -1,6 +1,6 @@
 # Life Command Center
 
-Your personal daily plan, call list, check-ins and training log. It is a small web app you install on your phone and laptop. Your data lives in your own free Supabase project, so every device shows the same thing within seconds, and the app keeps working when the connection drops.
+Your personal daily plan, call list, email outreach, check-ins and training log. It is a small web app you install on your phone and laptop. Your data lives in your own free Supabase project, so every device shows the same thing within seconds, and the app keeps working when the connection drops.
 
 The live app is at your Vercel URL. Setup is a one-time job; the first part takes about 15 minutes.
 
@@ -99,9 +99,45 @@ Each question costs a few cents. The function checks that the request comes from
 
 **After an app update** that changes a function, its setup sheet shows **Update needed**: tap **Copy the code**, open that function in Supabase, replace all of its code, **Deploy**, and tap **Check**. Your key and settings stay.
 
+## Email: your outreach command center
+
+The **Email** tab runs your cold email campaigns from your own Gmail (logan@logandnewman.com) and reads every reply. Two campaigns come ready to review:
+
+- **Own the Home Screen**: a custom app on your clients' home screens, $7,500 or about $625 a month over 12 months with Klarna. The first email changes with the type of business (med spas, wellness and IV clinics, chiropractors, clubs and courts, studios, everyone else).
+- **Front Desk AI**: an AI front desk that answers every call and text, plus full-service marketing, for service businesses and dental offices. Read its wording carefully and change anything that isn't true yet; add a price line if you want one in the email.
+
+Each campaign is a first email and two follow-ups in the same thread, three and five sending days apart. Nothing goes out until you approve a campaign's wording, add your mailing address, and tap **Start sending**.
+
+**What runs by itself, every 10 minutes, even with the app closed:**
+
+- One email at a time, at least 6 minutes apart, Monday to Saturday from 8:30 to 4:30 in each business's own time zone (Arizona gets Arizona hours, Iowa gets Iowa hours).
+- A daily limit that starts at 20 and grows by 5 each sending day up to 50, so a new mailbox warms up instead of landing in spam. Each campaign also has its own limit.
+- Plain-text emails with your name, website, mailing address and "Not interested? Reply no thanks" at the bottom, plus a one-click unsubscribe header. No tracking pixels.
+- Every reply in a campaign thread is read and sorted: interested, question, referral, not now, not interested, unsubscribe, bounce or auto-reply. Claude sorts them when the Anthropic key is set; simple rules do it otherwise. Anyone who replies gets no more follow-ups. Not interested, unsubscribe and bounces go on the do-not-contact list and are never emailed again, even if you import them later. Out-of-office replies don't stop the sequence.
+- **Hot replies** (interested, a question, a referral) are starred and labeled **LCC/Hot** in Gmail, show at the top of the Email tab with a one-line summary and the next step, ping your phone if notifications are on, and are forwarded to another address if you set one in Settings. The Email tab shows a green count until you answer them.
+
+**On the tab:** the status at the top (Sending, Paused, Done for today…) with today's count against the limit; a checklist until everything is set up; **Hot replies** with **Reply in Gmail**, **Call**, **Add to pipeline** (makes the business a warm lead due today on Calls, or moves the lead it came from to Talking) and **Done**; **Results** (businesses emailed, replies, hot, reply rate, and a two-week chart); each campaign's numbers with **Edit the emails**, **Pause** and **Add contacts**; **Up next**; every contact with its status, filters and search; and **Every reply**. Tap any contact for its history: each email it got, each reply in full, what goes out next, and buttons to queue, pause, resume, block or remove it. If a reply was sorted wrong, change **Sorted as** and the contact follows (with Undo).
+
+**Adding contacts.** **Add contacts** takes a spreadsheet saved as CSV (Google Sheets: File → Download → CSV), or drag the file onto the page. It reads columns like business, email, first name, type, city, state, phone and website, so exports from Apollo, Outscraper or Google Sheets work, and so does the list Claude made (`outreach-list.csv`). "By type" sends dentists and service businesses to Front Desk AI and everyone else to Own the Home Screen. Duplicates and do-not-contact addresses are skipped. Rows marked **Check first** wait until you look at them (the contact shows where the address was found) and tap **Queue**, or **Queue all**.
+
+**Approving a campaign.** **Read and approve** opens the editor with a live preview of the exact email a business gets. Change the subject, each email, the wait between them, the price line, and the question and pitch for each type of business. Fill-ins like `{business}`, `{greeting}`, `{question}`, `{features}` and `{price}` are filled per business; a misspelled one is flagged and blocks approval. **Send me a test** emails the first email to your own inbox. **Looks good, turn it on** approves it.
+
+**One-time setup, about 15 minutes, on a laptop.** Email → **Engine setup** walks you through it with a check at each step:
+
+1. In Google Cloud (signed in as logan@logandnewman.com), create a project and enable the **Gmail API**.
+2. In **Google Auth Platform**, set up the app as **Internal**, then create a **Web application** client with `https://developers.google.com/oauthplayground` as a redirect URI. Copy the client ID and secret.
+3. In the **OAuth Playground**, use your own credentials, authorize the scope `https://www.googleapis.com/auth/gmail.modify`, and exchange the code for a **refresh token**.
+4. In Supabase **Edge Functions → Secrets**, add `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET` and `GMAIL_REFRESH_TOKEN` (`ANTHROPIC_API_KEY` is already there if you set up Ask).
+5. Deploy `supabase/functions/outreach/index.ts` as an Edge Function named `outreach` (the app's **Copy the code** button), and turn off **Verify JWT**.
+6. Schedule it every 10 minutes: Supabase **Integrations → Cron**, or run `supabase/functions/outreach/cron.sql` in the SQL Editor.
+
+Then in **Settings** add your mailing address (a street address, a PO box, or a UPS Store mailbox; US law requires one in sales email), and optionally an address to forward hot replies to. Settings also has the sending days and hours, the warm-up numbers and your time zone.
+
+**Good to know:** start with the warm-up as it is; sending a lot from a new mailbox is the fastest way into spam folders. Keep an eye on the first replies and fix any that were sorted wrong. If the engine hits a problem (an expired Google token, say), the Email tab shows it in red with what to do.
+
 ## Laptop keys
 
-`1` to `5` switch tabs, `/` opens Calls with the search focused, `n` jumps to the new to-do box, `s` opens your schedule, `e` opens **Add**, `b` opens **Build my day**, `w` shows your week, `c` starts calling, `a` opens Ask, `Esc` closes any sheet. On another day, `n`, `s`, `e` and `b` work on that day.
+`1` to `6` switch tabs, `/` opens Calls with the search focused, `n` jumps to the new to-do box, `s` opens your schedule, `e` opens **Add**, `b` opens **Build my day**, `w` shows your week, `c` starts calling, `a` opens Ask, `Esc` closes any sheet. On another day, `n`, `s`, `e` and `b` work on that day.
 
 ## Reminders
 
