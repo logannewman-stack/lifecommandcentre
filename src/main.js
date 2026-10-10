@@ -10,7 +10,7 @@ import { supabase, config as sbConfig, configSource, saveConfig, clearConfig } f
 import { createDb } from './db.js';
 import { parseQuick } from './quickadd.js';
 import { parseDayText, buildDay } from './planday.js';
-import { SEQ_STATUS, DEFAULT_CAMPAIGNS, withDefaults as outSettings, composeEmail, segmentOf, parseCSV, importLeads, campaignStats, tzFor, localClock, dailyCap, nextSendDay, upNext, isEmail, SUPPRESS, HOT, LIVE_SEQ, stagePatch, replyPatch, enrollPatch, heatOf, liveCampaign, leadIdFor } from './outreach.js';
+import { SEQ_STATUS, DEFAULT_CAMPAIGNS, withDefaults as outSettings, sendingState, launchWrites, composeEmail, segmentOf, parseCSV, importLeads, campaignStats, tzFor, localClock, dailyCap, nextSendDay, upNext, isEmail, SUPPRESS, HOT, LIVE_SEQ, stagePatch, replyPatch, enrollPatch, heatOf, liveCampaign, leadIdFor } from './outreach.js';
 import REMINDERS_FN from '../supabase/functions/reminders/index.ts?raw';
 import CRON_SQL from '../supabase/functions/reminders/cron.sql?raw';
 import ASSISTANT_FN from '../supabase/functions/assistant/index.ts?raw';
@@ -574,6 +574,7 @@ function viewToday() {
       ${addTaskForm('qt', t)}
       ${doneTasks.length ? `<details style="margin-top:8px"><summary>Done today (${doneTasks.length})</summary>${doneTasks.map(x => taskRow(x, t)).join('')}</details>` : ''}
     </section>`,
+    pipeTodayCard(t),
     pmCard(t, day)
   ];
   return dayStrip(t) + installBanner() + tipBanner() + `<div class="two"><div class="main">${main.join('')}</div><div class="side">${side.join('')}</div></div>`;
@@ -813,6 +814,28 @@ function pmCard(t, day) {
     </form></section>`;
 }
 
+/* ----- the pipeline on Today ----- */
+// Replies to answer first, warm deals due for a follow-up, calls due, and what the email engine and
+// the finder did today. Every row opens the lead.
+function pipeTodayCard(t) {
+  const leads = allLeads(); if (!leads.length) return '';
+  const s = emSettings(), st = emState(), fin = outDoc('finder') || {}, local = localClock(s.tz).date, mode = sendingState(s, local);
+  const hot = emHot().filter(r => (S.data.leads || {})[r.lead]), calls = isRestDay(t) ? 0 : leadsDue(t).length;
+  const follow = leads.filter(l => ['Talking','Demo booked','Proposal sent'].includes(l.stage) && l.nextDate && l.nextDate <= t)
+    .sort((a, b) => String(a.nextDate).localeCompare(String(b.nextDate)) || leadHeat(b).score - leadHeat(a).score);
+  const sent = st.today && st.today.date === local ? st.today.sent || 0 : 0, found = fin.today && fin.today.date === local ? fin.today.found || 0 : 0;
+  const email = mode === 'later' ? `Emails start ${dayWord(s.startOn)}.` : mode === 'on' && emCampaigns().some(liveCampaign) ? `${plural(sent, 'email')} sent today.` : 'Emails are off.';
+  const row = (id, l, line) => `<button class="erow" data-act="lead-open" data-id="${esc(id)}"><div class="min0"><b>${esc(l.name || l.email)}</b><div class="meta clamp1">${esc(line)}</div></div><div class="erow-r">${heatChip(l)}</div></button>`;
+  const hotRows = hot.slice(0, 3).map(r => row(r.lead, S.data.leads[r.lead], r.summary || r.snippet || 'Replied to your email')).join('');
+  const followRows = follow.slice(0, 4).map(l => row(l.id, l, `${l.stage} · ${l.nextStep || 'Follow up'}${l.nextDate < t ? ' · late' : ''}`)).join('');
+  return `<section class="card pipetoday ord-8"><div class="card-h"><h2>Pipeline</h2><button class="btn sm" data-act="view" data-v="calls">Open</button></div>
+    <div class="pt-n"><span class="${hot.length ? 'hotnum' : ''}"><b>${hot.length}</b> hot ${hot.length === 1 ? 'reply' : 'replies'}</span><span><b>${follow.length}</b> ${follow.length === 1 ? 'follow-up' : 'follow-ups'}</span><span><b>${calls}</b> calls due</span>${found ? `<span><b>${found}</b> new leads</span>` : ''}</div>
+    ${hotRows ? `<h3>Answer first</h3><div class="elist">${hotRows}</div>` : ''}
+    ${followRows ? `<h3>Follow up today</h3><div class="elist">${followRows}</div>${follow.length > 4 ? `<div class="meta">and ${follow.length - 4} more on the board</div>` : ''}` : ''}
+    <div class="btnrow pt-f"><span class="meta">${esc(email)}</span>${mode === 'paused' ? '<button class="btn sm ghost" data-act="em-launch">Start sending</button>' : ''}</div>
+  </section>`;
+}
+
 /* ----- CALLS ----- */
 const inCadence = l => l.type === 'Cold' && ['New lead','Contacted'].includes(l.stage);
 const cadenceStep = l => CADENCE[Math.min(num(l.touches) || 0, CADENCE.length - 1)];
@@ -956,9 +979,23 @@ function undo() {
 }
 
 /* ----- WEEK ----- */
+// Emails sent, email replies and leads the finder added, by local date. Rebuilt when leads or replies change.
+let outIdx = null;
+function outreachDays() {
+  if (outIdx && outIdx.L === S.data.leads && outIdx.R === S.data.replies) return outIdx;
+  const sent = {}, found = {}, replied = {}, add = (o, d) => { if (d) o[d] = (o[d] || 0) + 1; };
+  const day = v => { const x = new Date(v); return isNaN(x) ? '' : iso(x); };
+  for (const l of Object.values(S.data.leads || {})) {
+    if (!l) continue;
+    (l.sentLog || []).forEach(x => add(sent, x && day(x.at)));
+    if (l.source === 'Finder' && l.createdAt) add(found, day(Number(l.createdAt)));
+  }
+  for (const r of Object.values(S.data.replies || {})) if (r && r.at && !['auto','bounce'].includes(r.label)) add(replied, day(r.at));
+  return outIdx = {L:S.data.leads, R:S.data.replies, sent, found, replied};
+}
 function dayStatsFor(d) {
-  const day = dayOf(d), pm = day.pm || {}, ch = day.checks || {};
-  const st = {dials:0,convos:0,demos:0,dms:0,proposals:0,deals:0,mockups:0,cash:0,gym:0,mobility:0,pro:0,checkins:0,checkouts:0,drill:0,competitive:0};
+  const day = dayOf(d), pm = day.pm || {}, ch = day.checks || {}, o = outreachDays();
+  const st = {dials:0,convos:0,demos:0,dms:0,proposals:0,deals:0,mockups:0,cash:0,gym:0,mobility:0,pro:0,checkins:0,checkouts:0,drill:0,competitive:0, emails:o.sent[d] || 0, replies:o.replied[d] || 0, found:o.found[d] || 0};
   (day.calls || []).forEach(c => { if (c.dial) st.dials++; if (c.convo) st.convos++; if (c.demo) st.demos++; if (c.dm) st.dms++; });
   st.proposals += num(pm.proposals)||0; st.deals += num(pm.deals)||0; st.mockups += num(pm.mockups)||0; st.dms += num(pm.dms)||0; st.cash += num(pm.cash)||0; st.pro += num(pm.proExtra)||0;
   if (day.am && day.am.savedAt) st.checkins++; if (pm.savedAt) st.checkouts++;
@@ -973,6 +1010,9 @@ function weekStats(ws) {
 }
 const STAT_INFO = {
   dials:['Dials','Every call result you tap on a lead (Pipeline › Calls, or calling mode) counts one dial.'],
+  emails:['Emails sent','Every campaign email the engine sent that day, follow-ups included.'],
+  replies:['Email replies','Replies to your campaign emails, not counting auto-replies and bounces.'],
+  found:['New leads found','Businesses the finder added to your pipeline that day.'],
   convos:['Owner conversations','Talked, Demo booked, Not interested and They replied each count as a conversation.'],
   demos:['Demos booked','Tap Demo booked on a lead.'],
   proposals:['Proposals sent','Typed in the evening check-out.'],
@@ -1006,9 +1046,10 @@ function viewWeek() {
     <div class="weeknav"><button class="btn sm" data-act="week-nav" data-d="-1" aria-label="Previous week">‹ Prev</button><h2>Week of ${esc(fmtShort(ws))}</h2><button class="btn sm" data-act="week-nav" data-d="1" aria-label="Next week">Next ›</button></div>
     ${wk ? `<div class="week-banner"><div class="eyebrow">Focus</div><b>${esc(wk.focus)}</b>${wk.musts ? `<div class="meta" style="margin-top:4px;color:var(--ink-2)">${esc(wk.musts)}</div>` : ''}</div>` : ''}
     <div class="two-eq">
-    <section class="card"><div class="card-h"><h2>Business</h2><span class="meta">Counted from your calls + check-outs</span></div><div class="stats">
+    <section class="card"><div class="card-h"><h2>Business</h2><span class="meta">Counted from your calls, check-outs and email</span></div><div class="stats">
       ${stat('Dials', st.dials, T.dials, null, 'dials')}${stat('Owner conversations', st.convos, T.convos, null, 'convos')}${stat('Demos booked', st.demos, T.demos, null, 'demos')}${stat('Proposals sent', st.proposals, T.proposals, null, 'proposals')}
-      ${stat('Deals won', st.deals, T.deals, null, 'deals')}${stat('Mockups sent', st.mockups, T.mockups, null, 'mockups')}${stat('DMs sent', st.dms, T.dms, null, 'dms')}${stat('Cash in', st.cash, 0, money, 'cash')}</div></section>
+      ${stat('Deals won', st.deals, T.deals, null, 'deals')}${stat('Mockups sent', st.mockups, T.mockups, null, 'mockups')}${stat('DMs sent', st.dms, T.dms, null, 'dms')}${stat('Cash in', st.cash, 0, money, 'cash')}
+      ${stat('Emails sent', st.emails, 0, null, 'emails')}${stat('Email replies', st.replies, 0, null, 'replies')}${stat('New leads found', st.found, 0, null, 'found')}</div></section>
     <section class="card"><div class="card-h"><h2>Pickleball + body</h2><span class="meta">Counted from your checkoffs + sessions</span></div><div class="stats">
       ${stat('Drill sessions', st.drill, T.drill, null, 'drill')}${stat('Competitive sessions', st.competitive, T.competitive, null, 'competitive')}${stat('Gym sessions', st.gym, T.gym, null, 'gym')}${stat('Mobility (min)', st.mobility, T.mobility, null, 'mobility')}
       ${stat('Pro video (hrs)', Math.round(st.pro/6)/10, (T.proMinutes||210)/60, null, 'pro')}${stat('Check-ins', st.checkins, 7, null, 'checkins')}${stat('Check-outs', st.checkouts, 7, null, 'checkouts')}${stat(`Rated games in ${parseISO(month+'-01').toLocaleDateString('en-US',{month:'long'})}`, ratedGames, 0)}</div>
@@ -2139,8 +2180,8 @@ function emSample(cid, seg) {
   const x = EM_SAMPLE[seg] || EM_SAMPLE.general;
   return {name:x[0], kind:x[1], city:x[2], state:x[3], email:'hello@example.com', segment:seg};
 }
-function emMailHtml(l, c, step) {
-  const s = emSettings(), mail = composeEmail(l, c, s, step);
+function emMailHtml(l, c, step, settings) {
+  const s = settings || emSettings(), mail = composeEmail(l, c, s, step);
   if (!mail) return '<div class="meta">There is no email at that step.</div>';
   return `<div class="mail">
     <div class="mail-h"><div><span>From</span>${esc(s.fromName)} &lt;${esc(emGmail() || 'logan@logandnewman.com')}&gt;</div><div><span>To</span>${esc(l.email || '')}</div><div><span>Subject</span><b>${esc(mail.subject)}</b></div></div>
@@ -2165,7 +2206,7 @@ function viewEmail() {
   return `<div class="two"><div class="main">${main.join('')}</div><div class="side">${side.join('')}</div></div>`;
 }
 function emHero(s, st, camps, list) {
-  const now = new Date(), today = localClock(s.tz, now).date, eng = S.outEng || {};
+  const now = new Date(), today = localClock(s.tz, now).date, eng = S.outEng || {}, mode = sendingState(s, today);
   const cap = dailyCap(s, today), sent = st.today && st.today.date === today ? (st.today.sent || 0) : 0;
   const live = camps.filter(liveCampaign), engineOk = emEngineOk(), gmail = emGmail();
   const waiting = list.filter(l => ['queued','active'].includes(l.seq.status) && !l.dnc && live.some(c => c.id === l.seq.campaign));
@@ -2173,9 +2214,15 @@ function emHero(s, st, camps, list) {
   const open = clocks.some(c => s.days.includes(c.dow) && c.minutes >= toMin(s.start) && c.minutes < toMin(s.end));
   const later = clocks.some(c => s.days.includes(c.dow) && c.minutes < toMin(s.start));
   const back = nextSendDay(addDays(todayISO(), 1), s.days);
+  const outdated = (eng.fn === 'ok' && (eng.version || 1) < OUTREACH_V) || (st.version && st.version < OUTREACH_V);
   let dot = 'warn', title, sub;
-  if (!engineOk) { dot = ''; title = 'Set up the engine'; sub = 'A one-time setup of about 15 minutes. After that, emails go out, replies get read and new leads get found on their own, even with this app closed.'; }
-  else if (!s.enabled) { title = 'Paused'; sub = 'Nothing goes out until you tap Start sending.'; }
+  if (mode === 'later') {
+    const todo = [!engineOk || outdated ? 'update the engine (Engine setup)' : '', !String(s.address || '').trim() ? 'add your mailing address' : '', !live.length ? 'approve a campaign' : ''].filter(Boolean);
+    dot = todo.length ? 'warn' : 'live'; title = `Starts ${dayWord(s.startOn)}`;
+    sub = todo.length ? `Before then: ${todo.join(', ')}.` : `The first emails go out at ${fmtTap(s.start)} in each business's own time. ${plural(waiting.length, 'lead')} in line${s.finder.enabled ? ', and the finder keeps adding more' : ''}.`;
+  }
+  else if (!engineOk) { dot = ''; title = 'Set up the engine'; sub = 'A one-time setup of about 15 minutes. After that, emails go out, replies get read and new leads get found on their own, even with this app closed.'; }
+  else if (mode === 'paused') { title = 'Paused'; sub = 'Nothing goes out until you tap Start sending.'; }
   else if (!String(s.address || '').trim()) { title = 'Waiting for your address'; sub = 'Add your mailing address in Settings. Every email needs it.'; }
   else if (!live.length) { title = 'No campaign is on'; sub = 'Read and approve a campaign to turn it on.'; }
   else if (!waiting.length) { title = 'Everyone has been emailed'; sub = s.finder.enabled ? 'The finder adds new leads through the day.' : 'Add leads or turn on the finder to keep it going. Replies still get read.'; }
@@ -2183,22 +2230,20 @@ function emHero(s, st, camps, list) {
   else if (open) { dot = 'live on'; title = 'Sending'; sub = `One email at a time, at least ${s.gap} minutes apart, until ${fmtTap(s.end)} their time.`; }
   else if (later) { dot = 'live'; title = 'Starting soon'; sub = `The first email goes out at ${fmtTap(s.start)} their time.`; }
   else { dot = 'live'; title = sent ? 'Done for today' : 'Off right now'; sub = `Back ${dayWord(back)} at ${fmtTap(s.start)} their time.`; }
-  const outdated = (eng.fn === 'ok' && (eng.version || 1) < OUTREACH_V) || (st.version && st.version < OUTREACH_V);
   const ranMin = st.lastRun ? (Date.now() - Date.parse(st.lastRun)) / 60000 : null;
   const alerts = [
     st.lastError ? `<div class="err"><b>The engine hit a problem${st.lastRun ? ' ' + esc(emAgo(st.lastRun)) : ''}:</b> ${esc(st.lastError)}</div>` : '',
     outdated ? '<div class="warnbox">Supabase is running an older copy of the engine. Open Engine setup, copy the new code and deploy it.</div>' : '',
-    s.enabled && engineOk && ranMin !== null && ranMin > 25 ? `<div class="warnbox">The engine last ran ${esc(emAgo(st.lastRun))}. Check that its schedule is on (Engine setup, step 6).</div>` : '',
+    mode === 'on' && engineOk && ranMin !== null && ranMin > 25 ? `<div class="warnbox">The engine last ran ${esc(emAgo(st.lastRun))}. Check that its schedule is on (Engine setup, step 6).</div>` : '',
   ].join('');
-  const confirmBox = S.confirm === 'em-start' ? `<div class="confirmbox"><b>Start sending?</b><div class="meta">Up to ${cap} emails today from ${esc(gmail || 'your Gmail')}, at least ${s.gap} minutes apart, ${fmtTap(s.start)} to ${fmtTap(s.end)} in each business's own time, ${esc(emDays(s.days))}. Follow-ups go in the same thread. Anyone who replies gets no more emails, and the reply moves them in your pipeline.</div><div class="btnrow"><button class="btn primary" data-act="em-start-yes">Yes, start</button><button class="btn ghost" data-act="confirm" data-c="">Not yet</button></div></div>` : '';
   const facts = [gmail ? `From <b>${esc(gmail)}</b>` : '', st.lastRun ? `Checked ${esc(emAgo(st.lastRun))}` : '', engineOk ? (s.startedOn && cap < (Number(s.capMax) || 50) ? `Warming up: ${cap} a day now, up to ${s.capMax}` : `${cap} a day`) : ''].filter(Boolean);
   return `<section class="card emhero ord-1">
     <div class="emhero-top"><div class="min0"><div class="eyebrow">Email command center</div><div class="emst"><i class="emdot ${dot}" aria-hidden="true"></i><b>${esc(title)}</b></div><div class="meta">${esc(sub)}</div></div>
-      ${s.enabled ? '<button class="btn" data-act="em-pause">Pause</button>' : '<button class="btn primary" data-act="em-start">Start sending</button>'}</div>
+      ${mode !== 'paused' ? '<button class="btn" data-act="em-pause">Pause</button>' : '<button class="btn primary" data-act="em-start">Start sending</button>'}</div>
     ${engineOk ? `<div class="progress"><div class="bar ${sent >= cap ? 'good' : ''}"><i style="width:${Math.min(100, Math.round(sent / Math.max(1, cap) * 100))}%"></i></div><span class="meta mono">${sent}/${cap} today</span></div>` : ''}
     ${facts.length ? `<div class="meta">${facts.join(' · ')}</div>` : ''}
-    ${confirmBox}${alerts}
-    <div class="btnrow"><button class="btn sm" data-act="em-import">Add leads</button><button class="btn sm" data-act="em-settings">Settings</button><button class="btn sm ghost" data-act="em-setup">Engine setup</button></div>
+    ${alerts}
+    <div class="btnrow">${mode === 'later' ? '<button class="btn sm" data-act="em-launch">Change the start day</button>' : ''}<button class="btn sm" data-act="em-import">Add leads</button><button class="btn sm" data-act="em-settings">Settings</button><button class="btn sm ghost" data-act="em-setup">Engine setup</button></div>
   </section>`;
 }
 function emChecklist(s, camps, list) {
@@ -2207,7 +2252,7 @@ function emChecklist(s, camps, list) {
     [!!String(s.address || '').trim(), 'Add a mailing address', 'The law requires one at the bottom of every sales email. A PO box or virtual mailbox works.', 'em-settings', 'Add it'],
     [list.length > 0 || s.finder.enabled, 'Add leads', 'Turn on the finder, or add outreach-list.csv or any spreadsheet with emails.', 'em-finder', 'Set up the finder'],
     [camps.some(c => c.reviewed), 'Read and approve the emails', 'Nothing goes out until you approve the wording.', 'em-review', 'Read them'],
-    [!!s.enabled && camps.some(liveCampaign), 'Start sending', `${s.capStart} a day to start, a few more each day, ${emDays(s.days)}.`, 'em-start', 'Start'],
+    [sendingState(s, localClock(s.tz).date) !== 'paused' && camps.some(liveCampaign), 'Pick your start day', `${s.capStart} a day to start, a few more each day, ${emDays(s.days)}.`, 'em-launch', 'Start'],
   ];
   const done = items.filter(x => x[0]).length, first = items.findIndex(x => !x[0]);
   if (done === items.length) return '';
@@ -2661,6 +2706,48 @@ function emSetupSheet() {
     <div class="meta">Nothing is sent until you approve a campaign, add your mailing address and tap Start sending. The finder does nothing until you turn it on.</div>`;
 }
 
+/* ----- start sending: both cold campaigns, the address, the finder and the first day in one sheet ----- */
+const LAUNCH_CAMPS = ['home-screen', 'front-desk'];
+// Whether the sheet's "find new leads" switch for a campaign is on: what you tapped, else what the
+// finder already does, else on.
+const lxFind = cid => { const f = emSettings().finder; return S.drafts['lx-f-' + cid] !== undefined ? !!S.drafts['lx-f-' + cid] : f.enabled ? !!(f.targets[cid] || {}).on : true; };
+function emLaunchSheet() {
+  const s = emSettings(), eng = S.outEng || {}, t = todayISO(), list = emLeads();
+  const startOn = draft('lx-date', s.startOn && s.startOn >= t ? s.startOn : nextSendDay(addDays(t, 1), s.days));
+  const addr = draft('lx-address', s.address || ''), preview = {...s, address:addr};
+  const outdated = eng.fn === 'ok' && (eng.version || 1) < OUTREACH_V, gm = eng.gmail || {};
+  const engineOk = eng.fn === 'ok' && !outdated && !!gm.ok;
+  const engLine = engineOk ? `Up to date, sending from <b>${esc(gm.email)}</b>.`
+    : eng.checking || !eng.fn ? 'Checking the engine…'
+    : outdated ? 'Supabase runs an older engine that won\'t wait for your start day. On a laptop: Engine setup, step 5 (copy the code, deploy), then step 6 (run the SQL). About 5 minutes.'
+    : eng.fn === 'ok' ? 'The engine is there, but Gmail isn\'t connected yet. Engine setup, steps 1 to 4, on a laptop.'
+    : eng.fn === 'missing' ? 'Not set up yet. Do Engine setup on a laptop before your start day, about 15 minutes.'
+    : 'Couldn\'t reach the engine from here. Check Engine setup on a laptop before your start day.';
+  const camps = LAUNCH_CAMPS.map(id => (S.data.campaigns || {})[id] ? {id, ...S.data.campaigns[id]} : null).filter(Boolean);
+  const need = camps.filter(c => !(c.reviewed && c.status === 'running'));
+  const f = s.finder;
+  const campRows = camps.map(c => {
+    const n = list.filter(l => l.seq.campaign === c.id && ['queued','active','hold'].includes(l.seq.status)).length;
+    const why = emCampaignProblem(emClean(c)), seg = Object.keys(c.segments || {})[0] || 'general';
+    return `<div class="lxcamp"><div class="lxcamp-h"><b>${esc(c.name)}</b>${c.reviewed && c.status === 'running' ? '<span class="pill good">Approved</span>' : '<span class="pill warn">Needs your OK</span>'}<span class="meta">${n ? `${plural(n, 'lead')} in line` : 'No leads in line yet'}</span></div>
+      ${c.offer ? `<div class="meta">${esc(c.offer)}</div>` : ''}
+      ${why ? `<div class="err">${esc(why)}</div>` : ''}
+      <details><summary>Read the first email</summary>${emMailHtml(emSample(c.id, seg), c, 0, preview)}</details>
+      ${toggleRow('lx-f-' + c.id, lxFind(c.id), `Find new leads for ${c.name} every day`)}
+      <div class="btnrow"><button class="btn sm ghost" data-act="em-campaign" data-id="${esc(c.id)}">Edit the wording</button>${n ? '' : `<button class="btn sm ghost" data-act="em-import" data-campaign="${esc(c.id)}">Add a spreadsheet</button>`}</div></div>`;
+  }).join('');
+  const label = need.length === camps.length && camps.length > 1 ? 'Approve both and start' : need.length ? `Approve ${need[0].name} and start` : 'Start';
+  const step = (n, title, body, ok) => `<div class="step ${ok ? 'ok' : ''}"><div class="num">${ok ? '✓' : n}</div><div class="min0 stack">${title ? `<b>${title}</b>` : ''}${body}</div></div>`;
+  return `<div class="card-h"><h2>Start sending</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
+    <p class="meta" style="margin:0;color:var(--ink-2)">Everything for your first sending day on one page. Nothing goes out before the day you pick, and Pause on the Email tab stops it any time. Replies are read either way.</p>
+    ${step(1, 'The engine', `<div class="meta" style="color:var(--ink-2)">${engLine}</div>${engineOk ? '' : '<div class="btnrow"><button class="btn sm" data-act="em-setup">Engine setup</button></div>'}`, engineOk)}
+    ${step(2, 'Your mailing address', `<textarea class="in" id="lx-address" rows="2" data-draft placeholder="PO Box 123, Des Moines, IA 50309">${esc(addr)}</textarea><span class="meta">One line of text at the bottom of each email, which US law requires in sales email. Nothing is ever mailed to it. A PO box or a virtual mailbox (iPostal1 or Anytime Mailbox, about $10 a month) keeps your home address private.</span>`, !!String(addr).trim())}
+    ${step(3, 'The emails', `${campRows}<span class="meta">The finder adds up to ${f.perDay} new leads a day in all and spends at most ${dollars(f.budget)} a day on your Anthropic account. Change that in its Settings.</span>`, !need.length)}
+    ${step(4, 'Your first sending day', `<input class="in" type="date" id="lx-date" data-draft data-rerender min="${t}" value="${esc(startOn)}" style="max-width:220px"><span class="meta">${fmtTap(s.start)} to ${fmtTap(s.end)} in each business's own time, ${esc(emDays(s.days))}. ${s.capStart} emails on the first day and ${s.capStep} more each sending day, up to ${s.capMax} a day, follow-ups included.</span>`, false)}
+    <div class="btnrow emfoot"><button class="btn primary" data-act="lx-go">${esc(label)} ${esc(dayWord(startOn))}</button><button class="btn ghost" data-act="modal-close">Not yet</button></div>
+    ${need.length ? `<div class="meta">This approves ${need.length > 1 ? 'both first emails and their follow-ups' : 'that campaign\'s emails'} as they read now.</div>` : ''}`;
+}
+
 /* ----- changes ----- */
 // Where the lead form goes when it closes: back to the lead (and from there to calling mode), or away.
 function leadEditDone(m) {
@@ -2788,7 +2875,7 @@ function renderModal() {
   const old = el.querySelector('.sheet'), top = old && el.dataset.sig === sig ? old.scrollTop : 0;
   const ty = S.modal.type;
   el.hidden = false;
-  el.innerHTML = `<div class="sheet ${old ? 'still' : ''} ${ty === 'sched' || ty === 'build' || ty === 'lead-view' || ty.startsWith('em-') ? 'wide' : ty === 'week' ? 'wide week' : ''}" role="dialog" aria-modal="true">${ty === 'em-campaign' ? emCampaignSheet() : ty === 'em-settings' ? emSettingsSheet() : ty === 'em-import' ? emImportSheet() : ty === 'em-finder' ? emFinderSheet() : ty === 'lead-view' ? leadSheet() : ty === 'em-setup' ? emSetupSheet() : ty === 'session' ? sessionForm() : ty === 'fresh' ? freshForm() : ty === 'block' ? blockSheet(S.modal.key, S.modal.date) : ty === 'task' ? taskSheet(S.modal.id) : ty === 'mile' ? mileSheet(S.modal.id) : ty === 'stat' ? statSheet(S.modal.id) : ty === 'notif' ? notifSheet() : ty === 'call' ? callSheet() : ty === 'event' ? eventForm() : ty === 'chat' ? chatSheet() : ty === 'assist' ? assistantSheet() : ty === 'sched' ? schedSheet() : ty === 'add' ? addForm() : ty === 'blockedit' ? blockEditForm() : ty === 'catchup' ? catchupSheet() : ty === 'quick' ? quickSheet() : ty === 'build' ? buildSheet() : ty === 'week' ? weekSheet() : leadEditForm()}</div>`;
+  el.innerHTML = `<div class="sheet ${old ? 'still' : ''} ${ty === 'sched' || ty === 'build' || ty === 'lead-view' || ty.startsWith('em-') ? 'wide' : ty === 'week' ? 'wide week' : ''}" role="dialog" aria-modal="true">${ty === 'em-campaign' ? emCampaignSheet() : ty === 'em-settings' ? emSettingsSheet() : ty === 'em-import' ? emImportSheet() : ty === 'em-finder' ? emFinderSheet() : ty === 'em-launch' ? emLaunchSheet() : ty === 'lead-view' ? leadSheet() : ty === 'em-setup' ? emSetupSheet() : ty === 'session' ? sessionForm() : ty === 'fresh' ? freshForm() : ty === 'block' ? blockSheet(S.modal.key, S.modal.date) : ty === 'task' ? taskSheet(S.modal.id) : ty === 'mile' ? mileSheet(S.modal.id) : ty === 'stat' ? statSheet(S.modal.id) : ty === 'notif' ? notifSheet() : ty === 'call' ? callSheet() : ty === 'event' ? eventForm() : ty === 'chat' ? chatSheet() : ty === 'assist' ? assistantSheet() : ty === 'sched' ? schedSheet() : ty === 'add' ? addForm() : ty === 'blockedit' ? blockEditForm() : ty === 'catchup' ? catchupSheet() : ty === 'quick' ? quickSheet() : ty === 'build' ? buildSheet() : ty === 'week' ? weekSheet() : leadEditForm()}</div>`;
   el.dataset.sig = sig;
   if (top) el.querySelector('.sheet').scrollTop = top;
   if (keep) { const n = document.getElementById(keep.id); if (n) { n.focus({preventScroll:true}); try { if (keep.s != null) n.setSelectionRange(keep.s, keep.e); } catch(e) {} } }
@@ -3255,16 +3342,28 @@ function handle(act, el, ev) {
       S.lastUndo = {type:'restore', ops:[{patch:['outreach', 'settings', {finder:{enabled:!on}}]}]};
       toast(on ? (emEngineOk() ? `The finder is on: up to ${f.perDay} new leads a day, ${dollars(f.budget)} a day at most.` : 'The finder is on. It starts once the engine is set up (Engine setup).') : 'The finder is paused. Leads it already found stay.', true); render(); break;
     }
-    case 'em-start': {
-      const s = emSettings(), camps = emCampaigns(), live = camps.filter(liveCampaign);
-      if (!emEngineOk()) { S.modal = {type:'em-setup'}; render(); outreachCheck(true); toast('Set up the engine first. It is what sends the emails.'); break; }
-      if (!String(s.address || '').trim()) { handle('em-settings', el, ev); toast('Add your mailing address first. Every email needs it.'); break; }
-      if (!live.length) { handle('em-review', el, ev); toast('Read and approve a campaign first.'); break; }
-      if (!s.finder.enabled && !emLeads().some(l => ['queued','active'].includes(l.seq.status) && live.some(c => c.id === l.seq.campaign))) { const cold = live.find(c => !c.trigger); S.emImport = null; S.modal = {type:'em-import', campaign:cold ? cold.id : 'auto'}; toast('Add leads to a campaign that is on, or turn on the finder.'); break; }
-      S.confirm = 'em-start'; render(); break;
+    case 'em-start': case 'em-launch': clearDrafts('lx-'); S.confirm = null; S.modal = {type:'em-launch'}; render(); outreachCheck(true); break;
+    // Logan's own tap: approves the two cold campaigns as they read now, saves the address and the finder,
+    // and sets sending to start by itself on the day picked. The engine holds every email until then.
+    case 'lx-go': {
+      const s = emSettings(), ids = LAUNCH_CAMPS.filter(id => (S.data.campaigns || {})[id]);
+      const w = launchWrites({campaigns:S.data.campaigns, settings:outDoc('settings'), ids, address:fval('lx-address'), startOn:String(fval('lx-date')), today:todayISO(), find:Object.fromEntries(LAUNCH_CAMPS.map(id => [id, lxFind(id)])), now:Date.now()});
+      if (w.error === 'address') { toast('Add the mailing address first. A PO box or virtual mailbox works.'); const a = document.getElementById('lx-address'); if (a) a.focus(); break; }
+      if (w.error) { toast('Pick a start day from today on.'); break; }
+      const bad = ids.map(id => [S.data.campaigns[id], emCampaignProblem(emClean(S.data.campaigns[id]))]).find(([, why]) => why);
+      if (bad) { toast(`${bad[0].name}: ${bad[1]}`); break; }
+      Object.entries(w.campaigns).forEach(([id, doc]) => setDoc('campaigns', id, doc));
+      patchDoc('outreach', 'settings', w.settings);
+      S.lastUndo = {type:'restore', ops:w.undo}; clearDrafts('lx-'); closeModal();
+      const eng = S.outEng || {}, ready = eng.fn === 'ok' && (eng.version || 1) >= OUTREACH_V && eng.gmail && eng.gmail.ok;
+      toast(`Approved. Sending starts ${dayWord(w.settings.startOn)} at ${fmtTap(s.start)} in each business's own time.${w.finderOn ? ' The finder starts looking for leads now.' : ''}${ready ? '' : ' Finish Engine setup before then.'}`, true); render(); break;
     }
-    case 'em-start-yes': patchDoc('outreach', 'settings', {enabled:true, enabledAt:Date.now()}); S.confirm = null; toast('Sending is on. The first email goes out within 10 minutes during sending hours.'); render(); break;
-    case 'em-pause': patchDoc('outreach', 'settings', {enabled:false}); S.lastUndo = {type:'restore', ops:[{patch:['outreach', 'settings', {enabled:true}]}]}; toast('Paused. Nothing more goes out until you start again. Replies still get read.', true); render(); break;
+    case 'em-pause': {
+      const cur = outDoc('settings') || {};
+      patchDoc('outreach', 'settings', {enabled:false, autoStart:false, updatedAt:Date.now()});
+      S.lastUndo = {type:'restore', ops:[{patch:['outreach', 'settings', {enabled:!!cur.enabled, autoStart:!!cur.autoStart}]}]};
+      toast('Paused. Nothing more goes out until you start again. Replies still get read.', true); render(); break;
+    }
     case 'goto-email': S.toast = null; renderToast(); setView('email'); break;
     case 'disconnect': if (confirm('Disconnect this device from your Supabase project? You will need to paste the URL and key again.')) { clearConfig(); if (db) db.destroy({wipe:true}); Promise.resolve(supabase && supabase.auth.signOut()).catch(() => {}).then(() => location.reload()); } break;
   }
