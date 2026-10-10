@@ -10,7 +10,7 @@ import { supabase, config as sbConfig, configSource, saveConfig, clearConfig } f
 import { createDb } from './db.js';
 import { parseQuick } from './quickadd.js';
 import { parseDayText, buildDay } from './planday.js';
-import { SEQ_STATUS, DEFAULT_CAMPAIGNS, withDefaults as outSettings, sendingState, launchWrites, composeEmail, segmentOf, parseCSV, importLeads, campaignStats, tzFor, localClock, dailyCap, nextSendDay, upNext, isEmail, SUPPRESS, HOT, LIVE_SEQ, stagePatch, replyPatch, enrollPatch, heatOf, liveCampaign, leadIdFor } from './outreach.js';
+import { SEQ_STATUS, DEFAULT_CAMPAIGNS, wordingUpdates, withDefaults as outSettings, sendingState, launchWrites, composeEmail, segmentOf, parseCSV, importLeads, campaignStats, tzFor, localClock, dailyCap, nextSendDay, upNext, isEmail, SUPPRESS, HOT, LIVE_SEQ, stagePatch, replyPatch, enrollPatch, heatOf, liveCampaign, leadIdFor } from './outreach.js';
 import REMINDERS_FN from '../supabase/functions/reminders/index.ts?raw';
 import CRON_SQL from '../supabase/functions/reminders/cron.sql?raw';
 import ASSISTANT_FN from '../supabase/functions/assistant/index.ts?raw';
@@ -2072,7 +2072,12 @@ let emSeeded = false, emCheckStarted = false, emMigrated = false;
 function maybeSeedOutreach() {
   if (emSeeded || !db || !db.status().loaded || !allLoaded()) return;
   emSeeded = true;
-  for (const [id, c] of Object.entries(DEFAULT_CAMPAIGNS)) if (!(S.data.campaigns || {})[id]) setDoc('campaigns', id, {...clone(c), createdAt:Date.now()});
+  for (const [id, c] of Object.entries(DEFAULT_CAMPAIGNS)) {
+    const stored = (S.data.campaigns || {})[id];
+    if (!stored) { setDoc('campaigns', id, {...clone(c), createdAt:Date.now()}); continue; }
+    const up = wordingUpdates(id, stored);
+    if (up) patchDoc('campaigns', id, {...up, updatedAt:Date.now()});
+  }
   if (!outDoc('settings')) setDoc('outreach', 'settings', {enabled:false, createdAt:Date.now()});
   maybeMigrateProspects();
 }

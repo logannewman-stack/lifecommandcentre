@@ -178,7 +178,7 @@ const FOLLOW_UP_HOME = [
 ];
 const FOLLOW_UP_DESK = [
   { wait: 3, body: 'Hi {greeting},\n\nJust bumping this up in case it got buried. Happy to show you how it would work for {business}, no strings attached.\n\nWould a quick call this week work?' },
-  { wait: 5, body: "Hi {greeting},\n\nI'll stop here so I'm not cluttering your inbox. If you ever want every call answered and more jobs booked at {business}, just reply to this email." },
+  { wait: 5, body: "Hi {greeting},\n\nI'll stop here so I'm not cluttering your inbox. If you ever want every call at {business} answered and booked, just reply to this email." },
 ];
 const EVERYONE = { general: { label: 'Everyone', question: '', features: '' } };
 // Two cold campaigns, each a first email and two follow-ups in the same thread; {question} and {features}
@@ -241,6 +241,22 @@ export const DEFAULT_CAMPAIGNS = {
     segments: EVERYONE,
   },
 };
+// Earlier default wordings, by campaign and step. A stored campaign that still has one of these word for
+// word, and isn't approved yet, gets the current default (wordingUpdates).
+export const OLD_WORDING = {
+  'front-desk': { 2: ["Hi {greeting},\n\nI'll stop here so I'm not cluttering your inbox. If you ever want every call answered and more jobs booked at {business}, just reply to this email."] },
+};
+// The step bodies to bring up to date in a stored campaign you haven't edited or approved: {steps} or null.
+export function wordingUpdates(id, stored) {
+  const old = OLD_WORDING[id], def = DEFAULT_CAMPAIGNS[id];
+  if (!old || !def || !stored || stored.reviewed || !Array.isArray(stored.steps)) return null;
+  let changed = false;
+  const steps = stored.steps.map((st, n) => {
+    if (st && (old[n] || []).includes(st.body) && def.steps[n]) { changed = true; return { ...st, body: def.steps[n].body }; }
+    return st;
+  });
+  return changed ? { steps } : null;
+}
 // Which cold campaign a business fits when you import "by type".
 export const campaignFor = segment => (['dental', 'services'].includes(segment) ? 'front-desk' : 'home-screen');
 export const liveCampaign = c => !!(c && c.status === 'running' && c.reviewed && (c.steps || []).length);
