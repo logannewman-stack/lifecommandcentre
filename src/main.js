@@ -10,19 +10,23 @@ import { supabase, config as sbConfig, configSource, saveConfig, clearConfig } f
 import { createDb } from './db.js';
 import { parseQuick } from './quickadd.js';
 import { parseDayText, buildDay } from './planday.js';
+import { STATUSES, DEFAULT_CAMPAIGNS, withDefaults as outSettings, composeEmail, segmentOf, firstNameFrom, parseCSV, prospectsFromRows, outreachStats, tzFor, localClock, dailyCap, nextSendDay, upNext, isEmail, STATUS_FOR, SUPPRESS } from './outreach.js';
 import REMINDERS_FN from '../supabase/functions/reminders/index.ts?raw';
 import CRON_SQL from '../supabase/functions/reminders/cron.sql?raw';
 import ASSISTANT_FN from '../supabase/functions/assistant/index.ts?raw';
+import OUTREACH_FN from '../supabase/functions/outreach/index.ts?raw';
+import OUTREACH_CRON from '../supabase/functions/outreach/cron.sql?raw';
 
 (() => {
 'use strict';
 
 /* ---------- constants ---------- */
-const COLS = ['config','days','tasks','leads','sessions','dupr','weeks','meta','push','events','chat'];
-const VIEWS = [['today','Today'],['calls','Calls'],['week','Week'],['log','Log'],['plan','Plan']];
+const COLS = ['config','days','tasks','leads','sessions','dupr','weeks','meta','push','events','chat','campaigns','prospects','replies','outreach','suppress'];
+const VIEWS = [['today','Today'],['calls','Calls'],['email','Email'],['week','Week'],['log','Log'],['plan','Plan']];
 const ICONS = {
   today: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="17" height="15.5" rx="2.5"/><path d="M3.5 10h17M8 3v4M16 3v4"/><path d="m9.5 15 2 2 3.5-3.5"/></svg>',
   calls: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4h3.5l1.8 4.5-2.3 1.4a11.5 11.5 0 0 0 6.1 6.1l1.4-2.3L20 15.5V19a2 2 0 0 1-2 2A15 15 0 0 1 3 6a2 2 0 0 1 2-2z"/></svg>',
+  email: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="m3.8 7.2 8.2 6 8.2-6"/></svg>',
   week: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V11M10 20V4M16 20v-6M3 20h18"/></svg>',
   log: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 17l5.5-5.5 4 4L21 7"/><path d="M15 7h6v6"/></svg>',
   plan: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6h12M9 12h12M9 18h12"/><path d="M4 6h.01M4 12h.01M4 18h.01" stroke-width="2.6"/></svg>',
@@ -31,7 +35,7 @@ const APP_VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '
 // The version inside each Edge Function's code. A deployed function reports its own in ?status=1,
 // so the setup sheets can say when Supabase is still running an older copy.
 const fnVersion = src => Number((String(src).match(/FN_VERSION = (\d+)/) || [])[1] || 1);
-const ASSISTANT_V = fnVersion(ASSISTANT_FN), REMINDERS_V = fnVersion(REMINDERS_FN);
+const ASSISTANT_V = fnVersion(ASSISTANT_FN), REMINDERS_V = fnVersion(REMINDERS_FN), OUTREACH_V = fnVersion(OUTREACH_FN);
 const THEMES = ['auto','light','dark'];
 // The Sunday that Fresh start installs when "Sundays are rest days" is on.
 const REST_SUNDAY = [
@@ -84,14 +88,15 @@ const ONEOFF_TAG = {event:'EVENT', task:'TO-DO', gym:'GYM', mobility:'MOBILITY',
 /* ---------- state ---------- */
 const S = {
   dbState:'loading', err:null,
-  data:{config:{},days:{},tasks:{},leads:{},sessions:{},dupr:{},weeks:{},meta:{},push:{},events:{},chat:{}},
+  data:{config:{},days:{},tasks:{},leads:{},sessions:{},dupr:{},weeks:{},meta:{},push:{},events:{},chat:{},campaigns:{},prospects:{},replies:{},outreach:{},suppress:{}},
   got:{},
   view:'today', drafts:{}, openItem:null, editAM:false, editPM:false,
   callFilter:'due', search:'', leadForm:null,
   weekOffset:0, weekDay:null, day:null, modal:null, toast:null, lastUndo:null, confirm:null,
   sync:null, email:'', installEvt:null, installDismissed:undefined, updateApp:null,
   connectBusy:false, connectErr:null, loginBusy:false, loginErr:null, notif:null, notifBusy:false, callMode:null,
-  chatBusy:false, chatErr:null, listening:false, assist:null, swipeKey:null, flash:null
+  chatBusy:false, chatErr:null, listening:false, assist:null, swipeKey:null, flash:null,
+  outEng:null, emFilter:'all', emCamp:'all', emSearch:'', emLimit:40, emReplies:'all', emRLimit:25, emImport:null, emTestBusy:false
 };
 let db = null;
 let theme = 'auto';
@@ -449,6 +454,7 @@ function maybeRollover() {
   if (!db || !allLoaded() || rolling || !cfg().schedule || !db.status().loaded) return;
   maybeAutoFreshStart();
   maybeRestart();
+  maybeSeedOutreach();
   const y = addDays(todayISO(), -1);
   const through = (S.data.meta.rollover || {}).through;
   if (through && through >= y) return;
@@ -514,7 +520,7 @@ function render() {
   else if (S.dbState === 'error') html = `<div class="card empty"><b>Couldn't load your data.</b><br>${esc(S.err || 'Check your connection and try again.')}<div class="btnrow" style="justify-content:center;margin-top:12px"><button class="btn primary" data-act="retry">Try again</button><button class="btn ghost" data-act="signout">Sign out</button></div></div>`;
   else if (!allLoaded()) html = `<div class="skel"><div class="skel-line w40"></div><div class="skel-box"></div><div class="skel-box tall"></div></div>`;
   else if (!cfg().schedule) html = importView();
-  else html = ({today:viewToday, calls:viewCalls, week:viewWeek, log:viewLog, plan:viewPlan})[S.view]();
+  else html = ({today:viewToday, calls:viewCalls, email:viewEmail, week:viewWeek, log:viewLog, plan:viewPlan})[S.view]();
   app.innerHTML = html;
   renderTabs(); renderModal(); renderToast();
 }
@@ -529,8 +535,10 @@ function renderTabs() {
   if (fab) fab.hidden = !(S.dbState === 'ok' && allLoaded() && cfg().schedule);
   if (S.dbState !== 'ok') { document.getElementById('tabs').innerHTML = ''; return; }
   const due = allLoaded() && !isRestDay(todayISO()) ? leadsDue(todayISO()).length : 0;
+  const hot = allLoaded() ? emHot().length : 0;
+  const badge = k => k === 'calls' && due ? `<span class="badge">${due}</span>` : k === 'email' && hot ? `<span class="badge hot" title="Hot replies">${hot}</span>` : '';
   document.getElementById('tabs').innerHTML = VIEWS.map(([k,l]) =>
-    `<button data-act="view" data-v="${k}" class="${S.view === k ? 'on' : ''}" aria-current="${S.view === k ? 'page' : 'false'}">${ICONS[k]}<span>${l}</span>${k === 'calls' && due ? `<span class="badge">${due}</span>` : ''}</button>`).join('');
+    `<button data-act="view" data-v="${k}" class="${S.view === k ? 'on' : ''}" aria-current="${S.view === k ? 'page' : 'false'}">${ICONS[k]}<span>${l}</span>${badge(k)}</button>`).join('');
 }
 
 /* ----- TODAY ----- */
@@ -607,7 +615,7 @@ function tipBanner() {
   if (done) return '';
   const desktop = window.matchMedia && matchMedia('(min-width: 980px)').matches;
   const add = ' <b>+ Add</b> understands plain words, like “Pickleball Thu 6-8am” or “Call Lisa tomorrow”.';
-  return `<div class="tip"><span><b>Tap any block</b> for the story behind it.${desktop ? ` <b>Rest your pointer on a block or a to-do</b> to push it back, reschedule or cancel it.${add} Keys: <kbd>1</kbd>–<kbd>5</kbd> tabs, <kbd>/</kbd> search leads, <kbd>n</kbd> new to-do, <kbd>s</kbd> schedule, <kbd>e</kbd> add, <kbd>c</kbd> start calling, <kbd>a</kbd> ask.` : ` <b>Swipe a block or a to-do left</b> to push it back, reschedule or cancel it, or <b>right</b> to mark it done.${add}`}</span><button class="btn sm ghost" data-act="tip-done">Got it</button></div>`;
+  return `<div class="tip"><span><b>Tap any block</b> for the story behind it.${desktop ? ` <b>Rest your pointer on a block or a to-do</b> to push it back, reschedule or cancel it.${add} Keys: <kbd>1</kbd>–<kbd>6</kbd> tabs, <kbd>/</kbd> search leads, <kbd>n</kbd> new to-do, <kbd>s</kbd> schedule, <kbd>e</kbd> add, <kbd>c</kbd> start calling, <kbd>a</kbd> ask.` : ` <b>Swipe a block or a to-do left</b> to push it back, reschedule or cancel it, or <b>right</b> to mark it done.${add}`}</span><button class="btn sm ghost" data-act="tip-done">Got it</button></div>`;
 }
 function nowCard(items, t) {
   const m = nowMin();
@@ -1332,7 +1340,7 @@ function settingsCard() {
       <div class="btnrow"><button class="btn sm" data-act="export">Download</button>${importControl('btn sm')}</div></div>
     <div class="srow"><div class="lbl">Account<small>${esc(S.email || '')}</small></div>
       <div class="btnrow"><button class="btn sm ghost" data-act="signout">Sign out</button>${configSource === 'device' ? '<button class="btn sm ghost" data-act="disconnect">Disconnect</button>' : ''}</div></div>
-    <div class="meta" style="margin-top:10px">Laptop keys: <span class="kbd">1</span>–<span class="kbd">5</span> tabs · <span class="kbd">/</span> search leads · <span class="kbd">n</span> new to-do · <span class="kbd">c</span> start calling · <span class="kbd">s</span> schedule · <span class="kbd">e</span> add to your plan · <span class="kbd">a</span> ask · <span class="kbd">Esc</span> close</div>
+    <div class="meta" style="margin-top:10px">Laptop keys: <span class="kbd">1</span>–<span class="kbd">6</span> tabs · <span class="kbd">/</span> search leads · <span class="kbd">n</span> new to-do · <span class="kbd">c</span> start calling · <span class="kbd">s</span> schedule · <span class="kbd">e</span> add to your plan · <span class="kbd">a</span> ask · <span class="kbd">Esc</span> close</div>
     <div class="meta" style="margin-top:6px">Version ${esc(APP_VERSION)}${S.updateApp ? ' · <a data-act="update-app">Update ready, tap to reload</a>' : ''}</div>
   </section>`;
 }
@@ -1902,6 +1910,582 @@ function assistantSheet() {
     <div class="btnrow">${st.fn === 'ok' && st.hasKey ? '<button class="btn primary" data-act="ask">Open the assistant</button>' : ''}<span class="meta">Model: ${esc(st.model || 'claude-opus-5-5')}. Each question costs a few cents.</span></div>`;
 }
 
+/* ----- EMAIL: the outreach command center ----- */
+// The engine (supabase/functions/outreach) sends from your Gmail and reads the replies every 10 minutes,
+// on its own. This tab is where you set it up, approve what it says, add contacts and answer replies.
+const outreachUrl = () => sbConfig ? String(sbConfig.url).replace(/\/+$/, '') + '/functions/v1/outreach' : '';
+const EM_HOT = ['interested','question','referral'];
+const EM_LABEL = {interested:['Interested','good'], question:['Question','acc'], referral:['Referral','acc'], not_now:['Not now','warn'], not_interested:['Not interested','bad'], unsubscribe:['Unsubscribed','bad'], bounce:['Bounced','bad'], auto:['Auto-reply',''], other:['Replied','']};
+const EM_LABEL_ORDER = ['interested','question','referral','not_now','other','not_interested','unsubscribe','bounce','auto'];
+const EM_SUP_REASON = {not_interested:'Not interested', unsubscribe:'Asked not to be emailed', bounce:'Bounced'};
+const EM_STATUS_CLS = {hot:'good', active:'acc', queued:'', hold:'warn', done:'', replied:'acc', no:'bad', unsub:'bad', bounced:'bad', paused:'warn'};
+const EM_STATUS_RANK = {hot:0, replied:1, active:2, queued:3, hold:4, paused:5, done:6, no:7, unsub:8, bounced:9};
+const EM_REPLY_GROUPS = [['all','All'], ['hot','Hot',EM_HOT], ['later','Not now',['not_now','other']], ['no','No',['not_interested','unsubscribe']], ['bounced','Bounced',['bounce']], ['auto','Auto-replies',['auto']]];
+const EM_TZS = [['America/Chicago','Central (Iowa)'], ['America/Phoenix','Arizona'], ['America/Denver','Mountain'], ['America/Los_Angeles','Pacific'], ['America/New_York','Eastern']];
+const EM_WHY = {address:'Waiting for your mailing address (Settings).', cap:"Today's limit is reached. More go out on the next sending day.", gap:'Spacing the emails out.', 'no-campaign':'No campaign is on.', 'nothing-due':"Outside sending hours, or everyone is waiting for their next follow-up day.", template:'A campaign email needs fixing before it can send.'};
+// Stand-ins for the preview when you have no contact of that type yet.
+const EM_SAMPLE = {medspa:['Glow Aesthetics','Med spa','Scottsdale','AZ'], wellness:['Desert Drip IV','IV and wellness','Phoenix','AZ'], chiro:['Peak Chiropractic','Chiropractor','Ankeny','IA'], club:['Prairie Pickleball Club','Pickleball club','Des Moines','IA'], studio:['Core Pilates','Pilates studio','Scottsdale','AZ'], services:['Cool Air HVAC','HVAC','Mesa','AZ'], dental:['Bright Smile Dental','Dentist','West Des Moines','IA'], general:['Main Street Studio','Local business','Ames','IA']};
+const EM_FILTERS = [
+  ['all','All', () => true],
+  ['look','Needs a look', p => emStuck(p) || (p.status === 'paused' && p.pausedWhy === 'failed')],
+  ['hot','Hot', p => p.status === 'hot'],
+  ['replied','Replied', p => p.status === 'replied'],
+  ['active','In sequence', p => p.status === 'active'],
+  ['queued','Up next', p => p.status === 'queued'],
+  ['hold','Check first', p => p.status === 'hold'],
+  ['paused','Paused', p => p.status === 'paused'],
+  ['done','Finished', p => p.status === 'done'],
+  ['no','Not interested', p => ['no','unsub'].includes(p.status)],
+  ['bounced','Bounced', p => p.status === 'bounced'],
+];
+const outDoc = id => (S.data.outreach || {})[id] || null;
+const emSettings = () => outSettings(outDoc('settings'));
+const emState = () => outDoc('state') || {};
+const emCampaigns = () => Object.entries(S.data.campaigns || {}).filter(([, c]) => c && c.name).map(([id, c]) => ({id, ...c})).sort((a, b) => (a.order || 9) - (b.order || 9) || String(a.name).localeCompare(String(b.name)));
+const emProspects = () => Object.entries(S.data.prospects || {}).filter(([, p]) => p && p.email).map(([id, p]) => ({id, ...p}));
+const emReplies = () => Object.entries(S.data.replies || {}).filter(([, r]) => r && r.at).map(([id, r]) => ({id, ...r})).sort((a, b) => String(b.at).localeCompare(String(a.at)));
+const emSuppressed = () => new Set(Object.keys(S.data.suppress || {}).map(e => e.toLowerCase()));
+const emLive = c => !!(c && c.status === 'running' && c.reviewed);
+const emHot = () => emReplies().filter(r => EM_HOT.includes(r.label) && !r.handled);
+const emStuck = p => p.sendingStep != null && !!p.sendingAt && Date.now() - Date.parse(p.sendingAt) > 15 * 60000;
+const emGmail = () => (S.outEng && S.outEng.gmail && S.outEng.gmail.email) || emState().gmail || '';
+const emEngineOk = () => !!((S.outEng && S.outEng.fn === 'ok' && S.outEng.gmail && S.outEng.gmail.ok) || emState().gmail);
+const gmailThread = id => `https://mail.google.com/mail/${emGmail() ? '?authuser=' + encodeURIComponent(emGmail()) : 'u/0/'}#all/${encodeURIComponent(id)}`;
+const emHref = u => /^https?:\/\//i.test(String(u || '')) ? String(u) : 'https://' + String(u || '');
+const emShortUrl = u => String(u || '').replace(/^https?:\/\/(www\.)?/i, '').replace(/\/$/, '');
+const emWhere = p => [p.city, p.state].filter(Boolean).join(', ');
+const emStepName = (n, len) => n === 0 ? 'First email' : n >= (len || 3) - 1 ? 'Last follow-up' : `Follow-up ${n}`;
+const emPill = p => `<span class="pill ${EM_STATUS_CLS[p.status] || ''}">${esc(STATUSES[p.status] || p.status || '')}</span>`;
+const emLabelPill = l => { const x = EM_LABEL[l] || EM_LABEL.other; return `<span class="pill ${x[1]}">${x[0]}</span>`; };
+const emSegLabel = (cid, k) => ((((S.data.campaigns || {})[cid] || {}).segments || {})[k] || {}).label || k;
+const emReplyWord = n => `${n} ${n === 1 ? 'reply' : 'replies'}`;
+const emWhen = ts => { const d = new Date(ts); return isNaN(d) ? '' : d.toLocaleString('en-US', {weekday:'short', month:'short', day:'numeric', hour:'numeric', minute:'2-digit'}); };
+function emAgo(ts) {
+  const at = typeof ts === 'number' ? ts : Date.parse(ts || '');
+  if (!Number.isFinite(at)) return '';
+  const m = Math.round((Date.now() - at) / 60000);
+  if (m < 1) return 'just now';
+  if (m < 60) return `${m} min ago`;
+  if (m < 24 * 60) return `${Math.round(m / 60)} h ago`;
+  return new Date(at).toLocaleDateString('en-US', {weekday:'short', month:'short', day:'numeric'});
+}
+// "Mon–Sat" for a run of days, otherwise the usual list.
+function emDays(days) {
+  const idx = WEEK_ORDER.map((d, i) => days.includes(d) ? i : -1).filter(i => i >= 0);
+  if (idx.length === 7) return 'every day';
+  if (idx.length > 2 && idx[idx.length - 1] - idx[0] === idx.length - 1) return `${WEEK_ORDER[idx[0]]}–${WEEK_ORDER[idx[idx.length - 1]]}`;
+  return daysLabel(days);
+}
+function emProgress(p, c) {
+  const len = ((c && c.steps) || []).length || 3, step = Number(p.step) || 0;
+  if (p.sendingStep != null) return emStuck(p) ? 'Check Gmail' : 'Sending now';
+  if (['hot','replied','no','unsub','bounced'].includes(p.status)) return p.replyAt ? emAgo(p.replyAt) : (step ? `${step} of ${len} sent` : '');
+  if (p.status === 'done') return `All ${len} sent`;
+  if (!step) return p.status === 'hold' ? 'Waiting for you' : 'Not emailed yet';
+  return `${step} of ${len} sent${p.nextOn && p.status === 'active' ? ' · next ' + (p.nextOn <= todayISO() ? 'today' : fmtShort(p.nextOn)) : ''}`;
+}
+// The status a paused or wrongly sorted contact goes back to: queued, or in sequence with a follow-up day.
+function emResume(p) {
+  const c = (S.data.campaigns || {})[p.campaign] || {}, len = (c.steps || []).length || 3, step = Number(p.step) || 0, t = todayISO();
+  if (step >= len) return {status:'done', nextOn:null};
+  if (!step) return {status:'queued'};
+  return {status:'active', nextOn:p.nextOn && p.nextOn >= t ? p.nextOn : t};
+}
+let emSeeded = false, emCheckStarted = false;
+// The two campaigns and the settings document, written once when they are missing. The engine
+// only works for an account that has settings, and it never sends while they say paused.
+function maybeSeedOutreach() {
+  if (emSeeded || !db || !db.status().loaded || !allLoaded()) return;
+  emSeeded = true;
+  for (const [id, c] of Object.entries(DEFAULT_CAMPAIGNS)) if (!(S.data.campaigns || {})[id]) setDoc('campaigns', id, {...clone(c), createdAt:Date.now()});
+  if (!outDoc('settings')) setDoc('outreach', 'settings', {enabled:false, createdAt:Date.now()});
+}
+async function outreachCheck(quiet) {
+  if (!outreachUrl()) return;
+  if (!quiet) { S.outEng = {...(S.outEng || {}), checking:true}; render(); }
+  let res;
+  try {
+    const r = await fetch(outreachUrl() + '?status=1');
+    if (r.status === 404) res = {fn:'missing'};
+    else if (r.status === 401 || r.status === 403) res = {fn:'error', msg:'The function is there but still checks for a login. Open its settings and turn off "Verify JWT".'};
+    else if (!r.ok) res = {fn:'error', msg:`The function answered ${r.status}.`};
+    else { const j = await r.json(); res = {fn:'ok', version:Number(j.version) || 1, gmail:j.gmail || {}, hasKey:!!j.hasKey, lastRun:j.lastRun || null, lastError:j.lastError || null}; }
+  } catch (e) { res = {fn:'error', msg:"Couldn't reach the function. Check your connection and that it is deployed."}; }
+  S.outEng = {...res, at:Date.now()};
+  if (quiet) scheduleRender(); else render();
+}
+// Waits until the given writes reached Supabase, so the engine reads what you just saved.
+async function emSettle(paths) {
+  try { await Promise.all(paths.map(p => queues[p]).filter(Boolean)); } catch (e) {}
+  for (let i = 0; i < 25 && db && db.status().pending; i++) { try { await db.flush(); } catch (e) {} await new Promise(r => setTimeout(r, 200)); }
+}
+async function emTest(id) {
+  if (S.emTestBusy) return;
+  S.emTestBusy = true; render();
+  try {
+    if (!outreachUrl()) throw new Error('Connect your Supabase project first.');
+    await emSettle(['campaigns/' + id, 'outreach/settings']);
+    const {data} = await supabase.auth.getSession();
+    const token = data && data.session && data.session.access_token;
+    if (!token) throw new Error('Sign out and back in, then try again.');
+    const r = await fetch(outreachUrl() + '?test=1&campaign=' + encodeURIComponent(id), {method:'POST', headers:{'Authorization':'Bearer ' + token}});
+    if (r.status === 404) throw new Error("The email engine isn't set up yet. Open Engine setup on the Email tab.");
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) throw new Error(j.error || `The engine answered ${r.status}.`);
+    toast(`Test sent to ${j.to}. It's in your inbox now.${j.missing && j.missing.length ? ` Fill in ${j.missing.join(', ')} before it can go out.` : ''}`);
+  } catch (e) { toast((e && e.message) || "Couldn't send the test."); }
+  S.emTestBusy = false; render();
+}
+
+/* the campaign being edited: what is saved plus what you typed */
+function emDraftCampaign(id) {
+  const c = clone((S.data.campaigns || {})[id] || DEFAULT_CAMPAIGNS[id] || {steps:[], segments:{}});
+  const dv = (k, def) => S.drafts[k] !== undefined ? S.drafts[k] : def;
+  c.name = dv('ec-name', c.name || ''); c.offer = dv('ec-offer', c.offer || ''); c.price = dv('ec-price', c.price || ''); c.cap = dv('ec-cap', c.cap ?? 30);
+  (c.steps || []).forEach((st, n) => {
+    if (n === 0) st.subject = dv('ec-s0-subject', st.subject || '');
+    else st.wait = dv(`ec-s${n}-wait`, st.wait ?? 3);
+    st.body = dv(`ec-s${n}-body`, st.body || '');
+  });
+  for (const [k, g] of Object.entries(c.segments || {})) { g.question = dv(`ec-g-${k}-question`, g.question || ''); g.features = dv(`ec-g-${k}-features`, g.features || ''); }
+  return c;
+}
+const emEditable = c => JSON.stringify([c.name || '', c.offer || '', c.price || '', Number(c.cap) || 0, (c.steps || []).map(s => [s.subject || '', s.body || '', Number(s.wait) || 0]), Object.entries(c.segments || {}).map(([k, g]) => [k, g.question || '', g.features || ''])]);
+function emClean(c) {
+  const out = clone(c);
+  out.name = String(out.name || '').trim() || 'Campaign';
+  out.offer = String(out.offer || '').trim(); out.price = String(out.price || '').trim();
+  out.cap = Math.max(1, Math.min(200, Math.round(Number(out.cap)) || 30));
+  (out.steps || []).forEach((s, n) => {
+    if (n === 0) s.subject = String(s.subject || '').replace(/[\r\n]+/g, ' ').trim();
+    else s.wait = Math.max(1, Math.min(30, Math.round(Number(s.wait)) || 3));
+    s.body = String(s.body || '').replace(/\r/g, '').trim();
+  });
+  for (const g of Object.values(out.segments || {})) { g.question = String(g.question || '').trim(); g.features = String(g.features || '').trim(); }
+  return out;
+}
+// What would stop a campaign from sending: an empty email, or a {fill-in} nothing fills.
+function emCampaignProblem(c) {
+  const steps = c.steps || [];
+  if (!steps.length) return 'This campaign has no emails.';
+  if (!String(steps[0].subject || '').trim()) return 'Add a subject to the first email.';
+  for (let n = 0; n < steps.length; n++) {
+    if (!String(steps[n].body || '').trim()) return `${emStepName(n, steps.length)} is empty.`;
+    for (const k of Object.keys(c.segments || {general:{}})) {
+      const mail = composeEmail(emSample(null, k), c, emSettings(), n);
+      if (mail && mail.missing.length) return `${emStepName(n, steps.length)}: fill in or take out ${mail.missing.join(', ')}.`;
+    }
+  }
+  return '';
+}
+function emSample(cid, seg) {
+  const real = cid ? emProspects().find(p => p.campaign === cid && (p.segment || segmentOf(p.type)) === seg) : null;
+  if (real) return {...real, segment:seg, firstName:real.firstName || firstNameFrom(real.email)};
+  const x = EM_SAMPLE[seg] || EM_SAMPLE.general;
+  return {business:x[0], type:x[1], city:x[2], state:x[3], email:'hello@example.com', segment:seg, firstName:''};
+}
+function emMailHtml(p, c, step) {
+  const s = emSettings(), mail = composeEmail(p, c, s, step);
+  if (!mail) return '<div class="meta">There is no email at that step.</div>';
+  return `<div class="mail">
+    <div class="mail-h"><div><span>From</span>${esc(s.fromName)} &lt;${esc(emGmail() || 'logan@logandnewman.com')}&gt;</div><div><span>To</span>${esc(p.email || '')}</div><div><span>Subject</span><b>${esc(mail.subject)}</b></div></div>
+    <div class="mail-b">${esc(mail.text)}</div>
+    ${mail.missing.length ? `<div class="err">Nothing fills ${esc(mail.missing.join(', '))}. Fix the spelling or take it out.</div>` : ''}
+    ${String(s.address || '').trim() ? '' : '<div class="mail-note">Your mailing address goes under your website. Add it in Settings before you start.</div>'}
+  </div>`;
+}
+function emPreviewHtml() {
+  const m = S.modal; if (!m || m.type !== 'em-campaign') return '';
+  const c = emDraftCampaign(m.id), steps = c.steps || [], n = Math.min(m.n || 0, Math.max(0, steps.length - 1));
+  const keys = Object.keys(c.segments || {}), seg = keys.includes(m.seg) ? m.seg : (keys[0] || 'general');
+  return emMailHtml(emSample(m.id, seg), c, n);
+}
+
+/* ----- the tab ----- */
+function viewEmail() {
+  if (!S.outEng && !emCheckStarted && outreachUrl()) { emCheckStarted = true; setTimeout(() => outreachCheck(true), 0); }
+  const s = emSettings(), st = emState(), camps = emCampaigns(), all = emProspects();
+  const main = [emHero(s, st, camps, all), emChecklist(s, camps, all), emHotCard(), emContactsCard(all, camps), emRepliesCard()];
+  const side = [emResults(st, all), ...camps.map(c => emCampaignCard(c, all, st, s)), emUpNext(s, st, camps)];
+  return `<div class="two"><div class="main">${main.join('')}</div><div class="side">${side.join('')}</div></div>`;
+}
+function emHero(s, st, camps, all) {
+  const now = new Date(), today = localClock(s.tz, now).date, eng = S.outEng || {};
+  const cap = dailyCap(s, today), sent = st.today && st.today.date === today ? (st.today.sent || 0) : 0;
+  const live = camps.filter(emLive), engineOk = emEngineOk(), gmail = emGmail();
+  const waiting = all.filter(p => ['queued','active'].includes(p.status) && live.some(c => c.id === p.campaign));
+  const zones = [...new Set(waiting.map(p => tzFor(p, s)))];
+  const clocks = zones.map(z => localClock(z, now));
+  const open = clocks.some(c => s.days.includes(c.dow) && c.minutes >= toMin(s.start) && c.minutes < toMin(s.end));
+  const later = clocks.some(c => s.days.includes(c.dow) && c.minutes < toMin(s.start));
+  const back = nextSendDay(addDays(todayISO(), 1), s.days);
+  let dot = 'warn', title, sub;
+  if (!engineOk) { dot = ''; title = 'Set up the engine'; sub = 'A one-time setup of about 15 minutes. After that, emails go out and replies get read on their own, even with this app closed.'; }
+  else if (!s.enabled) { title = 'Paused'; sub = 'Nothing goes out until you tap Start sending.'; }
+  else if (!String(s.address || '').trim()) { title = 'Waiting for your address'; sub = 'Add your mailing address in Settings. Every email needs it.'; }
+  else if (!live.length) { title = 'No campaign is on'; sub = 'Read and approve a campaign to turn it on.'; }
+  else if (!waiting.length) { title = 'Everyone has been emailed'; sub = 'Add more contacts to keep it going. Replies still get read.'; }
+  else if (sent >= cap) { dot = 'live'; title = 'Done for today'; sub = `${sent} sent, today's limit. Back ${dayWord(back)} at ${fmtTap(s.start)} their time.`; }
+  else if (open) { dot = 'live on'; title = 'Sending'; sub = `One email at a time, at least ${s.gap} minutes apart, until ${fmtTap(s.end)} their time.`; }
+  else if (later) { dot = 'live'; title = 'Starting soon'; sub = `The first email goes out at ${fmtTap(s.start)} their time.`; }
+  else { dot = 'live'; title = sent ? 'Done for today' : 'Off right now'; sub = `Back ${dayWord(back)} at ${fmtTap(s.start)} their time.`; }
+  const outdated = (eng.fn === 'ok' && (eng.version || 1) < OUTREACH_V) || (st.version && st.version < OUTREACH_V);
+  const ranMin = st.lastRun ? (Date.now() - Date.parse(st.lastRun)) / 60000 : null;
+  const alerts = [
+    st.lastError ? `<div class="err"><b>The engine hit a problem${st.lastRun ? ' ' + esc(emAgo(st.lastRun)) : ''}:</b> ${esc(st.lastError)}</div>` : '',
+    outdated ? '<div class="warnbox">Supabase is running an older copy of the engine. Open Engine setup, copy the new code and deploy it.</div>' : '',
+    s.enabled && engineOk && ranMin !== null && ranMin > 25 ? `<div class="warnbox">The engine last ran ${esc(emAgo(st.lastRun))}. Check that its cron job is on (Engine setup, step 6).</div>` : '',
+  ].join('');
+  const confirmBox = S.confirm === 'em-start' ? `<div class="confirmbox"><b>Start sending?</b><div class="meta">Up to ${cap} emails today from ${esc(gmail || 'your Gmail')}, at least ${s.gap} minutes apart, ${fmtTap(s.start)} to ${fmtTap(s.end)} in each business's own time, ${esc(emDays(s.days))}. Follow-ups go in the same thread. Anyone who replies gets no more emails.</div><div class="btnrow"><button class="btn primary" data-act="em-start-yes">Yes, start</button><button class="btn ghost" data-act="confirm" data-c="">Not yet</button></div></div>` : '';
+  const facts = [gmail ? `From <b>${esc(gmail)}</b>` : '', st.lastRun ? `Checked ${esc(emAgo(st.lastRun))}` : '', engineOk ? (s.startedOn && cap < (Number(s.capMax) || 50) ? `Warming up: ${cap} a day now, up to ${s.capMax}` : `${cap} a day`) : ''].filter(Boolean);
+  return `<section class="card emhero ord-1">
+    <div class="emhero-top"><div class="min0"><div class="eyebrow">Email command center</div><div class="emst"><i class="emdot ${dot}" aria-hidden="true"></i><b>${esc(title)}</b></div><div class="meta">${esc(sub)}</div></div>
+      ${s.enabled ? '<button class="btn" data-act="em-pause">Pause</button>' : '<button class="btn primary" data-act="em-start">Start sending</button>'}</div>
+    ${engineOk ? `<div class="progress"><div class="bar ${sent >= cap ? 'good' : ''}"><i style="width:${Math.min(100, Math.round(sent / Math.max(1, cap) * 100))}%"></i></div><span class="meta mono">${sent}/${cap} today</span></div>` : ''}
+    ${facts.length ? `<div class="meta">${facts.join(' · ')}</div>` : ''}
+    ${confirmBox}${alerts}
+    <div class="btnrow"><button class="btn sm" data-act="em-import">Add contacts</button><button class="btn sm" data-act="em-settings">Settings</button><button class="btn sm ghost" data-act="em-setup">Engine setup</button></div>
+  </section>`;
+}
+function emChecklist(s, camps, all) {
+  const items = [
+    [emEngineOk(), 'Connect your Gmail', 'The engine runs in your Supabase project and sends from your own inbox.', 'em-setup', 'Set it up'],
+    [!!String(s.address || '').trim(), 'Add your mailing address', 'The law requires it at the bottom of every sales email.', 'em-settings', 'Add it'],
+    [all.length > 0, 'Add your contacts', 'Choose outreach-list.csv, or any spreadsheet with emails.', 'em-import', 'Add contacts'],
+    [camps.some(c => c.reviewed), 'Read and approve the emails', 'Nothing goes out until you approve the wording.', 'em-review', 'Read them'],
+    [!!s.enabled && camps.some(emLive), 'Start sending', `${s.capStart} a day to start, a few more each day, ${emDays(s.days)}.`, 'em-start', 'Start'],
+  ];
+  const done = items.filter(x => x[0]).length, first = items.findIndex(x => !x[0]);
+  if (done === items.length) return '';
+  return `<section class="card ord-2"><div class="card-h"><h2>Get it running</h2><span class="meta">${done} of ${items.length} done</span></div>
+    ${items.map(([ok, title, body, act, label], n) => `<div class="step ${ok ? 'ok' : ''}"><div class="num">${ok ? '✓' : n + 1}</div><div class="min0 stepline"><div class="min0"><b>${title}</b><div class="meta">${esc(body)}</div></div>${ok ? '' : `<button class="btn sm ${n === first ? 'primary' : ''}" data-act="${act}">${label}</button>`}</div></div>`).join('')}
+  </section>`;
+}
+function emHotCard() {
+  const hot = emHot(), any = Object.keys(S.data.replies || {}).length;
+  return `<section class="card hotcard ord-3"><div class="card-h"><h2>Hot replies</h2><span class="meta">${hot.length ? `${hot.length} to answer` : 'All caught up'}</span></div>
+    ${hot.length ? hot.map(emHotRow).join('') : `<div class="meta">${any ? 'Every hot reply is handled. New ones show up here, get starred in Gmail and ping your phone.' : 'When someone says yes, asks a question or points you to the right person, it shows up here, gets starred in Gmail and pings your phone.'}</div>`}
+  </section>`;
+}
+function emHotRow(r) {
+  const p = (S.data.prospects || {})[r.prospect] || {}, tel = String(p.phone || '').replace(/[^\d+]/g, '');
+  return `<article class="hot">
+    <div class="hot-h"><button class="linkish" data-act="em-contact" data-id="${esc(r.prospect)}">${esc(r.business || p.business || r.email || 'Someone')}</button>${emLabelPill(r.label)}<span class="meta">${esc(emAgo(r.at))}${r.forwarded ? ' · forwarded' : ''}</span></div>
+    ${r.summary ? `<div class="sum">${esc(r.summary)}</div>` : ''}
+    <div class="quote">${esc(r.text || r.snippet || '')}</div>
+    ${r.next ? `<div class="meta"><b>Next:</b> ${esc(r.next)}</div>` : ''}
+    <div class="btnrow">${r.threadId ? `<a class="btn sm primary" href="${esc(gmailThread(r.threadId))}" target="_blank" rel="noopener">Reply in Gmail</a>` : ''}${tel ? `<a class="btn sm" href="tel:${esc(tel)}">Call</a>` : ''}${p.pipelined && p.leadId && S.data.leads[p.leadId] ? `<button class="btn sm" data-act="lead-edit" data-id="${esc(p.leadId)}">In your pipeline</button>` : `<button class="btn sm goodb" data-act="em-lead" data-id="${esc(r.prospect)}" data-reply="${esc(r.id)}">Add to pipeline</button>`}<button class="btn sm ghost" data-act="em-done" data-id="${esc(r.id)}">Done</button></div>
+  </article>`;
+}
+function emRow(p, showCamp) {
+  const c = (S.data.campaigns || {})[p.campaign] || {};
+  return `<button class="erow" data-act="em-contact" data-id="${esc(p.id)}"><div class="min0"><b>${esc(p.business || p.email)}</b><div class="meta">${esc([showCamp ? c.name : '', p.email, emWhere(p)].filter(Boolean).join(' · '))}</div></div><div class="erow-r">${emPill(p)}<span class="meta">${esc(emProgress(p, c))}</span></div></button>`;
+}
+function emContactsCard(all, camps) {
+  const q = S.emSearch.trim().toLowerCase(), cf = camps.some(c => c.id === S.emCamp) ? S.emCamp : 'all';
+  const inCamp = cf === 'all' ? all : all.filter(p => p.campaign === cf);
+  const counts = Object.fromEntries(EM_FILTERS.map(([k, , f]) => [k, inCamp.filter(f).length]));
+  const f = EM_FILTERS.some(x => x[0] === S.emFilter) && (counts[S.emFilter] || S.emFilter === 'all') ? S.emFilter : 'all';
+  const test = EM_FILTERS.find(x => x[0] === f)[2];
+  let list = inCamp.filter(test);
+  if (q) list = list.filter(p => [p.business, p.email, p.city, p.state, p.type, p.firstName].join(' ').toLowerCase().includes(q));
+  list.sort((a, b) => (EM_STATUS_RANK[a.status] ?? 9) - (EM_STATUS_RANK[b.status] ?? 9) || String(b.replyAt || '').localeCompare(String(a.replyAt || '')) || String(a.nextOn || '').localeCompare(String(b.nextOn || '')) || (a.createdAt || 0) - (b.createdAt || 0) || String(a.business || '').localeCompare(String(b.business || '')));
+  const lim = S.emLimit || 40, n = list.length;
+  const bulk = f === 'hold' && n ? `<button class="btn sm primary" data-act="em-bulk" data-op="queue">Queue all ${n}</button>`
+    : f === 'queued' && n ? `<button class="btn sm" data-act="em-bulk" data-op="pause">Pause all ${n}</button>`
+    : f === 'paused' && n ? `<button class="btn sm" data-act="em-bulk" data-op="resume">Resume all ${n}</button>` : '';
+  const usedCamps = camps.filter(c => all.some(p => p.campaign === c.id));
+  return `<section class="card ord-7" id="em-contacts"><div class="card-h"><h2>Contacts</h2><div class="btnrow"><span class="meta">${all.length}</span><button class="btn sm" data-act="em-import">Add</button></div></div>
+    ${all.length ? `
+    ${usedCamps.length > 1 ? `<div class="seg scope emcamps">${[['all','Both'], ...usedCamps.map(c => [c.id, c.name])].map(([k, l]) => `<button type="button" class="${cf === k ? 'on' : ''}" data-act="em-camp-filter" data-id="${esc(k)}">${esc(l)}</button>`).join('')}</div>` : ''}
+    <input class="in" id="em-search" placeholder="Search businesses, emails, cities" value="${esc(S.emSearch)}" autocomplete="off">
+    <div class="chips">${EM_FILTERS.filter(([k]) => k === 'all' || counts[k]).map(([k, l]) => `<button class="chip ${f === k ? 'on' : ''} ${k === 'look' ? 'warnchip' : ''}" data-act="em-filter" data-f="${k}">${l} ${counts[k]}</button>`).join('')}</div>
+    ${f === 'hold' ? '<div class="meta">These addresses were harder to confirm. Open one to see where it was found, then queue it, or queue them all.</div>' : ''}
+    ${f === 'look' ? '<div class="meta">Gmail refused these, or a send started and never finished. Open each one to sort it out.</div>' : ''}
+    ${bulk ? `<div class="btnrow">${bulk}</div>` : ''}
+    <div class="elist">${list.slice(0, lim).map(p => emRow(p, cf === 'all' && usedCamps.length > 1)).join('') || `<div class="meta" style="padding:10px 0">${q ? 'No contacts match that search.' : 'Nobody here.'}</div>`}</div>
+    ${n > lim ? `<button class="btn sm ghost" data-act="em-more">Show ${Math.min(60, n - lim)} more of ${n - lim}</button>` : ''}`
+    : '<div class="meta">No contacts yet. Add the list from Claude (outreach-list.csv) or any spreadsheet with business names and emails.</div><div class="btnrow" style="margin-top:8px"><button class="btn primary" data-act="em-import">Add contacts</button></div>'}
+  </section>`;
+}
+function emRepliesCard() {
+  const all = emReplies();
+  if (!all.length) return '';
+  const f = EM_REPLY_GROUPS.some(g => g[0] === S.emReplies) ? S.emReplies : 'all', grp = EM_REPLY_GROUPS.find(g => g[0] === f);
+  const list = grp[2] ? all.filter(r => grp[2].includes(r.label)) : all, lim = S.emRLimit || 25;
+  return `<section class="card ord-8"><div class="card-h"><h2>Every reply</h2><span class="meta">${emReplyWord(all.length)}</span></div>
+    <div class="chips">${EM_REPLY_GROUPS.map(([k, l, labels]) => { const n = labels ? all.filter(r => labels.includes(r.label)).length : all.length; return n || k === 'all' ? `<button class="chip ${f === k ? 'on' : ''}" data-act="em-rfilter" data-f="${k}">${l} ${n}</button>` : ''; }).join('')}</div>
+    <div class="elist">${list.slice(0, lim).map(r => `<button class="erow" data-act="em-contact" data-id="${esc(r.prospect)}"><div class="min0"><b>${esc(r.business || r.email || r.from || '')}</b><div class="meta clamp1">${esc(r.summary || r.snippet || r.text || '')}</div></div><div class="erow-r">${emLabelPill(r.label)}<span class="meta">${esc(emAgo(r.at))}</span></div></button>`).join('') || '<div class="meta" style="padding:10px 0">None of these.</div>'}</div>
+    ${list.length > lim ? `<button class="btn sm ghost" data-act="em-rmore">Show more</button>` : ''}
+  </section>`;
+}
+function emResults(st, all) {
+  const k = outreachStats(Object.fromEntries(all.map(p => [p.id, p])));
+  const t = todayISO(), days = [...Array(14)].map((_, i) => addDays(t, i - 13)), sentBy = {}, repBy = {};
+  all.forEach(p => (p.sent || []).forEach(x => { const d = x && x.at ? iso(new Date(x.at)) : ''; if (d) sentBy[d] = (sentBy[d] || 0) + 1; }));
+  emReplies().forEach(r => { if (r.label === 'auto' || r.label === 'bounce') return; const d = iso(new Date(r.at)); repBy[d] = (repBy[d] || 0) + 1; });
+  const max = Math.max(1, ...days.map(d => sentBy[d] || 0)), any = days.some(d => sentBy[d] || repBy[d]);
+  return `<section class="card ord-4"><div class="card-h"><h2>Results</h2><span class="meta">All campaigns</span></div>
+    <div class="auto">
+      <div><b>${k.emailed}</b><span>businesses emailed</span></div>
+      <div><b>${k.sent}</b><span>emails sent</span></div>
+      <div><b>${k.answered}</b><span>replied</span></div>
+      <div class="${k.hot ? 'hotnum' : ''}"><b>${k.hot}</b><span>hot</span></div>
+      <div><b>${k.rate}%</b><span>reply rate</span></div>
+      <div><b>${(k.by.queued || 0) + (k.by.active || 0)}</b><span>still in line</span></div>
+    </div>
+    ${any ? `<div class="embars" role="img" aria-label="Emails sent each day for the last two weeks">${days.map(d => `<div class="${d === t ? 'today' : ''}" title="${esc(fmtDay(d))}: ${sentBy[d] || 0} sent, ${emReplyWord(repBy[d] || 0)}"><i style="height:${Math.round((sentBy[d] || 0) / max * 100)}%"></i>${repBy[d] ? `<em>${repBy[d]}</em>` : ''}</div>`).join('')}</div>
+    <div class="meta">Emails sent each day, the last two weeks. Green numbers are replies.</div>` : ''}
+  </section>`;
+}
+function emCampaignCard(c, all, st, s) {
+  const mine = all.filter(p => p.campaign === c.id), k = outreachStats(Object.fromEntries(mine.map(p => [p.id, p])));
+  const today = st.today && st.today.date === localClock(s.tz).date ? ((st.today.by || {})[c.id] || 0) : 0;
+  const pct = k.total ? Math.round(k.emailed / k.total * 100) : 0;
+  const state = emLive(c) ? ['On', 'good'] : c.reviewed ? ['Paused', 'warn'] : ['Needs your OK', 'warn'];
+  return `<section class="card emc ord-5"><div class="card-h"><h2>${esc(c.name)}</h2><span class="pill ${state[1]}">${state[0]}</span></div>
+    ${c.offer ? `<div class="meta emc-offer">${esc(c.offer)}</div>` : ''}
+    <div class="emc-n"><span><b>${k.total}</b> contacts</span><span><b>${k.emailed}</b> emailed</span><span><b>${k.answered}</b> replied</span><span class="${k.hot ? 'hotnum' : ''}"><b>${k.hot}</b> hot</span></div>
+    ${k.total ? `<div class="progress"><div class="bar"><i style="width:${pct}%"></i></div><span class="meta mono">${today}/${c.cap || 30} today</span></div>` : ''}
+    <div class="btnrow">
+      <button class="btn sm ${c.reviewed ? '' : 'primary'}" data-act="em-campaign" data-id="${esc(c.id)}">${c.reviewed ? 'Edit the emails' : 'Read and approve'}</button>
+      ${c.reviewed ? `<button class="btn sm" data-act="em-camp-toggle" data-id="${esc(c.id)}">${emLive(c) ? 'Pause' : 'Turn on'}</button>` : ''}
+      <button class="btn sm ghost" data-act="em-import" data-campaign="${esc(c.id)}">Add contacts</button>
+      ${k.total ? `<button class="btn sm ghost" data-act="em-camp-filter" data-id="${esc(c.id)}" data-go="1">Contacts</button>` : ''}
+    </div></section>`;
+}
+function emUpNext(s, st, camps) {
+  const list = upNext(S.data.prospects, S.data.campaigns, s, new Date(), emSuppressed());
+  const ready = list.filter(x => x.ready).length;
+  const why = !s.enabled ? 'Sending is paused, so this is what goes out once you start.' : EM_WHY[st.lastWhy] || '';
+  return `<section class="card ord-6"><div class="card-h"><h2>Up next</h2><span class="meta">${ready} ready</span></div>
+    ${why && list.length ? `<div class="meta" style="margin-bottom:4px">${esc(why)}</div>` : ''}
+    ${list.length ? `<div class="elist">${list.slice(0, 6).map(x => { const c = (S.data.campaigns || {})[x.campaign] || {}; return `<button class="erow" data-act="em-contact" data-id="${esc(x.id)}"><div class="min0"><b>${esc(x.p.business || x.p.email)}</b><div class="meta">${esc(emStepName(x.step, (c.steps || []).length))} · ${esc(c.name || '')}</div></div><span class="meta">${x.ready ? (x.step ? 'due now' : 'in line') : esc(fmtDay(x.due))}</span></button>`; }).join('')}</div>${list.length > 6 ? `<div class="meta" style="margin-top:6px">and ${list.length - 6} more</div>` : ''}`
+      : `<div class="meta">${camps.some(emLive) ? 'Nobody is waiting. Add contacts to keep it going.' : 'Approve a campaign and its contacts line up here.'}</div>`}
+  </section>`;
+}
+
+/* ----- sheets ----- */
+function emCampaignSheet() {
+  const m = S.modal, id = m.id, stored = (S.data.campaigns || {})[id];
+  if (!stored) return closeOnly('Campaign');
+  const c = emDraftCampaign(id), steps = c.steps || [], n = Math.min(m.n || 0, Math.max(0, steps.length - 1));
+  const keys = Object.keys(c.segments || {}), seg = keys.includes(m.seg) ? m.seg : (keys[0] || 'general');
+  const st = steps[n] || {}, g = (c.segments || {})[seg] || {};
+  const dirty = emEditable(c) !== emEditable(stored);
+  const counts = {}; emProspects().filter(p => p.campaign === id).forEach(p => { const k = p.segment || segmentOf(p.type); counts[k] = (counts[k] || 0) + 1; });
+  const sample = emSample(id, seg);
+  return `<div class="card-h"><h2>${esc(stored.name)}</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
+    ${stored.reviewed ? `<div class="ok-box">Approved${stored.reviewedAt ? ' ' + esc(fmtDay(iso(new Date(stored.reviewedAt)))) : ''}. ${emLive(stored) ? 'It is on.' : 'It is paused.'} Changes you save go out from the next email on.</div>`
+      : `<div class="warnbox">Read each email the way a business will see it, change anything that isn't right, then approve it. Nothing from this campaign goes out until you do.</div>`}
+    <form class="stack" data-form="em-campaign">
+    <div class="grid2"><div class="fld"><label for="ec-name">Campaign name</label><input class="in" id="ec-name" data-draft value="${esc(c.name)}"></div>
+      <div class="fld"><label for="ec-cap">Most a day from this campaign</label><input class="in" type="number" min="1" max="200" inputmode="numeric" id="ec-cap" data-draft value="${esc(c.cap)}"></div></div>
+    <div class="fld"><label for="ec-offer">The offer in one line, for you</label><input class="in" id="ec-offer" data-draft value="${esc(c.offer)}"><span class="meta">Not in the emails. It helps Claude sort the replies and heads the forwarded ones.</span></div>
+    <div class="fld"><label for="ec-price">Price line, where an email says {price}</label><textarea class="in" id="ec-price" rows="2" data-draft data-emprev>${esc(c.price)}</textarea><span class="meta">Leave it empty to leave the price out.</span></div>
+    <h3>The emails</h3>
+    <div class="seg scope emtabs">${steps.map((x, k) => `<button type="button" class="${k === n ? 'on' : ''}" data-act="ec-step" data-n="${k}">${esc(emStepName(k, steps.length))}<small>${k ? `${plural(Number(x.wait) || 0, 'day')} later` : 'day 1'}</small></button>`).join('')}</div>
+    ${n === 0 ? `<div class="fld"><label for="ec-s0-subject">Subject</label><input class="in" id="ec-s0-subject" data-draft data-emprev value="${esc(st.subject || '')}"></div>`
+      : `<div class="fld"><label for="ec-s${n}-wait">Sending days after the email before</label><input class="in" type="number" min="1" max="30" inputmode="numeric" id="ec-s${n}-wait" data-draft value="${esc(st.wait)}" style="max-width:120px"><span class="meta">It goes in the same thread, so the subject is "Re: ${esc(steps[0] ? steps[0].subject : '')}".</span></div>`}
+    <div class="fld"><label for="ec-s${n}-body">Email</label><textarea class="in mailin" id="ec-s${n}-body" rows="9" data-draft data-emprev>${esc(st.body || '')}</textarea>
+      <span class="meta">Fill-ins: {greeting} (their first name, or "Business team"), {business}, {question}, {features}, {price}, {city}. Your name, website, mailing address and a way to opt out are added under every email.</span></div>
+    <h3>By type of business</h3>
+    <div class="chips multi">${keys.map(k => `<button type="button" class="chip ${k === seg ? 'on' : ''}" data-act="ec-seg" data-k="${esc(k)}">${esc((c.segments[k] || {}).label || k)}${counts[k] ? ` · ${counts[k]}` : ''}</button>`).join('')}</div>
+    <div class="fld"><label for="ec-g-${esc(seg)}-question">{question} for ${esc(g.label || seg)}</label><textarea class="in" rows="2" id="ec-g-${esc(seg)}-question" data-draft data-emprev>${esc(g.question || '')}</textarea></div>
+    <div class="fld"><label for="ec-g-${esc(seg)}-features">{features} for ${esc(g.label || seg)}</label><textarea class="in" rows="4" id="ec-g-${esc(seg)}-features" data-draft data-emprev>${esc(g.features || '')}</textarea></div>
+    <h3>How ${esc(sample.business)} sees it</h3>
+    <div id="em-preview">${emMailHtml(sample, c, n)}</div>
+    <div class="btnrow emfoot">
+      <button class="btn ${dirty ? 'primary' : ''}" type="submit">Save</button>
+      ${stored.reviewed ? '' : '<button class="btn primary" type="button" data-act="ec-approve">Looks good, turn it on</button>'}
+      <button class="btn ghost" type="button" data-act="em-test" data-id="${esc(id)}" ${S.emTestBusy ? 'disabled' : ''}>${S.emTestBusy ? 'Sending…' : 'Send me a test'}</button>
+    </div>
+    ${DEFAULT_CAMPAIGNS[id] ? `<div class="btnrow">${S.confirm === 'ec-reset' ? `<span class="meta">Put back the original wording? Your changes to this campaign are replaced.</span><button class="btn sm badb" type="button" data-act="ec-reset">Yes, put it back</button><button class="btn sm ghost" type="button" data-act="confirm" data-c="">Keep mine</button>` : '<button class="btn sm ghost" type="button" data-act="confirm" data-c="ec-reset">Back to the original wording</button>'}</div>` : ''}
+    </form>`;
+}
+function emSettingsSheet() {
+  const s = emSettings(), days = (S.modal && S.modal.days) || s.days, v = (k, def) => draft('es-' + k, def ?? '');
+  const today = localClock(s.tz).date, cap = dailyCap(s, today);
+  return `<div class="card-h"><h2>Email settings</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
+  <form class="stack" data-form="em-settings" novalidate>
+    <div class="fld"><label for="es-address">Your mailing address</label><textarea class="in" id="es-address" rows="2" data-draft placeholder="Street or PO box, city, state and ZIP">${esc(v('address', s.address))}</textarea><span class="meta">Goes under your name in every email. US law (CAN-SPAM) requires a real postal address in sales email: a street address, a PO box, or a mailbox at a UPS Store. Nothing sends without it.</span></div>
+    <div class="fld"><label for="es-forward">Forward hot replies to</label><input class="in" type="email" id="es-forward" data-draft value="${esc(v('forward', s.forwardTo))}" placeholder="Optional, like your personal email"><span class="meta">Either way, hot replies are starred and labeled LCC/Hot in ${esc(emGmail() || 'your Gmail')}, show up on this tab, and ping your phone when notifications are on.</span></div>
+    <div class="grid2"><div class="fld"><label for="es-name">Your name</label><input class="in" id="es-name" data-draft value="${esc(v('name', s.fromName))}"></div><div class="fld"><label for="es-website">Website</label><input class="in" id="es-website" data-draft value="${esc(v('website', s.website))}"></div></div>
+    <h3>When emails go out</h3>
+    ${dayPicker('es-day', days)}
+    <div class="grid2"><div class="fld"><label for="es-start">From</label><input class="in" type="time" id="es-start" data-draft value="${esc(v('start', s.start))}"></div><div class="fld"><label for="es-end">Until</label><input class="in" type="time" id="es-end" data-draft value="${esc(v('end', s.end))}"></div></div>
+    <span class="meta">In each business's own time, so Arizona gets Arizona hours and Iowa gets Iowa hours.</span>
+    <h3>How many a day</h3>
+    <div class="grid3"><div class="fld"><label for="es-capStart">Start at</label><input class="in" type="number" min="1" max="200" inputmode="numeric" id="es-capStart" data-draft value="${esc(v('capStart', s.capStart))}"></div><div class="fld"><label for="es-capStep">Add each day</label><input class="in" type="number" min="0" max="50" inputmode="numeric" id="es-capStep" data-draft value="${esc(v('capStep', s.capStep))}"></div><div class="fld"><label for="es-capMax">Up to</label><input class="in" type="number" min="1" max="200" inputmode="numeric" id="es-capMax" data-draft value="${esc(v('capMax', s.capMax))}"></div></div>
+    <span class="meta">A new mailbox that suddenly sends a lot ends up in spam. 20 a day plus 5 each sending day reaches 50 in about a week.${s.startedOn ? ` Today's limit: ${cap}.` : ''}</span>
+    <div class="grid2"><div class="fld"><label for="es-gap">Minutes between emails, at least</label><input class="in" type="number" min="3" max="120" inputmode="numeric" id="es-gap" data-draft value="${esc(v('gap', s.gap))}"></div>
+      <div class="fld"><label for="es-tz">Your time zone</label><select class="in" id="es-tz" data-draft>${EM_TZS.map(([z, l]) => `<option value="${z}" ${v('tz', s.tz) === z ? 'selected' : ''}>${l}</option>`).join('')}</select><span class="meta">When the day's count starts over.</span></div></div>
+    <div class="btnrow"><button class="btn primary" type="submit">Save</button><button class="btn ghost" type="button" data-act="modal-close">Cancel</button></div>
+  </form>`;
+}
+function emImportSheet() {
+  const m = S.modal, imp = S.emImport, camps = emCampaigns(), sel = m.campaign && (m.campaign === 'auto' || camps.some(c => c.id === m.campaign)) ? m.campaign : 'auto';
+  let body;
+  if (imp) {
+    const r = prospectsFromRows(imp.rows, {campaign:sel, existing:S.data.prospects || {}, suppressed:emSuppressed()});
+    const by = {}; r.add.forEach(x => { const k = x.doc.campaign; (by[k] = by[k] || {n:0, seg:{}}).n++; by[k].seg[x.doc.segment] = (by[k].seg[x.doc.segment] || 0) + 1; });
+    const sk = r.skipped, extra = [sk.dup ? `${sk.dup} already in your list` : '', sk.noEmail ? `${sk.noEmail} without an email` : '', sk.suppressed ? `${sk.suppressed} on your do-not-contact list` : ''].filter(Boolean);
+    body = `<div class="impbox">
+      <div class="meta">${esc(imp.name)} · ${plural(imp.rows.length, 'row')}</div>
+      <b class="impn">${r.add.length ? `${plural(r.add.length, 'new contact')} ready` : 'No new contacts in this file'}</b>
+      ${extra.length ? `<div class="meta">Skipping ${esc(extra.join(', '))}.</div>` : ''}
+      ${Object.entries(by).map(([cid, x]) => `<div><b>${esc(((S.data.campaigns || {})[cid] || {}).name || cid)}: ${x.n}</b> <span class="meta">${Object.entries(x.seg).map(([k, c]) => `${esc(emSegLabel(cid, k))} ${c}`).join(' · ')}</span></div>`).join('')}
+      ${r.held ? `<div class="meta">${r.held === 1 ? '1 contact is' : r.held + ' contacts are'} marked Check first. They wait until you look and tap Queue.</div>` : ''}
+      ${r.add.length ? `<div class="imptable">${r.add.slice(0, 6).map(x => `<div><b>${esc(x.doc.business)}</b><span>${esc(x.doc.email)}</span></div>`).join('')}${r.add.length > 6 ? `<div class="meta">and ${r.add.length - 6} more</div>` : ''}</div>` : ''}
+    </div>
+    <div class="btnrow"><button class="btn primary" data-act="ei-add" ${r.add.length ? '' : 'disabled'}>Add ${plural(r.add.length, 'contact')}</button><button class="btn ghost" data-act="ei-clear">Use another file</button></div>
+    <div class="meta">Adding doesn't send anything. Emails only go out from a campaign you approved, after you tap Start sending.</div>`;
+  } else {
+    body = `<div class="btnrow"><label class="btn primary" for="ei-file" style="cursor:pointer">Choose a CSV file</label><input type="file" id="ei-file" accept=".csv,.tsv,.txt,text/csv,text/plain" hidden><span class="meta">or drag it onto this page</span></div>
+    <details><summary>Or paste rows from a spreadsheet</summary><div class="stack" style="margin-top:8px"><textarea class="in" id="ei-paste" rows="5" data-draft placeholder="business,email,type,city,state&#10;Glow Aesthetics,hello@glow.com,Med spa,Scottsdale,AZ">${esc(draft('ei-paste'))}</textarea><div class="btnrow"><button class="btn sm" data-act="ei-read">Read it</button><span class="meta">Include the header row.</span></div></div></details>`;
+  }
+  return `<div class="card-h"><h2>Add contacts</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
+    <p class="meta" style="margin:0;color:var(--ink-2)">A spreadsheet saved as CSV (Google Sheets: File › Download › CSV). It reads columns like business, email, first name, type, city, state, phone and website, so exports from Apollo or Outscraper work too. The list from Claude, <b>outreach-list.csv</b>, works as is.</p>
+    <div class="fld"><label>Campaign</label><div class="seg scope">${[['auto','By type'], ...camps.map(c => [c.id, c.name])].map(([k, l]) => `<button type="button" class="${sel === k ? 'on' : ''}" data-act="ei-camp" data-k="${esc(k)}">${esc(l)}</button>`).join('')}</div>
+      <span class="meta">${sel === 'auto' ? 'Dentists and service businesses get Front Desk AI. Everyone else gets Own the Home Screen.' : 'Everyone in the file gets this campaign.'}</span></div>
+    ${body}`;
+}
+function emReplyItem(r) {
+  return `<div class="tli reply"><i></i><div class="min0">
+    <div class="btnrow">${emLabelPill(r.label)}<span class="meta">${esc(emWhen(r.at))}${r.by === 'claude' ? ' · sorted by Claude' : r.relabeled ? ' · sorted by you' : ''}</span></div>
+    ${r.summary ? `<div class="sum">${esc(r.summary)}</div>` : ''}
+    <div class="quote full">${esc(r.text || r.snippet || '')}</div>
+    ${r.next ? `<div class="meta"><b>Next:</b> ${esc(r.next)}</div>` : ''}
+    <div class="btnrow"><label class="meta relabel">Sorted as <select class="in" id="er-${esc(r.id)}" data-relabel="${esc(r.id)}">${EM_LABEL_ORDER.map(k => `<option value="${k}" ${k === r.label ? 'selected' : ''}>${EM_LABEL[k][0]}</option>`).join('')}</select></label>
+      ${EM_HOT.includes(r.label) && !r.handled ? `<button class="btn sm" data-act="em-done" data-id="${esc(r.id)}">Done</button>` : ''}
+      ${r.threadId ? `<a class="btn sm ghost" href="${esc(gmailThread(r.threadId))}" target="_blank" rel="noopener">Reply in Gmail</a>` : ''}</div>
+  </div></div>`;
+}
+function emContactSheet() {
+  const id = S.modal.id, p = (S.data.prospects || {})[id];
+  if (!p) return closeOnly('Contact');
+  const c = (S.data.campaigns || {})[p.campaign] || {}, steps = c.steps || [], step = Number(p.step) || 0;
+  const pr = {...p, firstName:p.firstName || firstNameFrom(p.email), segment:p.segment || segmentOf(p.type)};
+  const tl = [...(p.sent || []).filter(x => x && x.at).map(x => ({at:x.at, sent:x})), ...emReplies().filter(r => r.prospect === id).map(r => ({at:r.at, r}))].sort((a, b) => String(a.at).localeCompare(String(b.at)));
+  const st = p.status, ended = ['no','unsub','bounced'].includes(st), tel = String(p.phone || '').replace(/[^\d+]/g, '');
+  const nextLine = ['queued','active'].includes(st) && step < steps.length && p.sendingStep == null
+    ? `<div class="tli next"><i></i><div class="min0"><div><b>${esc(emStepName(step, steps.length))}</b> <span class="meta">${!emLive(c) ? 'waits until the campaign is on' : step === 0 ? 'goes out when its turn comes' : 'goes out ' + (p.nextOn ? (p.nextOn <= todayISO() ? 'today' : esc(fmtDay(p.nextOn))) : 'next')}</span></div><details><summary>Show it</summary>${emMailHtml(pr, c, step)}</details></div></div>` : '';
+  return `<div class="card-h"><h2>${esc(p.business || p.email)}</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
+    <div class="btnrow">${emPill(p)}<span class="meta">${esc(c.name || 'No campaign')}${pr.segment ? ' · ' + esc(emSegLabel(p.campaign, pr.segment)) : ''}</span></div>
+    <div class="kvlist">
+      <div><span>Email</span><a href="mailto:${esc(p.email)}">${esc(p.email)}</a></div>
+      ${p.firstName ? `<div><span>Name</span>${esc(p.firstName)}</div>` : ''}
+      ${p.phone ? `<div><span>Phone</span><a href="tel:${esc(tel)}">${esc(p.phone)}</a></div>` : ''}
+      ${emWhere(p) ? `<div><span>Where</span>${esc(emWhere(p))}</div>` : ''}
+      ${p.type ? `<div><span>Type</span>${esc(p.type)}</div>` : ''}
+      ${p.website ? `<div><span>Website</span><a href="${esc(emHref(p.website))}" target="_blank" rel="noopener">${esc(emShortUrl(p.website))}</a></div>` : ''}
+      ${p.foundAt ? `<div><span>Found on</span><a href="${esc(emHref(p.foundAt))}" target="_blank" rel="noopener">${esc(emShortUrl(p.foundAt).slice(0, 60))}</a></div>` : ''}
+    </div>
+    ${st === 'hold' ? `<div class="warnbox">Marked <b>Check first</b>: this address was harder to confirm.${p.foundAt ? ' Open where it was found to make sure it belongs to the business.' : ''} Queue it when it looks right.</div>` : ''}
+    ${emStuck(p) ? `<div class="warnbox">A send started ${esc(emAgo(p.sendingAt))} and never finished. Look in Gmail's Sent folder for ${esc(emStepName(p.sendingStep, steps.length).toLowerCase())} to ${esc(p.email)}.<div class="btnrow" style="margin-top:8px"><button class="btn sm" data-act="em-stuck" data-id="${esc(id)}" data-went="1">It went out, stop here</button><button class="btn sm" data-act="em-stuck" data-id="${esc(id)}" data-went="0">It didn't, send it again</button></div></div>` : ''}
+    ${st === 'paused' && p.pausedWhy === 'failed' && p.lastError ? `<div class="err">Gmail wouldn't send to this address: ${esc(p.lastError)}. Fix the address in your list and add it again, or leave it paused.</div>` : ''}
+    <h3>History</h3>
+    <div class="tl">${tl.map(x => x.r ? emReplyItem(x.r) : `<div class="tli"><i></i><div class="min0"><div><b>${esc(emStepName(x.sent.step, steps.length))} sent</b> <span class="meta">${esc(emWhen(x.at))}</span></div>${x.sent.step < steps.length ? `<details><summary>Show it</summary>${emMailHtml(pr, c, x.sent.step)}<div class="meta">As the template reads now.</div></details>` : ''}</div></div>`).join('')}${nextLine}${!tl.length && !nextLine ? '<div class="meta">Not emailed yet.</div>' : ''}</div>
+    <h3>Details</h3>
+    <div class="grid2">
+      <div class="fld"><label for="ep-camp">Campaign</label><select class="in" id="ep-camp" ${step > 0 ? 'disabled' : ''}>${emCampaigns().map(x => `<option value="${esc(x.id)}" ${x.id === p.campaign ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select>${step > 0 ? '<span class="meta">Already emailed, so it stays.</span>' : ''}</div>
+      <div class="fld"><label for="ep-seg">Version of the email</label><select class="in" id="ep-seg">${Object.entries(c.segments || {}).map(([k, g]) => `<option value="${esc(k)}" ${k === pr.segment ? 'selected' : ''}>${esc(g.label || k)}</option>`).join('')}</select></div>
+      <div class="fld"><label for="ep-first">First name</label><input class="in" id="ep-first" data-draft value="${esc(draft('ep-first', p.firstName || ''))}" placeholder="Unknown, so it says “${esc(p.business || 'Business')} team”"></div>
+      <div class="fld"><label for="ep-business">Business name</label><input class="in" id="ep-business" data-draft value="${esc(draft('ep-business', p.business || ''))}"></div>
+    </div>
+    <div class="btnrow"><button class="btn sm" data-act="ep-save" data-id="${esc(id)}">Save names</button></div>
+    <div class="btnrow actrow">
+      ${st === 'hold' ? `<button class="btn primary" data-act="em-status" data-id="${esc(id)}" data-op="queue">Queue it</button>` : ''}
+      ${['queued','active'].includes(st) ? `<button class="btn" data-act="em-status" data-id="${esc(id)}" data-op="pause">Pause</button>` : ''}
+      ${st === 'paused' ? `<button class="btn primary" data-act="em-status" data-id="${esc(id)}" data-op="resume">Resume</button>` : ''}
+      ${p.threadId ? `<a class="btn" href="${esc(gmailThread(p.threadId))}" target="_blank" rel="noopener">Open in Gmail</a>` : ''}
+      ${['hot','replied'].includes(st) ? (p.pipelined && p.leadId && S.data.leads[p.leadId] ? `<button class="btn" data-act="lead-edit" data-id="${esc(p.leadId)}">Open the lead</button>` : `<button class="btn goodb" data-act="em-lead" data-id="${esc(id)}">Add to pipeline</button>`) : ''}
+      ${ended ? '' : `<button class="btn ghost" data-act="em-status" data-id="${esc(id)}" data-op="block">Do not contact</button>`}
+      ${S.confirm === 'em-del' ? `<button class="btn badb" data-act="em-remove" data-id="${esc(id)}">Yes, remove</button><button class="btn ghost" data-act="confirm" data-c="">Keep</button>` : '<button class="btn ghost" data-act="confirm" data-c="em-del">Remove</button>'}
+    </div>`;
+}
+function emSetupSheet() {
+  const st = S.outEng || {}, state = emState(), outdated = st.fn === 'ok' && (st.version || 1) < OUTREACH_V, gm = st.gmail || {};
+  const gmailOk = (st.fn === 'ok' && !!gm.ok) || (!st.fn && !!state.gmail);
+  const ran = state.lastRun ? (Date.now() - Date.parse(state.lastRun)) / 60000 : null;
+  const step = (n, title, body, ok) => `<div class="step ${ok ? 'ok' : ''}"><div class="num">${ok ? '✓' : n}</div><div class="min0"><b>${title}</b><div class="meta" style="color:var(--ink-2)">${body}</div></div></div>`;
+  return `<div class="card-h"><h2>Email engine setup</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
+    <p class="meta" style="margin:0;color:var(--ink-2)">The engine is a small function in your own Supabase project. Every 10 minutes it sends the next email from your Gmail and reads new replies, even with this app closed. Do this once, on a laptop. About 15 minutes.</p>
+    ${step(1, 'Turn on the Gmail API', 'Open <b>console.cloud.google.com</b> signed in as <b>logan@logandnewman.com</b>. Create a project (any name, like Command), then go to <b>APIs &amp; Services › Library</b>, search for <b>Gmail API</b> and click <b>Enable</b>.', gmailOk)}
+    ${step(2, 'Make a sign-in key for the engine', 'Open <b>Google Auth Platform</b> (APIs &amp; Services › OAuth consent screen) and click <b>Get started</b>: app name <b>Command</b>, your email, audience <b>Internal</b>. Then <b>Clients › Create client</b>: type <b>Web application</b>, and under <b>Authorized redirect URIs</b> add <span class="kbd">https://developers.google.com/oauthplayground</span> <button class="btn sm ghost copyin" data-act="copy" data-text="https://developers.google.com/oauthplayground">Copy</button>. Click Create and copy the <b>Client ID</b> and <b>Client secret</b> right away (Google may show the secret only once).<div class="meta" style="margin-top:4px">No Internal option? Then the address isn\'t on Google Workspace: pick External, add yourself as a test user, and on the Audience page click <b>Publish app</b> so access doesn\'t expire after 7 days.</div>', gmailOk)}
+    ${step(3, 'Get a refresh token', 'Open <b>developers.google.com/oauthplayground</b>. Click the gear at the top right, check <b>Use your own OAuth credentials</b>, and paste the Client ID and secret. On the left, in <b>Input your own scopes</b>, paste <span class="kbd">https://www.googleapis.com/auth/gmail.modify</span> <button class="btn sm ghost copyin" data-act="copy" data-text="https://www.googleapis.com/auth/gmail.modify">Copy</button> and click <b>Authorize APIs</b>. Sign in as logan@logandnewman.com and allow it. Then click <b>Exchange authorization code for tokens</b> and copy the <b>Refresh token</b>.', gmailOk)}
+    ${step(4, 'Add three secrets in Supabase', `Open <b>Edge Functions › Secrets</b> and add <span class="kbd">GMAIL_CLIENT_ID</span>, <span class="kbd">GMAIL_CLIENT_SECRET</span> and <span class="kbd">GMAIL_REFRESH_TOKEN</span>. If you set up the assistant, <span class="kbd">ANTHROPIC_API_KEY</span> is already there, and Claude sorts the replies.${st.fn === 'ok' ? `<div class="btnrow" style="margin-top:6px">${gm.ok ? `<span class="pill good">Gmail connected: ${esc(gm.email)}</span>` : '<span class="pill warn">Gmail not connected yet</span>'}${st.hasKey ? '<span class="pill good">Claude sorts replies</span>' : '<span class="pill">No Anthropic key: replies are sorted by simple rules</span>'}</div>${!gm.ok && gm.error ? `<div class="err" style="margin-top:6px">${esc(gm.error)}</div>` : ''}` : ''}`, gmailOk)}
+    ${step(5, 'Create the function', `Open <b>Edge Functions › Deploy a new function › Via Editor</b>. Name it <span class="kbd">outreach</span>, replace all the code with the copied code, and <b>Deploy</b>. Then, in the function's <b>Settings</b>, turn <b>off</b> "Verify JWT".<div class="btnrow" style="margin-top:6px"><button class="btn sm" data-act="em-copy-fn">Copy the code</button><button class="btn sm ghost" data-act="em-check">${st.checking ? 'Checking…' : 'Check'}</button>${st.fn === 'ok' ? (outdated ? '<span class="pill warn">Update needed</span>' : '<span class="pill good">Found</span>') : st.fn === 'missing' ? '<span class="pill warn">Not found yet</span>' : st.fn === 'error' ? '<span class="pill bad">Problem</span>' : ''}</div>${outdated ? '<div class="meta" style="margin-top:6px">Supabase is running an older copy. Copy the code, open the <b>outreach</b> function, replace all of its code, Deploy, then tap Check.</div>' : ''}${st.fn === 'error' && st.msg ? `<div class="err" style="margin-top:6px">${esc(st.msg)}</div>` : ''}`, st.fn === 'ok' && !outdated)}
+    ${step(6, 'Run it every 10 minutes', `Open <b>Integrations › Cron</b> (enable it if asked) › <b>Create job</b>. Name <span class="kbd">outreach</span>, schedule <span class="kbd">*/10 * * * *</span>, type <b>Supabase Edge Function</b>, pick <b>outreach</b>, method <b>POST</b>, timeout <span class="kbd">120000</span> ms, then Create. Prefer SQL? Copy it and run it in the SQL Editor instead.<div class="btnrow" style="margin-top:6px"><button class="btn sm ghost" data-act="em-copy-sql">Copy the SQL</button>${ran !== null && ran <= 12 ? '<span class="pill good">Running</span>' : ran !== null ? `<span class="pill warn">Last ran ${esc(emAgo(state.lastRun))}</span>` : st.fn === 'ok' ? '<span class="pill warn">Not running yet. Check back in 10 minutes.</span>' : ''}</div>`, ran !== null && ran <= 12)}
+    ${state.lastError ? `<div class="err">Last run: ${esc(state.lastError)}</div>` : ''}
+    <div class="meta">Nothing is sent until you approve a campaign, add your mailing address and tap Start sending.</div>`;
+}
+
+/* ----- changes ----- */
+function emSetStatus(ids, op) {
+  const ops = []; let n = 0;
+  ids.forEach(id => {
+    const p = (S.data.prospects || {})[id]; if (!p) return;
+    let patch = null;
+    if (op === 'queue' && p.status === 'hold') patch = {status:'queued'};
+    else if (op === 'pause' && ['queued','active'].includes(p.status)) patch = {status:'paused', pausedWhy:'you'};
+    else if (op === 'resume' && p.status === 'paused') patch = {...emResume(p), pausedWhy:null, failCount:0, lastError:null};
+    else if (op === 'block' && !['no','unsub','bounced'].includes(p.status)) patch = {status:'no', nextOn:null};
+    if (!patch) return;
+    ops.push({patch:['prospects', id, Object.fromEntries(Object.keys(patch).map(k => [k, p[k] === undefined ? null : p[k]]))]});
+    patchDoc('prospects', id, patch); n++;
+    const email = String(p.email || '').toLowerCase();
+    if (op === 'block' && email && !(S.data.suppress || {})[email]) { setDoc('suppress', email, {email, reason:'Taken off by you', at:new Date().toISOString()}); ops.push({del:['suppress', email]}); }
+  });
+  if (n) S.lastUndo = {type:'restore', ops};
+  return n;
+}
+// A reply Claude (or the rules) sorted wrong: the contact's status and the do-not-contact list follow.
+function emRelabel(rid, label) {
+  const r = (S.data.replies || {})[rid]; if (!r || r.label === label || !EM_LABEL[label]) return;
+  const pid = r.prospect, p = (S.data.prospects || {})[pid], email = String((p && p.email) || r.email || '').toLowerCase();
+  const ops = [{patch:['replies', rid, {label:r.label, handled:!!r.handled, relabeled:!!r.relabeled}]}];
+  patchDoc('replies', rid, {label, handled:!EM_HOT.includes(label), relabeled:true});
+  if (p) {
+    ops.push({patch:['prospects', pid, {status:p.status, replyClass:p.replyClass ?? null, nextOn:p.nextOn ?? null}]});
+    patchDoc('prospects', pid, label === 'auto' ? {...emResume(p), replyClass:null} : {status:STATUS_FOR[label] || 'replied', replyClass:label, nextOn:null});
+  }
+  const sup = email ? (S.data.suppress || {})[email] : null;
+  if (email && SUPPRESS[label] && !sup) { setDoc('suppress', email, {email, reason:EM_SUP_REASON[label], at:new Date().toISOString()}); ops.push({del:['suppress', email]}); }
+  else if (email && !SUPPRESS[label] && sup && SUPPRESS[r.label]) { delDoc('suppress', email); ops.push({set:['suppress', email, clone(sup)]}); }
+  S.lastUndo = {type:'restore', ops};
+  toast(`Sorted as ${EM_LABEL[label][0]}.${EM_HOT.includes(label) ? ' It is on your hot list.' : ''}`, true);
+}
+// A reply worth a call: it becomes a warm lead in Calls (or moves the lead it came from), due today.
+function emToLead(pid, rid) {
+  const p = (S.data.prospects || {})[pid]; if (!p) return;
+  const r = rid && (S.data.replies || {})[rid] ? {id:rid, ...S.data.replies[rid]} : emReplies().find(x => x.prospect === pid && x.label !== 'auto');
+  const c = (S.data.campaigns || {})[p.campaign] || {}, t = todayISO();
+  const line = `${t.slice(5).replace('-', '/')}: Replied to the ${c.name || 'outreach'} email${r && (r.summary || r.snippet) ? `: ${r.summary || r.snippet}` : ''}.`;
+  const lid = p.leadId && S.data.leads[p.leadId] ? p.leadId : 'lead-' + Date.now().toString(36), l = S.data.leads[lid];
+  const ops = [{patch:['prospects', pid, {leadId:p.leadId ?? null, pipelined:!!p.pipelined}]}];
+  if (l) {
+    ops.push({set:['leads', lid, clone(l)]});
+    patchDoc('leads', lid, {type:l.type === 'Cold' ? 'Warm' : l.type, stage:advanceStage(l.stage, 'Talking'), nextStep:'Answer their email', nextDate:t, notes:(l.notes ? l.notes + '\n' : '') + line, updatedAt:Date.now()});
+  } else {
+    ops.push({del:['leads', lid]});
+    setDoc('leads', lid, {name:p.business || p.email, business:p.type || '', contact:p.firstName || '', phone:p.phone || '', website:p.website || '', type:'Warm', region:['IA','AZ'].includes(p.state) ? p.state : '', stage:'Talking', nextStep:'Answer their email', nextDate:t, touches:0, notes:`${line}\nEmail: ${p.email}`, createdAt:Date.now(), updatedAt:Date.now()});
+  }
+  patchDoc('prospects', pid, {leadId:lid, pipelined:true});
+  if (r && EM_HOT.includes(r.label) && !r.handled) { ops.push({patch:['replies', r.id, {handled:false}]}); patchDoc('replies', r.id, {handled:true, handledAt:Date.now()}); }
+  S.lastUndo = {type:'restore', ops};
+  toast(`${p.business || 'They'} ${l ? 'moved to Talking' : 'added as a warm lead'}, due today on the Calls tab.`, true);
+}
+async function emReadFile(f) {
+  try {
+    const rows = parseCSV(await f.text());
+    if (!rows.length) { toast("That file is empty, or it isn't a spreadsheet."); return; }
+    S.emImport = {name:f.name, rows};
+    if (!S.modal || S.modal.type !== 'em-import') { S.confirm = null; S.modal = {type:'em-import', campaign:'auto'}; }
+    render();
+  } catch (e) { toast("Couldn't read that file."); }
+}
+
 /* ----- calling mode: one lead at a time ----- */
 function callSheet() {
   const t = todayISO(), cm = S.callMode || {}, m = nowMin();
@@ -1920,7 +2504,7 @@ function callSheet() {
   return head + `<div class="callcard">${leadCard(cur, t)}</div>
     <div class="btnrow"><button class="btn ghost" data-act="call-skip" data-id="${esc(cur.id)}">Skip for now</button><span class="meta">Tap a result and the next lead comes up.</span></div>`;
 }
-function closeModal() { S.modal = null; S.confirm = null; S.callMode = null; }
+function closeModal() { S.modal = null; S.confirm = null; S.callMode = null; S.emImport = null; }
 async function signOut() {
   if (db) {
     if (db.status().pending) {
@@ -1944,7 +2528,7 @@ function renderModal() {
   const old = el.querySelector('.sheet'), top = old && el.dataset.sig === sig ? old.scrollTop : 0;
   const ty = S.modal.type;
   el.hidden = false;
-  el.innerHTML = `<div class="sheet ${old ? 'still' : ''} ${ty === 'sched' || ty === 'build' ? 'wide' : ty === 'week' ? 'wide week' : ''}" role="dialog" aria-modal="true">${ty === 'session' ? sessionForm() : ty === 'fresh' ? freshForm() : ty === 'block' ? blockSheet(S.modal.key, S.modal.date) : ty === 'task' ? taskSheet(S.modal.id) : ty === 'mile' ? mileSheet(S.modal.id) : ty === 'stat' ? statSheet(S.modal.id) : ty === 'notif' ? notifSheet() : ty === 'call' ? callSheet() : ty === 'event' ? eventForm() : ty === 'chat' ? chatSheet() : ty === 'assist' ? assistantSheet() : ty === 'sched' ? schedSheet() : ty === 'add' ? addForm() : ty === 'blockedit' ? blockEditForm() : ty === 'catchup' ? catchupSheet() : ty === 'quick' ? quickSheet() : ty === 'build' ? buildSheet() : ty === 'week' ? weekSheet() : leadEditForm()}</div>`;
+  el.innerHTML = `<div class="sheet ${old ? 'still' : ''} ${ty === 'sched' || ty === 'build' || ty.startsWith('em-') ? 'wide' : ty === 'week' ? 'wide week' : ''}" role="dialog" aria-modal="true">${ty === 'em-campaign' ? emCampaignSheet() : ty === 'em-settings' ? emSettingsSheet() : ty === 'em-import' ? emImportSheet() : ty === 'em-contact' ? emContactSheet() : ty === 'em-setup' ? emSetupSheet() : ty === 'session' ? sessionForm() : ty === 'fresh' ? freshForm() : ty === 'block' ? blockSheet(S.modal.key, S.modal.date) : ty === 'task' ? taskSheet(S.modal.id) : ty === 'mile' ? mileSheet(S.modal.id) : ty === 'stat' ? statSheet(S.modal.id) : ty === 'notif' ? notifSheet() : ty === 'call' ? callSheet() : ty === 'event' ? eventForm() : ty === 'chat' ? chatSheet() : ty === 'assist' ? assistantSheet() : ty === 'sched' ? schedSheet() : ty === 'add' ? addForm() : ty === 'blockedit' ? blockEditForm() : ty === 'catchup' ? catchupSheet() : ty === 'quick' ? quickSheet() : ty === 'build' ? buildSheet() : ty === 'week' ? weekSheet() : leadEditForm()}</div>`;
   el.dataset.sig = sig;
   if (top) el.querySelector('.sheet').scrollTop = top;
   if (keep) { const n = document.getElementById(keep.id); if (n) { n.focus({preventScroll:true}); try { if (keep.s != null) n.setSelectionRange(keep.s, keep.e); } catch(e) {} } }
@@ -2010,8 +2594,9 @@ function renderToast() {
 
 /* ---------- actions ---------- */
 function setView(v) {
-  S.view = v; S.openItem = null; S.leadForm = null; S.modal = null; S.confirm = null;
+  S.view = v; S.openItem = null; S.leadForm = null; S.modal = null; S.confirm = null; S.emImport = null;
   try { localStorage.setItem('lcc-view', v); } catch(e) {}
+  if (location.hash) { try { history.replaceState(null, '', location.pathname + location.search); } catch(e) {} }
   render(); window.scrollTo(0, 0);
 }
 function toggleCheck(key) {
@@ -2207,6 +2792,121 @@ function handle(act, el, ev) {
       patchDay(t, {off:true}); S.modal = null; S.lastUndo = null;
       toast(`Fresh start tomorrow, ${fmtDay(tm)}. Today is a day off. ${plural(r.moved, 'to-do')} and ${plural(r.leadsMoved, 'follow-up')} moved there.`); render(); break;
     }
+    /* email */
+    case 'em-setup': S.confirm = null; S.modal = {type:'em-setup'}; render(); outreachCheck(true); break;
+    case 'em-check': outreachCheck(); break;
+    case 'em-copy-fn': navigator.clipboard.writeText(OUTREACH_FN).then(() => toast('Function code copied. Paste it into the Supabase editor.'), () => toast("Couldn't copy. Open supabase/functions/outreach/index.ts in the repo instead.")); break;
+    case 'em-copy-sql': navigator.clipboard.writeText(OUTREACH_CRON.replace(/YOUR-PROJECT-REF/g, projectRef())).then(() => toast('SQL copied. Run it in the Supabase SQL Editor.'), () => toast("Couldn't copy. Open supabase/functions/outreach/cron.sql in the repo instead.")); break;
+    case 'em-settings': clearDrafts('es-'); S.confirm = null; S.modal = {type:'em-settings', days:emSettings().days.slice()}; render(); break;
+    case 'es-day': if (S.modal) { const cur = S.modal.days || emSettings().days; S.modal.days = cur.includes(d.d) ? cur.filter(x => x !== d.d) : [...cur, d.d]; } render(); break;
+    case 'em-import': S.confirm = null; S.emImport = null; S.modal = {type:'em-import', campaign:d.campaign || 'auto'}; render(); break;
+    case 'ei-camp': if (S.modal) S.modal.campaign = d.k; render(); break;
+    case 'ei-clear': S.emImport = null; render(); break;
+    case 'ei-read': {
+      const txt = String(S.drafts['ei-paste'] || (document.getElementById('ei-paste') || {}).value || '');
+      const rows = parseCSV(txt);
+      if (!rows.length) { toast('Paste the header row too, like business, email, type.'); break; }
+      S.emImport = {name:'Pasted rows', rows}; clearDrafts('ei-'); render(); break;
+    }
+    case 'ei-add': {
+      const imp = S.emImport; if (!imp) break;
+      const r = prospectsFromRows(imp.rows, {campaign:(S.modal && S.modal.campaign) || 'auto', existing:S.data.prospects || {}, suppressed:emSuppressed()});
+      if (!r.add.length) { toast('Nothing new to add.'); break; }
+      r.add.forEach(x => setDoc('prospects', x.id, x.doc));
+      S.lastUndo = {type:'restore', ops:r.add.map(x => ({del:['prospects', x.id]}))};
+      S.emImport = null; S.modal = null; S.emFilter = 'all'; S.emCamp = 'all'; S.emSearch = '';
+      toast(`Added ${plural(r.add.length, 'contact')}.${r.held ? ` ${r.held} wait for you under Check first.` : ''}`, true); render(); break;
+    }
+    case 'em-review': { const c = emCampaigns().find(x => !x.reviewed) || emCampaigns()[0]; if (c) handle('em-campaign', {dataset:{id:c.id}}, ev); break; }
+    case 'em-campaign': clearDrafts('ec-'); S.confirm = null; S.modal = {type:'em-campaign', id:d.id, n:0, seg:null}; render(); break;
+    case 'ec-step': if (S.modal) S.modal.n = Number(d.n) || 0; render(); break;
+    case 'ec-seg': if (S.modal) S.modal.seg = d.k; render(); break;
+    case 'ec-approve': {
+      const id = S.modal && S.modal.id, prev = id && S.data.campaigns[id]; if (!prev) break;
+      const c = emClean(emDraftCampaign(id)), why = emCampaignProblem(c);
+      if (why) { toast(why); break; }
+      setDoc('campaigns', id, {...c, reviewed:true, reviewedAt:Date.now(), status:'running', updatedAt:Date.now()});
+      S.lastUndo = {type:'restore', ops:[{set:['campaigns', id, clone(prev)]}]};
+      clearDrafts('ec-'); closeModal();
+      toast(`${c.name} is approved and on. ${emSettings().enabled ? 'Its emails join the line now.' : 'Tap Start sending when you are ready.'}`, true); render(); break;
+    }
+    case 'ec-reset': {
+      const id = S.modal && S.modal.id, prev = id && S.data.campaigns[id]; if (!prev || !DEFAULT_CAMPAIGNS[id]) break;
+      setDoc('campaigns', id, {...clone(DEFAULT_CAMPAIGNS[id]), createdAt:prev.createdAt || Date.now(), updatedAt:Date.now()});
+      S.lastUndo = {type:'restore', ops:[{set:['campaigns', id, clone(prev)]}]};
+      clearDrafts('ec-'); S.confirm = null; toast('Back to the original wording. It needs your OK again before it sends.', true); render(); break;
+    }
+    case 'em-test': {
+      const id = d.id; if (!id) break;
+      if (S.modal && S.modal.type === 'em-campaign' && S.modal.id === id) {
+        const stored = S.data.campaigns[id], c = emDraftCampaign(id);
+        if (stored && emEditable(c) !== emEditable(stored)) { setDoc('campaigns', id, {...emClean(c), updatedAt:Date.now()}); clearDrafts('ec-'); }
+      }
+      emTest(id); break;
+    }
+    case 'em-camp-toggle': {
+      const c = S.data.campaigns[d.id]; if (!c) break;
+      if (!c.reviewed) { handle('em-campaign', el, ev); toast('Read it and approve it first.'); break; }
+      const on = c.status !== 'running';
+      patchDoc('campaigns', d.id, {status:on ? 'running' : 'paused'});
+      S.lastUndo = {type:'restore', ops:[{patch:['campaigns', d.id, {status:c.status || 'paused'}]}]};
+      toast(on ? `${c.name} is on.${emSettings().enabled ? '' : ' Sending is still paused overall.'}` : `${c.name} is paused. Follow-ups wait too.`, true); render(); break;
+    }
+    case 'em-camp-filter': S.emCamp = d.id || 'all'; S.emFilter = 'all'; S.emLimit = 40; render(); if (d.go) setTimeout(() => { const x = document.getElementById('em-contacts'); if (x) x.scrollIntoView({behavior:'smooth', block:'start'}); }, 30); break;
+    case 'em-filter': S.emFilter = d.f; S.emLimit = 40; render(); break;
+    case 'em-more': S.emLimit = (S.emLimit || 40) + 60; render(); break;
+    case 'em-rfilter': S.emReplies = d.f; S.emRLimit = 25; render(); break;
+    case 'em-rmore': S.emRLimit = (S.emRLimit || 25) + 50; render(); break;
+    case 'em-bulk': {
+      const all = emProspects(), f = EM_FILTERS.find(x => x[0] === S.emFilter), q = S.emSearch.trim().toLowerCase();
+      if (!f) break;
+      const ids = all.filter(p => (S.emCamp === 'all' || p.campaign === S.emCamp) && f[2](p) && (!q || [p.business, p.email, p.city, p.state, p.type, p.firstName].join(' ').toLowerCase().includes(q))).map(p => p.id);
+      const n = emSetStatus(ids, d.op);
+      toast(n ? `${d.op === 'queue' ? 'Queued' : d.op === 'pause' ? 'Paused' : 'Resumed'} ${plural(n, 'contact')}.` : 'Nothing to change.', !!n); render(); break;
+    }
+    case 'em-contact': if (!d.id || !S.data.prospects[d.id]) { toast('That contact was removed.'); break; } clearDrafts('ep-'); S.confirm = null; S.modal = {type:'em-contact', id:d.id}; render(); break;
+    case 'em-status': {
+      const p = S.data.prospects[d.id]; if (!p) break;
+      const n = emSetStatus([d.id], d.op);
+      if (n) toast(d.op === 'queue' ? `${p.business} is in line.` : d.op === 'pause' ? `${p.business} is paused.` : d.op === 'resume' ? `${p.business} is back in line.` : `${p.business} won't be emailed again.`, true);
+      render(); break;
+    }
+    case 'em-stuck': {
+      const p = S.data.prospects[d.id]; if (!p || p.sendingStep == null) break;
+      const prev = {sendingStep:p.sendingStep, sendingAt:p.sendingAt || null, step:p.step ?? 0, status:p.status, nextOn:p.nextOn ?? null};
+      patchDoc('prospects', d.id, d.went === '1' ? {sendingStep:null, sendingAt:null, step:Number(p.sendingStep) + 1, status:'done', nextOn:null} : {sendingStep:null, sendingAt:null});
+      S.lastUndo = {type:'restore', ops:[{patch:['prospects', d.id, prev]}]};
+      toast(d.went === '1' ? 'Marked as sent. No more emails to them.' : 'It goes out again on the next run.', true); render(); break;
+    }
+    case 'em-remove': {
+      const p = S.data.prospects[d.id]; if (!p) break;
+      delDoc('prospects', d.id); S.lastUndo = {type:'restore', ops:[{set:['prospects', d.id, clone(p)]}]};
+      closeModal(); toast(`Removed ${p.business || p.email}.`, true); render(); break;
+    }
+    case 'ep-save': {
+      const p = S.data.prospects[d.id]; if (!p) break;
+      const firstName = String((document.getElementById('ep-first') || {}).value ?? S.drafts['ep-first'] ?? '').trim(), business = String((document.getElementById('ep-business') || {}).value ?? S.drafts['ep-business'] ?? '').trim();
+      if (!business) { toast('The business needs a name.'); break; }
+      patchDoc('prospects', d.id, {firstName, business}); S.lastUndo = {type:'restore', ops:[{patch:['prospects', d.id, {firstName:p.firstName || '', business:p.business || ''}]}]};
+      clearDrafts('ep-'); toast('Saved. The next email uses it.', true); render(); break;
+    }
+    case 'em-lead': emToLead(d.id, d.reply || null); render(); break;
+    case 'em-done': {
+      const r = S.data.replies[d.id]; if (!r) break;
+      patchDoc('replies', d.id, {handled:true, handledAt:Date.now()}); S.lastUndo = {type:'restore', ops:[{patch:['replies', d.id, {handled:false}]}]};
+      toast('Off your hot list.', true); render(); break;
+    }
+    case 'em-start': {
+      const s = emSettings(), camps = emCampaigns(), live = camps.filter(emLive);
+      if (!emEngineOk()) { S.modal = {type:'em-setup'}; render(); outreachCheck(true); toast('Set up the engine first. It is what sends the emails.'); break; }
+      if (!String(s.address || '').trim()) { handle('em-settings', el, ev); toast('Add your mailing address first. Every email needs it.'); break; }
+      if (!live.length) { handle('em-review', el, ev); toast('Read and approve a campaign first.'); break; }
+      if (!emProspects().some(p => ['queued','active'].includes(p.status) && live.some(c => c.id === p.campaign))) { S.emImport = null; S.modal = {type:'em-import', campaign:live[0].id}; toast('Add contacts to a campaign that is on.'); break; }
+      S.confirm = 'em-start'; render(); break;
+    }
+    case 'em-start-yes': patchDoc('outreach', 'settings', {enabled:true, enabledAt:Date.now()}); S.confirm = null; toast('Sending is on. The first email goes out within 10 minutes during sending hours.'); render(); break;
+    case 'em-pause': patchDoc('outreach', 'settings', {enabled:false}); S.lastUndo = {type:'restore', ops:[{patch:['outreach', 'settings', {enabled:true}]}]}; toast('Paused. Nothing more goes out until you start again. Replies still get read.', true); render(); break;
+    case 'goto-email': S.toast = null; renderToast(); setView('email'); break;
     case 'disconnect': if (confirm('Disconnect this device from your Supabase project? You will need to paste the URL and key again.')) { clearConfig(); if (db) db.destroy({wipe:true}); Promise.resolve(supabase && supabase.auth.signOut()).catch(() => {}).then(() => location.reload()); } break;
   }
 }
@@ -2399,6 +3099,30 @@ function submit(form) {
       S.modal = {type:'block', key:m.key, date, scope:'day', back:m.back || null};
       toast(`Saved for ${daysLabel(sel)}.`, true); render(); break;
     }
+    case 'em-campaign': {
+      const id = S.modal && S.modal.id, prev = id && S.data.campaigns[id]; if (!prev) return;
+      const c = emClean(emDraftCampaign(id));
+      if (emEditable(c) === emEditable(prev)) { toast('Saved.'); return; }
+      setDoc('campaigns', id, {...c, updatedAt:Date.now()});
+      S.lastUndo = {type:'restore', ops:[{set:['campaigns', id, clone(prev)]}]};
+      clearDrafts('ec-'); const why = prev.reviewed ? emCampaignProblem(c) : '';
+      toast(why ? `Saved, but ${why.charAt(0).toLowerCase() + why.slice(1)}` : 'Saved.', true); render(); break;
+    }
+    case 'em-settings': {
+      const address = String(v('es-address')).trim(), fwd = String(v('es-forward')).trim(), start = v('es-start'), end = v('es-end');
+      if (fwd && !isEmail(fwd)) { toast("That forwarding address doesn't look right."); return; }
+      if (!isHM(start) || !isHM(end) || toMin(end) <= toMin(start)) { toast('The start time has to be before the end time.'); return; }
+      const days = (S.modal && S.modal.days) || emSettings().days;
+      if (!days.length) { toast('Pick at least one sending day.'); return; }
+      const n = (id, lo, hi, def) => { const raw = String(v(id)).trim(), x = Math.round(Number(raw)); return raw !== '' && Number.isFinite(x) ? Math.max(lo, Math.min(hi, x)) : def; };
+      const capMax = n('es-capMax', 1, 200, 50);
+      const patch = {address, forwardTo:fwd, fromName:String(v('es-name')).trim() || 'Logan Newman', website:String(v('es-website')).trim(), days:WEEK_ORDER.filter(x => days.includes(x)), start, end,
+        capStart:Math.min(capMax, n('es-capStart', 1, 200, 20)), capStep:n('es-capStep', 0, 50, 5), capMax, gap:n('es-gap', 3, 120, 6), tz:EM_TZS.some(z => z[0] === v('es-tz')) ? v('es-tz') : 'America/Chicago'};
+      const cur = emSettings(), back = {}; Object.keys(patch).forEach(k => { back[k] = cur[k]; });
+      patchDoc('outreach', 'settings', {...patch, updatedAt:Date.now()});
+      S.lastUndo = {type:'restore', ops:[{patch:['outreach', 'settings', back]}]};
+      clearDrafts('es-'); closeModal(); toast(address ? 'Settings saved.' : 'Saved. Add your mailing address before you start sending.', true); render(); break;
+    }
     case 'chat': { const txt = v('chat-in'); askAssistant(txt); break; }
     case 'task-edit': {
       const id = form.dataset.id, x = S.data.tasks[id]; if (!x) { S.modal = null; render(); return; }
@@ -2429,7 +3153,7 @@ document.addEventListener('click', ev => {
   if (el.tagName === 'INPUT') return;
   ev.preventDefault();
   handle(el.dataset.act, el, ev);
-  if (!['goto','copy','view','undo','export','signout','retry','sync-now','install','update-app','disconnect','goto-settings','calendar','notif-check','notif-enable','notif-off','notif-test','copy-fn','copy-sql','event-ics','ask','chat-suggest','chat-mic','assistant-setup','assistant-check','copy-assistant'].includes(el.dataset.act)) render();
+  if (!['goto','copy','view','undo','export','signout','retry','sync-now','install','update-app','disconnect','goto-settings','calendar','notif-check','notif-enable','notif-off','notif-test','copy-fn','copy-sql','event-ics','ask','chat-suggest','chat-mic','assistant-setup','assistant-check','copy-assistant','em-check','em-test','em-copy-fn','em-copy-sql','goto-email'].includes(el.dataset.act)) render();
 });
 /* ----- swipe a plan row (touch): left shows +30 min, Reschedule and Cancel; right marks it done ----- */
 let sw = null, swipeEnded = 0;
@@ -2479,7 +3203,9 @@ document.addEventListener('submit', ev => { const f = ev.target.closest('form[da
 document.addEventListener('input', ev => {
   const el = ev.target;
   if (el.id === 'lead-search') { S.search = el.value; const pos = el.selectionStart; render(); const n = document.getElementById('lead-search'); if (n) { n.focus(); try { n.setSelectionRange(pos, pos); } catch(e) {} } return; }
+  if (el.id === 'em-search') { S.emSearch = el.value; S.emLimit = 40; const pos = el.selectionStart; render(); const n = document.getElementById('em-search'); if (n) { n.focus(); try { n.setSelectionRange(pos, pos); } catch(e) {} } return; }
   if (el.hasAttribute && el.hasAttribute('data-draft') && el.id) S.drafts[el.id] = el.value;
+  if (el.hasAttribute && el.hasAttribute('data-emprev')) { const out = document.getElementById('em-preview'); if (out) out.innerHTML = emPreviewHtml(); }
   if (el.hasAttribute && el.hasAttribute('data-build')) {
     const out = document.getElementById(el.id + '-prev'), date = el.dataset.date || todayISO();
     if (out) { const {parsed, r} = buildPlanFor(date, el.value); out.innerHTML = buildChips(parsed, r, date); }
@@ -2498,6 +3224,23 @@ document.addEventListener('change', ev => {
   if (el.id === 'fs-date') { S.drafts['fs-date'] = el.value; render(); return; }
   if (el.id === 'nt-lead') { S.drafts['nt-lead'] = el.value; if (pushDoc()) { patchDoc('push', deviceId(), {lead:Number(el.value), updatedAt:Date.now()}); toast('Saved.'); } return; }
   if (el.id === 'import-file' && el.files && el.files[0]) { importFile(el.files[0]); el.value = ''; return; }
+  if (el.id === 'ei-file' && el.files && el.files[0]) { emReadFile(el.files[0]); el.value = ''; return; }
+  if ((el.id === 'ep-camp' || el.id === 'ep-seg') && S.modal && S.modal.type === 'em-contact') {
+    const id = S.modal.id, p = S.data.prospects[id]; if (!p) return;
+    if (el.id === 'ep-camp') {
+      if (Number(p.step) > 0 || el.value === p.campaign) return;
+      const segs = (S.data.campaigns[el.value] || {}).segments || {}, seg = segmentOf(p.type);
+      patchDoc('prospects', id, {campaign:el.value, segment:segs[seg] ? seg : 'general'});
+      S.lastUndo = {type:'restore', ops:[{patch:['prospects', id, {campaign:p.campaign, segment:p.segment || null}]}]};
+      toast(`Moved to ${(S.data.campaigns[el.value] || {}).name || 'that campaign'}.`, true);
+    } else {
+      patchDoc('prospects', id, {segment:el.value});
+      S.lastUndo = {type:'restore', ops:[{patch:['prospects', id, {segment:p.segment || null}]}]};
+      toast('Saved. The next email uses that version.', true);
+    }
+    render(); return;
+  }
+  if (el.dataset && el.dataset.relabel) { emRelabel(el.dataset.relabel, el.value); render(); return; }
   if (el.dataset && el.dataset.act === 'task-date' && el.value) { const x = S.data.tasks[el.dataset.id]; if (x) patchDoc('tasks', el.dataset.id, {due:el.value, origDue:x.origDue || x.due}); toast('Moved to ' + fmtDay(el.value) + '.'); return; }
   if (el.hasAttribute && el.hasAttribute('data-draft') && el.id) S.drafts[el.id] = el.value;
 });
@@ -2509,7 +3252,7 @@ document.addEventListener('keydown', ev => {
   if (a && a.id === 'bd-in' && ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); const f = a.closest('form'); if (f) f.requestSubmit(); return; }
   const typing = a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT' || a.isContentEditable);
   if (typing || S.modal || S.dbState !== 'ok' || !allLoaded()) return;
-  if (ev.key >= '1' && ev.key <= '5') { ev.preventDefault(); setView(VIEWS[+ev.key - 1][0]); }
+  if (ev.key >= '1' && ev.key <= String(VIEWS.length)) { ev.preventDefault(); setView(VIEWS[+ev.key - 1][0]); }
   else if (ev.key === '/') { ev.preventDefault(); setView('calls'); setTimeout(() => { const s = document.getElementById('lead-search'); if (s) s.focus(); }, 0); }
   else if (ev.key === 'n') { ev.preventDefault(); if (!['today','plan'].includes(S.view)) setView('today'); setTimeout(() => { const f = document.getElementById(S.view === 'plan' ? 'pt-title' : S.day ? 'qd-title' : 'qt-title'); if (f) { f.scrollIntoView({block:'center'}); f.focus(); } }, 0); }
   else if (ev.key === 'c') { ev.preventDefault(); handle('call-start', {dataset:{}}, ev); render(); }
@@ -2530,7 +3273,8 @@ document.addEventListener('drop', ev => {
   ev.preventDefault(); dragDepth = 0; document.body.classList.remove('dropping');
   const f = ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files[0];
   if (!f) return;
-  if (!/\.json$/i.test(f.name) && f.type !== 'application/json') { toast('Drop a backup .json file.'); return; }
+  if (/\.(csv|tsv)$/i.test(f.name) || /csv|tab-separated/.test(f.type)) { emReadFile(f); return; }
+  if (!/\.json$/i.test(f.name) && f.type !== 'application/json') { toast('Drop a backup .json file or a contacts .csv file.'); return; }
   importFile(f);
 });
 
@@ -2573,8 +3317,9 @@ if ('serviceWorker' in navigator) navigator.serviceWorker.addEventListener('mess
   const d = ev.data;
   if (!d || d.type !== 'lcc-push') return;
   window.__lcc.pushes.push(d);
-  toast(d.title + (d.body ? ' · ' + d.body : ''));
+  toast(d.title + (d.body ? ' · ' + d.body : ''), false, /#email/.test(d.url || '') && S.view !== 'email' ? {act:'goto-email', label:'Open'} : null);
 });
+window.addEventListener('hashchange', () => { const v = location.hash.slice(1); if (S.dbState === 'ok' && VIEWS.some(x => x[0] === v)) setView(v); });
 window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); S.installEvt = e; if (S.dbState === 'ok') scheduleRender(); });
 window.addEventListener('appinstalled', () => { S.installEvt = null; toast('Installed. Open Command from your home screen or dock.'); scheduleRender(); });
 const updateSW = registerSW({
