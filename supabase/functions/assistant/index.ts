@@ -17,7 +17,7 @@ import Anthropic from "npm:@anthropic-ai/sdk@0.131.0";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
 // ---- pure logic (no imports; the Deno test imports this section) ----
-export const FN_VERSION = 5;
+export const FN_VERSION = 6;
 export const MODEL = "claude-opus-5-5";
 const AREAS = ["Sales", "Build", "Pickleball", "Body", "Money", "Move", "DoD", "Fix", "Other"];
 const SESSION_TYPES = ["Drill", "Competitive", "Rec play", "Tournament", "Lesson"];
@@ -158,11 +158,17 @@ export function buildContext(d: any, today: string, now: string, tz: string) {
   const doneToday = Object.values(tasks).filter((x: any) => x && x.done && x.doneOn === today);
   if (doneToday.length) lines.push(`Done today: ${doneToday.map((x: any) => x.title).join("; ")}.`);
   const allLeads = Object.entries(leads).map(([id, l]: any) => ({ id, ...l }));
-  const due = allLeads.filter((l: any) => l.stage !== "Lost" && l.nextDate && l.nextDate <= today).sort((a: any, b: any) => ((a.type === "Cold" ? 1 : 0) - (b.type === "Cold" ? 1 : 0)) || String(a.nextDate).localeCompare(b.nextDate));
+  const due = allLeads.filter((l: any) => l.stage !== "Lost" && l.callList !== false && l.nextDate && l.nextDate <= today).sort((a: any, b: any) => ((a.type === "Cold" ? 1 : 0) - (b.type === "Cold" ? 1 : 0)) || String(a.nextDate).localeCompare(b.nextDate));
   const stages: any = {}; allLeads.forEach((l: any) => { stages[l.stage || "?"] = (stages[l.stage || "?"] || 0) + 1; });
   const won = allLeads.filter((l: any) => l.stage === "Won");
   const callBlocks = itemsForDay(d, today).filter((i: any) => i.kind === "calls").map((i: any) => `${i.region === "IA" ? "Iowa" : i.region === "AZ" ? "Arizona" : i.region || "all"} ${dialsFor(day, i.region)}/${i.quota}`);
   lines.push(`CALLS today: ${callBlocks.join(", ") || "no call blocks today"}. Conversations today ${(day.calls || []).filter((c: any) => c.convo).length}, demos booked today ${(day.calls || []).filter((c: any) => c.demo).length}. Pipeline: ${Object.entries(stages).map(([k, v]) => `${k} ${v}`).join(", ") || "-"}. Won clients: ${won.map((l: any) => `${l.name} (${money(l.monthly)}/mo)`).join(", ") || "none"}.\nLeads due now (${due.length}, showing ${Math.min(due.length, 30)}):\n${due.slice(0, 30).map((l: any) => `- [${l.id}] ${l.name}${l.business ? ", " + l.business : ""} | ${l.type}/${l.stage}${l.region ? "/" + l.region : ""} | next: ${l.nextStep || "-"} (${l.nextDate})${l.phone ? " | " + l.phone : ""}`).join("\n") || "- none"}`);
+  // Email outreach: hot replies waiting for an answer, and what the engine and the finder did today.
+  const hot = Object.entries(d.replies || {}).map(([id, r]: any) => ({ id, ...r })).filter((r: any) => ["interested", "question", "referral"].includes(r.label) && !r.handled).sort((a: any, b: any) => String(b.at).localeCompare(String(a.at)));
+  const os = (d.outreach || {}).settings || {}, ost = (d.outreach || {}).state || {}, ofi = (d.outreach || {}).finder || {};
+  const sentToday = ost.today && ost.today.date === today ? ost.today.sent || 0 : 0, foundToday = ofi.today && ofi.today.date === today ? ofi.today.found || 0 : 0;
+  const inSeq = allLeads.filter((l: any) => l.seq && ["queued", "active"].includes(l.seq.status)).length;
+  if (os.createdAt || hot.length || inSeq) lines.push(`EMAIL OUTREACH: sending ${os.enabled ? "on" : "paused"}, ${sentToday} sent today, ${inSeq} leads waiting in campaigns; lead finder ${os.finder && os.finder.enabled ? "on" : "off"}, ${foundToday} found today. Hot replies to answer (${hot.length}):\n${hot.slice(0, 10).map((r: any) => { const l = leads[r.lead || r.prospect] || {}; return `- [${r.lead || r.prospect}] ${l.name || r.business || r.email}: ${clip(r.summary || r.snippet || r.text || "", 120)}${l.phone ? " | " + l.phone : ""}`; }).join("\n") || "- none"}`);
   const ws = weekStartOf(today);
   const st: any = { dials: 0, convos: 0, demos: 0, dms: 0, proposals: 0, deals: 0, mockups: 0, cash: 0, gym: 0, mobility: 0, drill: 0, competitive: 0, checkins: 0 };
   for (let i = 0; i < 7; i++) {
@@ -377,12 +383,14 @@ export async function runTool(store: any, name: string, input: any, today: strin
       return { result: "updated", action: `${nx.dropped ? "Dropped" : nx.done ? "Completed" : "Updated"} to-do: ${nx.title}` };
     }
     case "add_lead_note": {
-      const l = (d.leads || {})[input.lead_id]; if (!l) return err("no lead with that id");
+      // Only the note and the next step change, on the lead as it is now: the email engine may have
+      // logged a send or a reply on it since this question started.
+      const l = (await store.get("leads", input.lead_id)) || (d.leads || {})[input.lead_id]; if (!l) return err("no lead with that id");
       const note = str(input.note); if (!note) return err("note is required");
-      const nl: any = { ...l, notes: (l.notes ? l.notes + "\n" : "") + `${today.slice(5).replace("-", "/")}: ${note}`, updatedAt: Date.now() };
-      if (str(input.next_step)) nl.nextStep = str(input.next_step);
-      if (isDate(input.next_date)) nl.nextDate = input.next_date;
-      await put("leads", input.lead_id, nl);
+      const p: any = { notes: (l.notes ? l.notes + "\n" : "") + `${today.slice(5).replace("-", "/")}: ${note}`, updatedAt: Date.now() };
+      if (str(input.next_step)) p.nextStep = str(input.next_step);
+      if (isDate(input.next_date)) p.nextDate = input.next_date;
+      await patch("leads", input.lead_id, p);
       return { result: "noted", action: `Noted on ${l.name}` };
     }
     case "log_checkin": {
