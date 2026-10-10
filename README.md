@@ -107,6 +107,8 @@ The **Pipeline** tab is your CRM. Every business is one lead, whether you call i
 - **Calls**: today's dials and the leads due for a call, the same cards and result buttons as before. Only leads on your call list show up here, so a few thousand found leads don't bury your calls.
 - **All leads**: a list you can filter by heat, stage and source (call list, email, finder, imported) and sort by heat, next step, latest activity or newest. Everything shown can be moved to a stage, started on an email campaign, or put on or taken off the call list at once, with one Undo.
 
+**On Today**, the Pipeline card puts the replies to answer first, then the deals due for a follow-up, with the calls due, the new leads the finder found and whether emails are going out. **On the Week tab**, Emails sent, Email replies and New leads found count up next to your dials.
+
 **Tap any lead** for everything about it: the stage, Call / Text / Email / Website, the next step and date, whether it's on your call list, its email campaign (what was sent, what goes out next and when, pause, resume, start one), every stage move, email, reply and call in one timeline, and your notes.
 
 **What moves by itself.** A reply that says yes, asks a question or points you to someone moves the lead to **Talking**, makes it warm and puts it on your call list today. "Not now" moves it to **Not now**; "not interested" or "unsubscribe" moves it to **Lost** and onto the do-not-contact list. A call where you talk to the owner moves it to **Talking**, a demo to **Demo booked**. The first email moves a new lead to **Contacted**. Anyone who moves past Contacted, by a reply, a call or your own tap, stops getting cold emails. Two campaigns start from the pipeline: **Check back** emails leads that sat in Not now for 60 days, and **Proposal follow-up** emails leads 2 days after you move them to Proposal sent (both wait for your approval like any campaign).
@@ -118,7 +120,9 @@ The **Email** tab runs your cold email campaigns from your own Gmail (logan@loga
 - **Own the Home Screen**: a custom app on your clients' home screens, $7,500 or about $625 a month over 12 months with Klarna. The first email changes with the type of business (med spas, wellness and IV clinics, chiropractors, clubs and courts, studios, everyone else).
 - **Front Desk AI**: an AI front desk that answers every call and text, plus full-service marketing, for service businesses and dental offices. Read its wording carefully and change anything that isn't true yet; add a price line if you want one in the email.
 
-Each campaign is a first email and two follow-ups in the same thread, three and five sending days apart. Nothing goes out until you approve a campaign's wording, add your mailing address, and tap **Start sending**.
+Each campaign is a first email and two follow-ups in the same thread, three and five sending days apart. Nothing goes out until you approve a campaign's wording, add your mailing address, and pick a start day.
+
+**Start sending** (on the Email tab, or on Today's Pipeline card) opens one page with everything for your first sending day: whether the engine is ready, your mailing address, both cold campaigns with their first email to read and a switch to find new leads for each, and the first sending day (the next one, Monday, to start). **Approve both and start Mon, Oct 12** is your OK: it approves both emails as they read, saves the address, turns on the finder, and nothing goes out before that day, even if you tap it on a Saturday. Pause stops it any time, and Undo takes the tap back.
 
 **What runs by itself, even with the app closed:**
 
@@ -144,7 +148,7 @@ Each campaign is a first email and two follow-ups in the same thread, three and 
 
 **Your mailing address.** US law (CAN-SPAM) requires a postal address at the bottom of every sales email. It is only a line of text: nothing is ever mailed to it. To keep your home address private, use a PO box or a virtual mailbox (iPostal1 or Anytime Mailbox, about $10 a month, set up online). Nothing sends until one is in **Settings**, which also has the forwarding address, the sending days and hours, the warm-up numbers and your time zone.
 
-**Updating from 1.9:** redeploy the `outreach` function with the new code and run the new `cron.sql` once (it adds the finder's schedule). Your 1.9 contacts become leads in the pipeline the first time you open the app.
+**Updating from 1.9 or 2.0:** redeploy the `outreach` function with the new code (version 3, the one that waits for your start day) and run the new `cron.sql` once (it adds the finder's schedule). Your 1.9 contacts become leads in the pipeline the first time you open the app.
 
 **Good to know:** start with the warm-up as it is; sending a lot from a new mailbox is the fastest way into spam folders. One Gmail inbox sends about 50 emails a day once warmed up, follow-ups included, so the finder's 50 a day keeps it full. More than that takes more inboxes. Keep an eye on the first replies and fix any that were sorted wrong (**Sorted as** on the reply, with Undo). If the engine or the finder hits a problem (an expired Google token, say), the Email tab shows it in red with what to do.
 
