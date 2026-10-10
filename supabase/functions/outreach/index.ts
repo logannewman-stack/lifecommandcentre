@@ -27,7 +27,7 @@ import * as webpush from "jsr:@negrel/webpush@0.5.0";
 import Anthropic from "npm:@anthropic-ai/sdk@0.131.0";
 
 // ---- pure logic (plain JavaScript; the tests import this section) ----
-export const FN_VERSION = 2;
+export const FN_VERSION = 3;
 export const MODEL = "claude-opus-5-5";
 export const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 export const SEND_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -43,7 +43,7 @@ export const FINDER_DEFAULTS: any = {
   },
 };
 export const DEFAULT_SETTINGS: any = {
-  enabled: false, fromName: "Logan Newman", website: "logandnewman.com", address: "", forwardTo: "",
+  enabled: false, autoStart: false, startOn: "", fromName: "Logan Newman", website: "logandnewman.com", address: "", forwardTo: "",
   days: SEND_DAYS, start: "08:30", end: "16:30", tz: "America/Chicago", capMax: 50, capStart: 20, capStep: 5, gap: 6,
 };
 function finderWithDefaults(f: any) {
@@ -88,6 +88,13 @@ export function sendDaysSince(from: string, to: string, days: string[]) {
   return n;
 }
 // Today's limit for the whole inbox. It starts low and grows each sending day, so a new mailbox warms up.
+// Sending is on when you tapped Start sending (enabled) or set it to start by itself (autoStart); with
+// a start day (startOn) either one waits for that day. Returns 'paused', 'later' or 'on'.
+export function sendingState(settings: any, today: string) {
+  const s = settings || {};
+  if (!s.enabled && !s.autoStart) return "paused";
+  return s.startOn && today < s.startOn ? "later" : "on";
+}
 export function dailyCap(settings: any, today: string) {
   const s = withDefaults(settings), max = num(s.capMax, 50), start = Math.min(max, num(s.capStart, 20)), step = num(s.capStep, 5);
   return s.startedOn ? Math.min(max, start + step * sendDaysSince(s.startedOn, today, s.days)) : start;
@@ -200,12 +207,13 @@ export const liveCampaign = (c: any) => !!(c && c.status === "running" && c.revi
 
 // What to send now: follow-ups that are due first, then new contacts, campaigns taking turns,
 // each campaign under its own daily limit and the inbox under its warm-up limit.
-// Returns {id, step, campaign} or {why}: paused | address | cap | gap | no-campaign | nothing-due.
+// Returns {id, step, campaign} or {why}: paused | address | start | cap | gap | no-campaign | nothing-due.
 export function pickNext({ leads, campaigns, settings, state, suppressed, now }: any) {
   const s = withDefaults(settings);
-  if (!s.enabled) return { why: "paused" };
+  const today = localClock(s.tz, now).date, on = sendingState(s, today);
+  if (on === "paused") return { why: "paused" };
   if (!String(s.address || "").trim()) return { why: "address" };
-  const today = localClock(s.tz, now).date;
+  if (on === "later") return { why: "start", startOn: s.startOn };
   const counts = state && state.today && state.today.date === today ? state.today : { date: today, sent: 0, by: {} };
   const cap = dailyCap(s, today);
   if ((counts.sent || 0) >= cap) return { why: "cap", cap };

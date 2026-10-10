@@ -18,7 +18,7 @@ export const FINDER_DEFAULTS = {
   },
 };
 export const DEFAULT_SETTINGS = {
-  enabled: false, fromName: 'Logan Newman', website: 'logandnewman.com', address: '', forwardTo: '',
+  enabled: false, autoStart: false, startOn: '', fromName: 'Logan Newman', website: 'logandnewman.com', address: '', forwardTo: '',
   days: SEND_DAYS, start: '08:30', end: '16:30', tz: 'America/Chicago', capMax: 50, capStart: 20, capStep: 5, gap: 6,
 };
 function finderWithDefaults(f) {
@@ -57,6 +57,13 @@ export function sendDaysSince(from, to, days) {
   let n = 0, d = from, guard = 0;
   while (d < to && guard++ < 400) { d = addD(d, 1); if (days.includes(dowD(d))) n++; }
   return n;
+}
+// Sending is on when you tapped Start sending (enabled) or set it to start by itself (autoStart); with
+// a start day (startOn) either one waits for that day. Returns 'paused', 'later' or 'on'.
+export function sendingState(settings, today) {
+  const s = settings || {};
+  if (!s.enabled && !s.autoStart) return 'paused';
+  return s.startOn && today < s.startOn ? 'later' : 'on';
 }
 export function dailyCap(settings, today) {
   const s = withDefaults(settings), max = num(s.capMax, 50), start = Math.min(max, num(s.capStart, 20)), step = num(s.capStep, 5);
@@ -363,6 +370,29 @@ export function heatOf(l, now = Date.now()) {
   if (age <= 2) score += 12; else if (age <= 7) score += 8; else if (age <= 30) score += 3; else if ((STAGE_RANK[l.stage] ?? 0) >= 2) score -= 12;
   score = Math.max(1, Math.min(99, Math.round(score)));
   return score >= 60 ? { score, label: 'Hot', cls: 'hot' } : score >= 30 ? { score, label: 'Warm', cls: 'warm' } : { score, label: 'Cold', cls: 'cold' };
+}
+
+// What "Approve and start" on the Start sending sheet writes, when you tap it: the cold campaigns you
+// haven't approved yet, approved and on; your address; the finder's switch for each campaign; and
+// sending set to start by itself on the day you picked (the engine holds every email until then).
+// Returns {campaigns: {id: doc}, settings: patch, undo: [ops], finderOn} or {error: 'address' | 'date'}.
+export function launchWrites({ campaigns = {}, settings = null, ids = [], address = '', startOn = '', today = '', find = {}, now = Date.now() } = {}) {
+  const addr = String(address || '').trim();
+  if (!addr) return { error: 'address' };
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(startOn)) || startOn < today) return { error: 'date' };
+  const s = withDefaults(settings), cur = settings || {}, out = { campaigns: {}, undo: [] }, targets = {};
+  for (const id of ids) {
+    const c = campaigns[id];
+    if (!c || (c.reviewed && c.status === 'running')) continue;
+    out.campaigns[id] = { ...c, reviewed: true, reviewedAt: now, status: 'running', updatedAt: now };
+    out.undo.push({ set: ['campaigns', id, JSON.parse(JSON.stringify(c))] });
+  }
+  for (const id of ids) if (s.finder.targets[id]) targets[id] = { on: !!find[id] };
+  out.finderOn = Object.values(targets).some(x => x.on);
+  out.settings = { address: addr, autoStart: true, startOn, finder: { enabled: out.finderOn, targets }, updatedAt: now };
+  out.undo.push({ patch: ['outreach', 'settings', { address: cur.address ?? '', autoStart: !!cur.autoStart, startOn: cur.startOn ?? '',
+    finder: { enabled: !!s.finder.enabled, targets: Object.fromEntries(Object.keys(targets).map(k => [k, { on: !!s.finder.targets[k].on }])) } }] });
+  return out;
 }
 
 // Counts for a campaign (or all of them): who is in it, who was emailed, who answered.
