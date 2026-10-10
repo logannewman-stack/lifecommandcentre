@@ -2001,6 +2001,8 @@ const emSuppressed = () => new Set(Object.keys(S.data.suppress || {}).map(e => e
 const emHot = () => emReplies().filter(r => HOT.includes(r.label) && !r.handled);
 const emStuck = l => !!(l.seq && l.seq.sendingStep != null && l.seq.sendingAt && Date.now() - Date.parse(l.seq.sendingAt) > 15 * 60000);
 const emGmail = () => (S.outEng && S.outEng.gmail && S.outEng.gmail.email) || emState().gmail || '';
+// The engine Supabase runs is older than the copy in this app (from its status check or its last run).
+const emOutdated = () => { const e = S.outEng || {}, st = emState(); return (e.fn === 'ok' && (e.version || 1) < OUTREACH_V) || (!!st.version && st.version < OUTREACH_V); };
 const emEngineOk = () => !!((S.outEng && S.outEng.fn === 'ok' && S.outEng.gmail && S.outEng.gmail.ok) || emState().gmail);
 const gmailThread = id => `https://mail.google.com/mail/${emGmail() ? '?authuser=' + encodeURIComponent(emGmail()) : 'u/0/'}#all/${encodeURIComponent(id)}`;
 const gmailCompose = to => `https://mail.google.com/mail/?${emGmail() ? 'authuser=' + encodeURIComponent(emGmail()) + '&' : ''}view=cm&fs=1&to=${encodeURIComponent(to)}`;
@@ -2113,9 +2115,10 @@ async function emSettle(paths) {
   try { await Promise.all(paths.map(p => queues[p]).filter(Boolean)); } catch (e) {}
   for (let i = 0; i < 25 && db && db.status().pending; i++) { try { await db.flush(); } catch (e) {} await new Promise(r => setTimeout(r, 200)); }
 }
-async function emTest(id) {
-  if (S.emTestBusy) return;
+async function emTest(id, quiet) {
+  if (S.emTestBusy && !quiet) return null;
   S.emTestBusy = true; render();
+  let out = null;
   try {
     if (!outreachUrl()) throw new Error('Connect your Supabase project first.');
     await emSettle(['campaigns/' + id, 'outreach/settings']);
@@ -2126,9 +2129,37 @@ async function emTest(id) {
     if (r.status === 404) throw new Error("The email engine isn't set up yet. Open Engine setup on the Email tab.");
     const j = await r.json().catch(() => ({}));
     if (!r.ok || !j.ok) throw new Error(j.error || `The engine answered ${r.status}.`);
-    toast(`Test sent to ${j.to}. It's in your inbox now.${j.missing && j.missing.length ? ` Fill in ${j.missing.join(', ')} before it can go out.` : ''}`);
-  } catch (e) { toast((e && e.message) || "Couldn't send the test."); }
+    out = {ok:true, to:j.to, missing:j.missing || []};
+    if (!quiet) toast(`Test sent to ${j.to}. It's in your inbox now.${j.missing && j.missing.length ? ` Fill in ${j.missing.join(', ')} before it can go out.` : ''}`);
+  } catch (e) { out = {ok:false, error:(e && e.message) || "Couldn't send the test."}; if (!quiet) toast(out.error); }
+  if (!quiet) { S.emTestBusy = false; render(); }
+  return out;
+}
+// Both cold campaigns' first emails to your own inbox, one after the other.
+async function emTestBoth() {
+  if (S.emTestBusy) return;
+  const ids = LAUNCH_CAMPS.filter(id => (S.data.campaigns || {})[id]), done = [];
+  for (const id of ids) { const r = await emTest(id, true); if (!r || !r.ok) { S.emTestBusy = false; render(); toast((r && r.error) || "Couldn't send the test."); return; } done.push(r); }
   S.emTestBusy = false; render();
+  if (done.length) toast(`${done.length === 1 ? 'A test is' : 'Both tests are'} in ${done[0].to}. They show exactly what businesses get, with [Test] in the subject.`);
+}
+// Runs the finder once now instead of waiting for its schedule, to see it work.
+const FIND_WHY = {off:'The finder is off. Turn it on first.', key:'The finder needs your Anthropic key in Supabase (ANTHROPIC_API_KEY).', target:"Today's number of new leads is reached. It starts again tomorrow.", budget:"Today's spending limit is reached. It starts again tomorrow.", done:'Every search in your list ran in the last 90 days. Add types of business or cities in its Settings.', error:'The search didn\'t finish. It tries again on the next run.'};
+async function emFindNow() {
+  if (S.emFindBusy) return;
+  S.emFindBusy = true; render();
+  try {
+    if (!outreachUrl()) throw new Error('Connect your Supabase project first.');
+    await emSettle(['outreach/settings']);
+    const r = await fetch(outreachUrl() + '?job=find', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{"job":"find"}'});
+    if (r.status === 404) throw new Error("The engine isn't set up yet. Open Engine setup on the Email tab.");
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) throw new Error(j.error || `The engine answered ${r.status}.`);
+    const res = Object.values(j.results || {})[0] || {why:'off'};
+    try { if (db) await db.refresh(); } catch (e) {}
+    toast(res.error ? `The finder hit a problem: ${res.error}` : res.why === 'ran' ? `Searched ${res.search || String(res.job || '').split('|').slice(1).join(' in ') || 'one type of business in one city'}: ${plural(res.found || 0, 'new lead')}${res.checked ? ` from ${res.checked} ${res.checked === 1 ? 'business' : 'businesses'} checked` : ''}.` : FIND_WHY[res.why] || 'Nothing to do right now.');
+  } catch (e) { toast((e && e.message) || "Couldn't run the finder."); }
+  S.emFindBusy = false; render();
 }
 
 /* the campaign being edited: what is saved plus what you typed */
@@ -2248,7 +2279,8 @@ function emHero(s, st, camps, list) {
 }
 function emChecklist(s, camps, list) {
   const items = [
-    [emEngineOk(), 'Connect your Gmail', 'The engine runs in your Supabase project and sends from your own inbox.', 'em-setup', 'Set it up'],
+    emEngineOk() && emOutdated() ? [false, 'Update the engine', 'Supabase runs an older copy. Copy the new code, deploy it and run the SQL again (Engine setup, steps 5 and 6).', 'em-setup', 'Update']
+      : [emEngineOk(), 'Connect your Gmail', 'The engine runs in your Supabase project and sends from your own inbox.', 'em-setup', 'Set it up'],
     [!!String(s.address || '').trim(), 'Add a mailing address', 'The law requires one at the bottom of every sales email. A PO box or virtual mailbox works.', 'em-settings', 'Add it'],
     [list.length > 0 || s.finder.enabled, 'Add leads', 'Turn on the finder, or add outreach-list.csv or any spreadsheet with emails.', 'em-finder', 'Set up the finder'],
     [camps.some(c => c.reviewed), 'Read and approve the emails', 'Nothing goes out until you approve the wording.', 'em-review', 'Read them'],
@@ -2355,7 +2387,7 @@ function emFinderCard(s) {
     ${f.enabled && S.outEng && S.outEng.fn === 'ok' && !S.outEng.hasKey ? '<div class="warnbox">The finder needs your Anthropic key in Supabase (ANTHROPIC_API_KEY). Engine setup, step 4.</div>' : ''}
     ${f.enabled && ran !== null && ran > 40 ? `<div class="warnbox">The finder last ran ${esc(emAgo(st.lastRun))}. Check its schedule (Engine setup, step 6).</div>` : f.enabled && ran === null ? '<div class="meta">Waiting for its first run. It needs the engine and its 15-minute schedule (Engine setup, step 6).</div>' : ''}
     ${(st.recent || []).length ? `<details><summary>Last searches</summary><div class="elist">${st.recent.slice(0, 6).map(x => `<div class="erow static"><div class="min0"><b>${esc(x.search)}</b><div class="meta clamp1">${x.found ? esc((x.names || []).join(', ')) : 'No new businesses with an email'}</div></div><div class="erow-r"><span class="pill ${x.found ? 'good' : ''}">${x.found} new</span><span class="meta">${esc(emAgo(x.at))}</span></div></div>`).join('')}</div></details>` : ''}
-    <div class="btnrow"><button class="btn sm ${f.enabled ? '' : 'primary'}" data-act="em-finder-toggle">${f.enabled ? 'Pause' : 'Turn on'}</button><button class="btn sm" data-act="em-finder">Settings</button><span class="meta">${finderSearches(f)} searches in your list</span></div>
+    <div class="btnrow"><button class="btn sm ${f.enabled ? '' : 'primary'}" data-act="em-finder-toggle">${f.enabled ? 'Pause' : 'Turn on'}</button>${f.enabled && emEngineOk() ? `<button class="btn sm" data-act="em-find-now" ${S.emFindBusy ? 'disabled' : ''}>${S.emFindBusy ? 'Searching… up to 2 min' : 'Search now'}</button>` : ''}<button class="btn sm" data-act="em-finder">Settings</button><span class="meta">${finderSearches(f)} searches in your list</span></div>
   </section>`;
 }
 function emCampaignCard(c, list, st, s) {
@@ -2702,6 +2734,7 @@ function emSetupSheet() {
     ${step(4, 'Add the secrets in Supabase', `Open <b>Edge Functions › Secrets</b> and add <span class="kbd">GMAIL_CLIENT_ID</span>, <span class="kbd">GMAIL_CLIENT_SECRET</span> and <span class="kbd">GMAIL_REFRESH_TOKEN</span>. <span class="kbd">ANTHROPIC_API_KEY</span> (already there if you set up Ask) lets Claude sort the replies and run the finder.${st.fn === 'ok' ? `<div class="btnrow" style="margin-top:6px">${gm.ok ? `<span class="pill good">Gmail connected: ${esc(gm.email)}</span>` : '<span class="pill warn">Gmail not connected yet</span>'}${st.hasKey ? '<span class="pill good">Anthropic key is set</span>' : '<span class="pill warn">No Anthropic key: no finder, and replies are sorted by simple rules</span>'}</div>${!gm.ok && gm.error ? `<div class="err" style="margin-top:6px">${esc(gm.error)}</div>` : ''}` : ''}`, gmailOk)}
     ${step(5, 'Create the function', `Open <b>Edge Functions › Deploy a new function › Via Editor</b>. Name it <span class="kbd">outreach</span>, replace all the code with the copied code, and <b>Deploy</b>. Then, in the function's <b>Settings</b>, turn <b>off</b> "Verify JWT".<div class="btnrow" style="margin-top:6px"><button class="btn sm" data-act="em-copy-fn">Copy the code</button><button class="btn sm ghost" data-act="em-check">${st.checking ? 'Checking…' : 'Check'}</button>${st.fn === 'ok' ? (outdated ? '<span class="pill warn">Update needed</span>' : '<span class="pill good">Found</span>') : st.fn === 'missing' ? '<span class="pill warn">Not found yet</span>' : st.fn === 'error' ? '<span class="pill bad">Problem</span>' : ''}</div>${outdated ? '<div class="meta" style="margin-top:6px">Supabase is running an older copy. Copy the code, open the <b>outreach</b> function, replace all of its code, Deploy, then tap Check.</div>' : ''}${st.fn === 'error' && st.msg ? `<div class="err" style="margin-top:6px">${esc(st.msg)}</div>` : ''}`, st.fn === 'ok' && !outdated)}
     ${step(6, 'Put it on a schedule', `Easiest: tap <b>Copy the SQL</b>, open Supabase's <b>SQL Editor</b>, paste it and click <b>Run</b>. It sets up both jobs: sending and replies every 10 minutes, the finder every 15. (On the <b>Integrations › Cron</b> page instead: one job for <b>outreach</b> every <span class="kbd">*/10 * * * *</span>, and a second one every <span class="kbd">7,22,37,52 * * * *</span> with the body <span class="kbd">{"job":"find"}</span>, both POST with timeout <span class="kbd">120000</span> ms.)<div class="btnrow" style="margin-top:6px"><button class="btn sm" data-act="em-copy-sql">Copy the SQL</button>${ran !== null && ran <= 12 ? '<span class="pill good">Sending job running</span>' : ran !== null ? `<span class="pill warn">Sending job last ran ${esc(emAgo(state.lastRun))}</span>` : st.fn === 'ok' ? '<span class="pill warn">Not running yet. Check back in 10 minutes.</span>' : ''}${fran !== null && fran <= 20 ? '<span class="pill good">Finder running</span>' : ''}</div>`, ran !== null && ran <= 12)}
+    ${step(7, 'Keep your emails out of spam', `Cold email reaches inboxes when your domain vouches for it. If logandnewman.com runs on Google Workspace, open <b>admin.google.com</b> › Apps › Google Workspace › Gmail › <b>Authenticate email</b>, generate the DKIM record, add it as a TXT record where your domain's DNS is managed, then click <b>Start authentication</b>. The DNS also needs SPF, a TXT record on the domain itself, <span class="kbd">v=spf1 include:_spf.google.com ~all</span> <button class="btn sm ghost copyin" data-act="copy" data-text="v=spf1 include:_spf.google.com ~all">Copy</button> (if one starting with v=spf1 is already there, add <span class="kbd">include:_spf.google.com</span> to it instead of making a second), and DMARC, a TXT record named <span class="kbd">_dmarc</span> with <span class="kbd">v=DMARC1; p=none</span> <button class="btn sm ghost copyin" data-act="copy" data-text="v=DMARC1; p=none">Copy</button>. About 10 minutes once; the records can take a few hours to start working.`, false)}
     ${state.lastError ? `<div class="err">Last run: ${esc(state.lastError)}</div>` : ''}
     <div class="meta">Nothing is sent until you approve a campaign, add your mailing address and tap Start sending. The finder does nothing until you turn it on.</div>`;
 }
@@ -2742,7 +2775,7 @@ function emLaunchSheet() {
     <p class="meta" style="margin:0;color:var(--ink-2)">Everything for your first sending day on one page. Nothing goes out before the day you pick, and Pause on the Email tab stops it any time. Replies are read either way.</p>
     ${step(1, 'The engine', `<div class="meta" style="color:var(--ink-2)">${engLine}</div>${engineOk ? '' : '<div class="btnrow"><button class="btn sm" data-act="em-setup">Engine setup</button></div>'}`, engineOk)}
     ${step(2, 'Your mailing address', `<textarea class="in" id="lx-address" rows="2" data-draft placeholder="PO Box 123, Des Moines, IA 50309">${esc(addr)}</textarea><span class="meta">One line of text at the bottom of each email, which US law requires in sales email. Nothing is ever mailed to it. A PO box or a virtual mailbox (iPostal1 or Anytime Mailbox, about $10 a month) keeps your home address private.</span>`, !!String(addr).trim())}
-    ${step(3, 'The emails', `${campRows}<span class="meta">The finder adds up to ${f.perDay} new leads a day in all and spends at most ${dollars(f.budget)} a day on your Anthropic account. Change that in its Settings.</span>`, !need.length)}
+    ${step(3, 'The emails', `${campRows}${engineOk ? `<div class="btnrow"><button class="btn sm" data-act="lx-test" ${S.emTestBusy ? 'disabled' : ''}>${S.emTestBusy ? 'Sending…' : 'Send me both as a test'}</button><span class="meta">To your own inbox, so you see exactly what goes out.</span></div>` : ''}<span class="meta">The finder adds up to ${f.perDay} new leads a day in all and spends at most ${dollars(f.budget)} a day on your Anthropic account. Change that in its Settings.</span>`, !need.length)}
     ${step(4, 'Your first sending day', `<input class="in" type="date" id="lx-date" data-draft data-rerender min="${t}" value="${esc(startOn)}" style="max-width:220px"><span class="meta">${fmtTap(s.start)} to ${fmtTap(s.end)} in each business's own time, ${esc(emDays(s.days))}. ${s.capStart} emails on the first day and ${s.capStep} more each sending day, up to ${s.capMax} a day, follow-ups included.</span>`, false)}
     <div class="btnrow emfoot"><button class="btn primary" data-act="lx-go">${esc(label)} ${esc(dayWord(startOn))}</button><button class="btn ghost" data-act="modal-close">Not yet</button></div>
     ${need.length ? `<div class="meta">This approves ${need.length > 1 ? 'both first emails and their follow-ups' : 'that campaign\'s emails'} as they read now.</div>` : ''}`;
@@ -3342,6 +3375,8 @@ function handle(act, el, ev) {
       S.lastUndo = {type:'restore', ops:[{patch:['outreach', 'settings', {finder:{enabled:!on}}]}]};
       toast(on ? (emEngineOk() ? `The finder is on: up to ${f.perDay} new leads a day, ${dollars(f.budget)} a day at most.` : 'The finder is on. It starts once the engine is set up (Engine setup).') : 'The finder is paused. Leads it already found stay.', true); render(); break;
     }
+    case 'lx-test': emTestBoth(); break;
+    case 'em-find-now': emFindNow(); break;
     case 'em-start': case 'em-launch': clearDrafts('lx-'); S.confirm = null; S.modal = {type:'em-launch'}; render(); outreachCheck(true); break;
     // Logan's own tap: approves the two cold campaigns as they read now, saves the address and the finder,
     // and sets sending to start by itself on the day picked. The engine holds every email until then.
@@ -3656,7 +3691,7 @@ document.addEventListener('click', ev => {
   if (el.tagName === 'INPUT') return;
   ev.preventDefault();
   handle(el.dataset.act, el, ev);
-  if (!['goto','copy','view','undo','export','signout','retry','sync-now','install','update-app','disconnect','goto-settings','calendar','notif-check','notif-enable','notif-off','notif-test','copy-fn','copy-sql','event-ics','ask','chat-suggest','chat-mic','assistant-setup','assistant-check','copy-assistant','em-check','em-test','em-copy-fn','em-copy-sql','goto-email'].includes(el.dataset.act)) render();
+  if (!['goto','copy','view','undo','export','signout','retry','sync-now','install','update-app','disconnect','goto-settings','calendar','notif-check','notif-enable','notif-off','notif-test','copy-fn','copy-sql','event-ics','ask','chat-suggest','chat-mic','assistant-setup','assistant-check','copy-assistant','em-check','em-test','em-copy-fn','em-copy-sql','goto-email','lx-test','em-find-now'].includes(el.dataset.act)) render();
 });
 /* ----- swipe a plan row (touch): left shows +30 min, Reschedule and Cancel; right marks it done ----- */
 let sw = null, swipeEnded = 0;
