@@ -27,7 +27,7 @@ import * as webpush from "jsr:@negrel/webpush@0.5.0";
 import Anthropic from "npm:@anthropic-ai/sdk@0.131.0";
 
 // ---- pure logic (plain JavaScript; the tests import this section) ----
-export const FN_VERSION = 5;
+export const FN_VERSION = 6;
 export const MODEL = "claude-opus-5-5";
 export const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 export const SEND_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -36,10 +36,10 @@ export const FINDER_AREAS = "Des Moines, IA; West Des Moines, IA; Urbandale, IA;
   "Phoenix, AZ; Scottsdale, AZ; Mesa, AZ; Chandler, AZ; Gilbert, AZ; Tempe, AZ; Glendale, AZ; Peoria, AZ; Surprise, AZ; Goodyear, AZ; Queen Creek, AZ; " +
   "Fountain Hills, AZ; Tucson, AZ; Flagstaff, AZ; Prescott, AZ";
 export const FINDER_DEFAULTS: any = {
-  enabled: false, perDay: 50, budget: 3, model: "claude-opus-5-5", review: false,
+  enabled: false, perDay: 100, budget: 5, keep: 300, model: "claude-opus-5-5", review: false,
   targets: {
     "front-desk": { on: true, niches: "HVAC, plumber, electrician, roofer, landscaping, lawn care, house cleaning, carpet cleaning, pest control, garage door repair, pool service, handyman, house painter, remodeling contractor, tree service, junk removal, moving company, pressure washing, auto repair, auto detailing, towing, locksmith, appliance repair, water damage restoration, dentist, orthodontist, pediatric dentist, cosmetic dentist", areas: FINDER_AREAS },
-    "home-screen": { on: false, niches: "med spa, IV therapy, chiropractor, pilates studio, yoga studio, boutique gym, pickleball club, hair salon, massage therapy", areas: FINDER_AREAS },
+    "home-screen": { on: true, niches: "med spa, IV therapy, chiropractor, pilates studio, yoga studio, boutique gym, pickleball club, hair salon, massage therapy", areas: FINDER_AREAS },
   },
 };
 export const DEFAULT_SETTINGS: any = {
@@ -53,6 +53,17 @@ function finderWithDefaults(f: any) {
   return { ...FINDER_DEFAULTS, ...x, targets };
 }
 export const withDefaults = (s: any) => ({ ...DEFAULT_SETTINGS, ...(s || {}), days: Array.isArray(s && s.days) && s.days.length ? s.days : DEFAULT_SETTINGS.days, finder: finderWithDefaults(s && s.finder) });
+// Leads waiting for their first email in each campaign: queued, or held for you to check first.
+// The finder keeps this at `finder.keep` for every campaign it searches for.
+export function inLine(leads: any) {
+  const out: any = {};
+  for (const l of Object.values(leads || {}) as any) {
+    const q = l && l.seq;
+    if (!q || !q.campaign || !["queued", "hold"].includes(q.status) || Number(q.step) > 0 || l.dnc || l.emailBad) continue;
+    out[q.campaign] = (out[q.campaign] || 0) + 1;
+  }
+  return out;
+}
 const num = (v: any, d: number) => (v === "" || v === null || v === undefined || !Number.isFinite(Number(v)) ? d : Number(v));
 export const isEmail = (e: any) => /^[^\s@<>(),;:"]+@[^\s@<>(),;:"]+\.[a-z]{2,}$/i.test(String(e || "").trim());
 export const STATE_TZ: any = {
@@ -429,12 +440,14 @@ export function finderJobs(settings: any) {
   for (let i = 0; lists.some((l) => i < l.length); i++) for (const l of lists) if (i < l.length) out.push(l[i]);
   return out;
 }
-// The next search: the first one after the last that hasn't run in `every` days.
-export function nextFinderJob(jobs: any[], st: any, today: string, every = 90) {
+// The next search: the first one after the last that hasn't run in `every` days, leaving out the
+// campaigns in `full` (the ones that already have enough leads waiting).
+export function nextFinderJob(jobs: any[], st: any, today: string, every = 90, full: any = {}) {
   if (!jobs.length) return null;
   const done = (st && st.done) || {}, start = Math.max(0, Number(st && st.cursor) || 0) % jobs.length;
   for (let i = 0; i < jobs.length; i++) {
     const k = (start + i) % jobs.length, j = jobs[k], last = done[j.key];
+    if (full[j.campaign]) continue;
     if (!last || (Date.parse(today) - Date.parse(last)) / 86400000 >= every) return { ...j, index: k };
   }
   return null;
@@ -843,19 +856,26 @@ async function fetchPage(url: string, ms: number) {
   } catch (_e) { return null; }
 }
 // The homepage, then the contact page and others it links to, until an address on the business's own domain turns up.
-async function crawlSite(site: string, deadline: number) {
+// `check` is an address Claude reported and the page it named: it counts only when it is really on that page,
+// so a guessed address never gets emailed.
+export async function crawlSite(site: string, deadline: number, check: any = null) {
   const found: any[] = [], home = await fetchPage(site, 7000);
-  if (!home) return found;
-  found.push(...extractEmails(home.html).map((e) => ({ ...e, page: home.url })));
-  const dm = domainOf(home.url) || domainOf(site);
+  const dm = (home && domainOf(home.url)) || domainOf(site);
   const best = () => { const p = pickEmail(found, dm); return p && p.email.endsWith("@" + dm) ? p : null; };
-  if (best()) return found;
-  const tries = [...new Set([...contactLinks(home.html, home.url), new URL("/contact", home.url).href, new URL("/contact-us", home.url).href])].slice(0, 3);
-  for (const u of tries) {
-    if (Date.now() > deadline) break;
-    const pg = await fetchPage(u, 6000);
-    if (pg) found.push(...extractEmails(pg.html).map((e) => ({ ...e, page: pg.url })));
-    if (best()) break;
+  if (home) {
+    found.push(...extractEmails(home.html).map((e) => ({ ...e, page: home.url })));
+    const tries = best() ? [] : [...new Set([...contactLinks(home.html, home.url), new URL("/contact", home.url).href, new URL("/contact-us", home.url).href])].slice(0, 3);
+    for (const u of tries) {
+      if (Date.now() > deadline) break;
+      const pg = await fetchPage(u, 6000);
+      if (pg) found.push(...extractEmails(pg.html).map((e) => ({ ...e, page: pg.url })));
+      if (best()) break;
+    }
+  }
+  const want = check && cleanEmail(check.email), page = String((check && check.page) || "");
+  if (want && !best() && !found.some((x) => x.email === want) && /^https?:\/\//i.test(page) && Date.now() < deadline) {
+    const pg = await fetchPage(page, 6000);
+    if (pg && extractEmails(pg.html).some((e) => e.email === want)) found.push({ email: want, how: "text", page: pg.url });
   }
   return found;
 }
@@ -876,10 +896,13 @@ export async function runFinder(admin: any, owner: string, d: any, apiKey: strin
   const save = async (why: string) => { st.lastRun = now.toISOString(); st.lastWhy = why; st.version = FN_VERSION; await put(admin, owner, "outreach", "finder", st); return { why, found: 0 }; };
   if (!f.enabled) return { why: "off", found: 0 };
   if (!apiKey) { st.lastError = "Add your Anthropic key (ANTHROPIC_API_KEY) under Edge Functions › Secrets so the finder can search."; return save("key"); }
-  if (st.today.found >= num(f.perDay, 50)) return save("target");
-  if (st.today.spent >= num(f.budget, 3)) return save("budget");
-  const job = nextFinderJob(finderJobs(s), st, today);
-  if (!job) return save("done");
+  if (st.today.found >= num(f.perDay, 100)) return save("target");
+  if (st.today.spent >= num(f.budget, 5)) return save("budget");
+  // Campaigns that already have their number of leads waiting sit this one out until emails go out.
+  const waiting = inLine(d.leads), keep = num(f.keep, 300), full: any = {};
+  for (const cid of Object.keys(f.targets || {})) if ((waiting[cid] || 0) >= keep) full[cid] = true;
+  const jobs = finderJobs(s), job = nextFinderJob(jobs, st, today, 90, full);
+  if (!job) return save(jobs.length && jobs.every((j: any) => full[j.campaign]) ? "full" : "done");
   const index = leadIndex(d.leads), suppressed = new Set(Object.keys(d.suppress || {}).map((e) => e.toLowerCase()));
   let res: any;
   try { res = await search(apiKey, f.model, job, knownFor(d.leads, job), deadline - 35000); }
@@ -896,14 +919,14 @@ export async function runFinder(admin: any, owner: string, d: any, apiKey: strin
   });
   const found: any[] = [];
   let noEmail = 0, checked = 0;
-  for (let i = 0; i < fresh.length; i += 5) {
+  for (let i = 0; i < fresh.length; i += 8) {
     if (Date.now() > deadline - 8000) break;
-    const batch = fresh.slice(i, i + 5);
+    const batch = fresh.slice(i, i + 8);
     checked += batch.length;
     await Promise.all(batch.map(async (b: any) => {
       const dm = domainOf(b.website);
-      let got: any = b.email ? pickEmail([{ email: b.email, how: "text", page: b.emailSource || b.website }], dm) : null;
-      if (!got) got = pickEmail(await crawl(b.website, deadline - 6000), dm);
+      // Only an address seen on a page counts: the business's own pages, or the page Claude said it was on.
+      const got: any = pickEmail(await crawl(b.website, deadline - 6000, b.email ? { email: b.email, page: b.emailSource || "" } : null), dm);
       if (!got) { noEmail++; return; }
       // Taken before any await, so two businesses in one batch that list the same address can't both get it.
       if (index.emails.has(got.email) || suppressed.has(got.email)) return;
