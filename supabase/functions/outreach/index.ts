@@ -27,7 +27,7 @@ import * as webpush from "jsr:@negrel/webpush@0.5.0";
 import Anthropic from "npm:@anthropic-ai/sdk@0.131.0";
 
 // ---- pure logic (plain JavaScript; the tests import this section) ----
-export const FN_VERSION = 4;
+export const FN_VERSION = 5;
 export const MODEL = "claude-opus-5-5";
 export const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 export const SEND_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -241,8 +241,10 @@ function cmpRank(a: any[], b: any[]) { for (let i = 0; i < a.length; i++) { if (
 export function afterSend(l: any, c: any, settings: any, step: number, sent: any, now: any) {
   const s = withDefaults(settings), steps = c.steps || [], localDate = localClock(tzFor(l, s), now).date, more = step + 1 < steps.length;
   const q = l.seq || {};
-  const seq = { ...q, step: step + 1, status: more ? "active" : "done", lastAt: now.toISOString(), sendingStep: null, sendingAt: null, lastError: null, failCount: 0,
-    nextOn: more ? addSendDays(localDate, Math.max(1, num(steps[step + 1].wait, 3)), s.days) : null,
+  // Stopped, paused or replied while the email was going out: the email is logged, the status stays.
+  const kept = !!q.status && !["queued", "active"].includes(q.status);
+  const seq = { ...q, step: step + 1, status: kept ? q.status : more ? "active" : "done", lastAt: now.toISOString(), sendingStep: null, sendingAt: null, lastError: null, failCount: 0,
+    nextOn: !kept && more ? addSendDays(localDate, Math.max(1, num(steps[step + 1].wait, 3)), s.days) : null,
     threadId: q.threadId || sent.threadId, rfcId: q.rfcId || sent.rfcId || "" };
   const out = { ...l, seq, sentLog: [...(Array.isArray(l.sentLog) ? l.sentLog : []), { at: now.toISOString(), campaign: q.campaign, step, id: sent.id }].slice(-30),
     threads: [...new Set([...(l.threads || []), seq.threadId].filter(Boolean))].slice(-10) };
@@ -307,11 +309,17 @@ export function quickLabel({ from, subject, text, headers }: any) {
   if (/^\s*(no thanks|no thank you|not interested|no\.?|pass)\s*[.!]?\s*$/i.test(t.split("\n")[0] || "") || (short && /\bnot interested\b/i.test(t))) return "not_interested";
   return null;
 }
-// Used when Claude isn't set up or doesn't answer.
+// Used when Claude isn't set up or doesn't answer. A no or a maybe-later counts only when nothing else in
+// the reply sounds like interest: "not interested" is never read as a yes, and a mixed reply ("interested,
+// but we already have someone") goes to you as hot instead of quietly closing the lead.
+const NOT_NOW_RE = /\b(not (right )?now|maybe later|later this year|reach (back )?out (again |in |next )|check back|circle back|in the (spring|summer|fall|winter|new year)|next (year|month|quarter|season|spring|summer|fall)|busy season|too busy|not a good time|bad time)\b/i;
+const NO_RE = /\b(not interested|no thanks|no thank you|not (a )?(good )?fit|not looking|not in the market|no need|(do not|don'?t) need|we('| a)re (all )?(set|good|covered)|already (have|use|work with|got)|we have (someone|somebody|one|a (company|guy|team|person|vendor|provider|service))|we'?ll pass|pass on this)\b/i;
+const YES_RE = /\b(yes|yeah|yep|sure|interested|send (it|it over|over|me)|sounds (good|great)|let'?s (talk|chat|do it|connect)|call me|give me a call|tell me more|more info|how much|pricing|price|cost|mock ?up|set up a (call|time))\b/i;
 export function heuristicLabel(text: any) {
-  const t = String(text || "");
-  if (/\b(yes|yeah|yep|sure|interested|send (it|it over|over|me)|sounds (good|great)|let'?s (talk|chat|do it|connect)|call me|give me a call|tell me more|more info|how much|pricing|price|cost|mock ?up|available|set up a (call|time)|schedule)\b/i.test(t)) return "interested";
-  if (/\b(not (right )?now|maybe later|later this year|reach (back )?out (again |in |next )|check back|circle back|in the (spring|summer|fall|winter|new year)|next (year|month|quarter|season|spring|summer|fall)|busy season|too busy|not a good time|bad time)\b/i.test(t)) return "not_now";
+  const t = String(text || ""), rest = t.replace(new RegExp(NOT_NOW_RE.source, "gi"), " ").replace(new RegExp(NO_RE.source, "gi"), " ");
+  if (YES_RE.test(rest)) return "interested";
+  if (NOT_NOW_RE.test(t)) return "not_now";
+  if (NO_RE.test(t)) return "not_interested";
   if (/\?/.test(t)) return "question";
   return "other";
 }
@@ -568,10 +576,11 @@ const put = async (admin: any, owner: string, collection: string, id: string, da
   const { error } = await admin.from("docs").upsert({ owner, collection, id, data, updated_at: new Date().toISOString() }, { onConflict: "owner,collection,id" });
   if (error) throw new Error(`Could not save ${collection}/${id}: ${error.message}`);
 };
-// Adds a document only if there isn't one with that id (a lead found twice stays as it is).
+// Adds a document only if there isn't one with that id (a lead found twice stays as it is). True when it added one.
 const insert = async (admin: any, owner: string, collection: string, id: string, data: any) => {
-  const { error } = await admin.from("docs").upsert({ owner, collection, id, data, updated_at: new Date().toISOString() }, { onConflict: "owner,collection,id", ignoreDuplicates: true });
+  const { data: rows, error } = await admin.from("docs").upsert({ owner, collection, id, data, updated_at: new Date().toISOString() }, { onConflict: "owner,collection,id", ignoreDuplicates: true }).select("id");
   if (error) throw new Error(`Could not save ${collection}/${id}: ${error.message}`);
+  return !!(rows && rows.length);
 };
 // Read, change, write only if nobody wrote in between (else read again): a stage you move in the app
 // while a run is busy with that lead is never lost.
@@ -659,120 +668,136 @@ export async function runOwner(admin: any, owner: string, d: any, token: string,
   const settings = withDefaults(d.outreach.settings), state: any = { ...(d.outreach.state || {}) };
   const report: any = { replies: 0, hot: 0, sent: 0, enrolled: 0, why: "" };
   const today = localClock(settings.tz, now).date;
-  state.labels = await ensureLabels(token, state.labels);
-  const byThread: any = {}, byEmail: any = {};
-  for (const [id, l] of Object.entries(d.leads) as any) {
-    if (!l) continue;
-    for (const t of [...(l.threads || []), l.seq && l.seq.threadId]) if (t) byThread[t] = id;
-    if (l.email && ((l.sentLog || []).length || (l.seq && Number(l.seq.step) > 0))) byEmail[String(l.email).toLowerCase()] = id;
-  }
-  const suppressed = new Set(Object.keys(d.suppress || {}).map((e) => e.toLowerCase()));
+  try {
+    state.labels = await ensureLabels(token, state.labels);
+    const byThread: any = {}, byEmail: any = {};
+    for (const [id, l] of Object.entries(d.leads) as any) {
+      if (!l) continue;
+      for (const t of [...(l.threads || []), l.seq && l.seq.threadId]) if (t) byThread[t] = id;
+      if (l.email && ((l.sentLog || []).length || (l.seq && Number(l.seq.step) > 0))) byEmail[String(l.email).toLowerCase()] = id;
+    }
+    const suppressed = new Set(Object.keys(d.suppress || {}).map((e) => e.toLowerCase()));
 
-  // 1. Replies: new messages in a campaign thread, or from the address of someone you emailed.
-  const fresh = await newMessages(token, state);
-  const pending = [...(state.pending || []), ...fresh.list].filter((m: any, i: number, a: any[]) => m && m.id && !d.seen.has(m.id) && a.findIndex((x: any) => x.id === m.id) === i);
-  state.historyId = fresh.historyId || state.historyId;
-  const keep: any[] = [];
-  let checked = 0;
-  for (const m of pending) {
-    if (Date.now() > deadline - 45000 || report.replies >= 12) { keep.push(m); continue; }
-    let lid = byThread[m.threadId] || null;
-    if (!lid) {
-      if (checked >= 30) { keep.push(m); continue; }
-      checked++;
-      const meta = await gm(token, `messages/${m.id}?format=metadata&metadataHeaders=From`);
-      const from = (((meta.payload && meta.payload.headers) || []).find((h: any) => /^from$/i.test(h.name)) || {}).value || "";
-      lid = byEmail[((from.match(/<([^>]+)>/) || [])[1] || from).trim().toLowerCase()] || null;
-      if (!lid) continue; // not about your outreach
-    }
-    const full = await gm(token, `messages/${m.id}?format=full`), H: any = {};
-    for (const h of (full.payload && full.payload.headers) || []) H[String(h.name).toLowerCase()] = h.value;
-    const from = H.from || "", subject = H.subject || "";
-    const cur = d.leads[lid]; if (!cur) { d.seen.add(m.id); continue; }
-    const c = d.campaigns[(cur.seq && cur.seq.campaign) || ""] || {};
-    const text = cleanReply(textOf(full.payload)).slice(0, 4000);
-    let label = quickLabel({ from, subject, text, headers: H }), summary = "", next = "", by = "rules";
-    if (!label) {
-      if (apiKey) { try { const r = await classify(apiKey, c.offer || c.name || "", bizName(cur), subject, text); label = r.label; summary = r.summary; next = r.next; by = "claude"; } catch (e) { console.error("classify", msgOf(e)); } }
-      if (!label) label = heuristicLabel(text);
-    }
-    const at = new Date(Number(full.internalDate) || now.getTime()).toISOString();
-    const hot = HOT.includes(label);
-    const reply: any = { lead: lid, campaign: (cur.seq && cur.seq.campaign) || "", business: bizName(cur), email: cur.email || "", from, subject, text: text.slice(0, 2000),
-      snippet: String(full.snippet || "").slice(0, 240), at, label, summary, next, by, threadId: full.threadId, handled: !hot, forwarded: false };
-    const updated = await casUpdate(admin, owner, "leads", lid, (x) => x ? { ...x, ...replyPatch(x, label, { summary: summary || reply.snippet }, now, today), updatedAt: now.getTime() } : null);
-    if (updated) d.leads[lid] = updated;
-    if (SUPPRESS[label] && cur.email) {
-      const email = String(cur.email).toLowerCase();
-      await put(admin, owner, "suppress", email, { email, reason: label === "bounce" ? "Bounced" : label === "unsubscribe" ? "Asked not to be emailed" : "Not interested", at });
-      suppressed.add(email);
-    }
-    if (hot) {
-      report.hot++;
-      try { await gm(token, `messages/${m.id}/modify`, { method: "POST", body: JSON.stringify({ addLabelIds: [state.labels.hot, "STARRED", "IMPORTANT"] }) }); } catch (e) { console.error("label", msgOf(e)); }
-      const title = `${label === "question" ? "❓" : label === "referral" ? "👉" : "🔥"} ${bizName(cur) || from} replied`;
-      await notify(admin, d.push, { id: "hot-" + m.id, title, body: summary || reply.snippet, tag: "lcc-hot-" + m.id, url: "/#email", renotify: true });
-      const to = String(settings.forwardTo || "").trim();
-      if (isEmail(to) && to.toLowerCase() !== me.toLowerCase()) {
-        const body = `${bizName(cur)} (${cur.email}) replied to your ${c.name || "outreach"} email.\n\n${summary ? `What they said: ${summary}\n` : ""}${next ? `Next step: ${next}\n` : ""}\nTheir reply:\n${text}\n\nOpen the conversation: https://mail.google.com/mail/u/0/#all/${full.threadId}`;
-        try { await sendMail(token, buildMime({ from: `${settings.fromName} <${me}>`, to, subject: `Hot reply: ${bizName(cur)}`, text: body })); reply.forwarded = true; } catch (e) { console.error("forward", msgOf(e)); }
-      }
-    }
-    await put(admin, owner, "replies", m.id, reply);
-    d.seen.add(m.id); report.replies++;
-  }
-  state.pending = keep.slice(0, 300);
-
-  // 2. The pipeline: leads parked in a stage long enough get that stage's campaign.
-  for (const e of dueEnrollments(d.leads, d.campaigns, now, suppressed).slice(0, 25)) {
-    if (Date.now() > deadline - 30000) break;
-    const updated = await casUpdate(admin, owner, "leads", e.id, (x) => {
-      if (!x || (x.seq && (LIVE_SEQ.includes(x.seq.status) || x.seq.sendingStep != null)) || (x.enrolled || {})[e.campaign]) return null;
-      return { ...x, ...enrollPatch(x, e.campaign, today, false) };
-    });
-    if (updated) { d.leads[e.id] = updated; report.enrolled++; }
-  }
-
-  // 3. Sending: at most one email per run, so the day's emails are spread out.
-  if (!state.today || state.today.date !== today) state.today = { date: today, sent: 0, by: {} };
-  const pick: any = pickNext({ leads: d.leads, campaigns: d.campaigns, settings, state, suppressed, now });
-  report.why = pick.why || "";
-  if (pick.id && Date.now() < deadline - 20000) {
-    const c = d.campaigns[pick.campaign], l = d.leads[pick.id];
-    const mail = composeEmail(l, c, settings, pick.step);
-    if (!mail || mail.missing.length) {
-      report.why = "template"; state.lastError = `${c.name || pick.campaign}: fill in ${mail ? mail.missing.join(", ") : "the email"} before it can send.`;
-    } else {
-      // Claim the slot and mark the lead before sending: if saving fails after Gmail accepted the email,
-      // the marker keeps it from going out twice (the app shows it under Needs a look).
-      state.lastSendAt = now.toISOString();
-      await put(admin, owner, "outreach", "state", state);
-      const claimed = await casUpdate(admin, owner, "leads", pick.id, (x) => (x && x.seq && x.seq.campaign === pick.campaign && ["queued", "active"].includes(x.seq.status) &&
-        x.seq.sendingStep == null && (Number(x.seq.step) || 0) === pick.step && !x.dnc) ? { ...x, seq: { ...x.seq, sendingStep: pick.step, sendingAt: now.toISOString() } } : null);
-      if (claimed) {
-        const raw = buildMime({ from: `${settings.fromName} <${me}>`, to: String(claimed.email).trim(), subject: mail.subject, text: mail.text,
-          inReplyTo: pick.step > 0 ? claimed.seq.rfcId : "", unsubUrl: await unsubUrl(owner, pick.id), unsubMail: me });
-        let sent: any;
-        try { sent = await sendMail(token, raw, pick.step > 0 ? claimed.seq.threadId || undefined : undefined); }
-        catch (e: any) {
-          // Gmail refused this one message (a bad address, say): after two tries the lead is paused so
-          // it can't hold up everyone else. Limits and outages don't count against it.
-          await casUpdate(admin, owner, "leads", pick.id, (x) => {
-            if (!x || !x.seq) return null;
-            const fails = e && e.status === 400 ? (Number(x.seq.failCount) || 0) + 1 : Number(x.seq.failCount) || 0;
-            return { ...x, seq: { ...x.seq, sendingStep: null, sendingAt: null, lastError: msgOf(e), failCount: fails, ...(fails >= 2 ? { status: "paused", pausedWhy: "failed" } : {}) } };
-          });
-          throw e;
+    // 1. Replies: new messages in a campaign thread, or from the address of someone you emailed.
+    const fresh = await newMessages(token, state);
+    const pending = [...(state.pending || []), ...fresh.list].filter((m: any, i: number, a: any[]) => m && m.id && !d.seen.has(m.id) && a.findIndex((x: any) => x.id === m.id) === i);
+    state.historyId = fresh.historyId || state.historyId;
+    const keep: any[] = [];
+    let checked = 0;
+    for (const m of pending) {
+      if (Date.now() > deadline - 45000 || report.replies >= 12) { keep.push(m); continue; }
+      try {
+        let lid = byThread[m.threadId] || null;
+        if (!lid) {
+          if (checked >= 30) { keep.push(m); continue; }
+          checked++;
+          const meta = await gm(token, `messages/${m.id}?format=metadata&metadataHeaders=From`);
+          const from = (((meta.payload && meta.payload.headers) || []).find((h: any) => /^from$/i.test(h.name)) || {}).value || "";
+          lid = byEmail[((from.match(/<([^>]+)>/) || [])[1] || from).trim().toLowerCase()] || null;
+          if (!lid) continue; // not about your outreach
         }
-        try { await gm(token, `messages/${sent.id}/modify`, { method: "POST", body: JSON.stringify({ addLabelIds: [state.labels.outreach] }) }); } catch (e) { console.error("label", msgOf(e)); }
-        const after = await casUpdate(admin, owner, "leads", pick.id, (x) => afterSend(x || claimed, c, settings, pick.step, sent, now));
-        if (after) d.leads[pick.id] = after;
-        state.today.sent = (state.today.sent || 0) + 1;
-        state.today.by = { ...(state.today.by || {}), [pick.campaign]: ((state.today.by || {})[pick.campaign] || 0) + 1 };
-        if (!settings.startedOn) await casUpdate(admin, owner, "outreach", "settings", (x) => ({ ...(x || {}), startedOn: (x && x.startedOn) || today }));
-        report.sent = 1; state.lastError = null;
+        const full = await gm(token, `messages/${m.id}?format=full`), H: any = {};
+        for (const h of (full.payload && full.payload.headers) || []) H[String(h.name).toLowerCase()] = h.value;
+        const from = H.from || "", subject = H.subject || "";
+        const cur = d.leads[lid]; if (!cur) { d.seen.add(m.id); continue; }
+        const c = d.campaigns[(cur.seq && cur.seq.campaign) || ""] || {};
+        const text = cleanReply(textOf(full.payload)).slice(0, 4000);
+        let label = quickLabel({ from, subject, text, headers: H }), summary = "", next = "", by = "rules";
+        if (!label) {
+          if (apiKey) { try { const r = await classify(apiKey, c.offer || c.name || "", bizName(cur), subject, text); label = r.label; summary = r.summary; next = r.next; by = "claude"; } catch (e) { console.error("classify", msgOf(e)); } }
+          if (!label) label = heuristicLabel(text);
+        }
+        const at = new Date(Number(full.internalDate) || now.getTime()).toISOString();
+        const hot = HOT.includes(label);
+        const reply: any = { lead: lid, campaign: (cur.seq && cur.seq.campaign) || "", business: bizName(cur), email: cur.email || "", from, subject, text: text.slice(0, 2000),
+          snippet: String(full.snippet || "").slice(0, 240), at, label, summary, next, by, threadId: full.threadId, handled: !hot, forwarded: false };
+        const updated = await casUpdate(admin, owner, "leads", lid, (x) => x ? { ...x, ...replyPatch(x, label, { summary: summary || reply.snippet }, now, today), updatedAt: now.getTime() } : null);
+        if (updated) d.leads[lid] = updated;
+        if (SUPPRESS[label] && cur.email) {
+          const email = String(cur.email).toLowerCase();
+          await put(admin, owner, "suppress", email, { email, reason: label === "bounce" ? "Bounced" : label === "unsubscribe" ? "Asked not to be emailed" : "Not interested", at });
+          suppressed.add(email);
+        }
+        if (hot) {
+          report.hot++;
+          try { await gm(token, `messages/${m.id}/modify`, { method: "POST", body: JSON.stringify({ addLabelIds: [state.labels.hot, "STARRED", "IMPORTANT"] }) }); } catch (e) { console.error("label", msgOf(e)); }
+          const title = `${label === "question" ? "❓" : label === "referral" ? "👉" : "🔥"} ${bizName(cur) || from} replied`;
+          await notify(admin, d.push, { id: "hot-" + m.id, title, body: summary || reply.snippet, tag: "lcc-hot-" + m.id, url: "/#email", renotify: true });
+          const to = String(settings.forwardTo || "").trim();
+          if (isEmail(to) && to.toLowerCase() !== me.toLowerCase()) {
+            const body = `${bizName(cur)} (${cur.email}) replied to your ${c.name || "outreach"} email.\n\n${summary ? `What they said: ${summary}\n` : ""}${next ? `Next step: ${next}\n` : ""}\nTheir reply:\n${text}\n\nOpen the conversation: https://mail.google.com/mail/u/0/#all/${full.threadId}`;
+            try { await sendMail(token, buildMime({ from: `${settings.fromName} <${me}>`, to, subject: `Hot reply: ${bizName(cur)}`, text: body })); reply.forwarded = true; } catch (e) { console.error("forward", msgOf(e)); }
+          }
+        }
+        await put(admin, owner, "replies", m.id, reply);
+        d.seen.add(m.id); report.replies++;
+      } catch (e: any) {
+        // A message that is gone (deleted, 404) or unreadable (400) is skipped for good; anything else is
+        // tried again on the next two runs, then dropped, so one message can never hold up the rest.
+        console.error("reply", m.id, msgOf(e));
+        const tries = (Number(m.tries) || 0) + 1;
+        if (!(e && (e.status === 404 || e.status === 400)) && tries < 3) keep.push({ id: m.id, threadId: m.threadId, tries });
       }
     }
+    state.pending = keep.slice(0, 300);
+
+    // 2. The pipeline: leads parked in a stage long enough get that stage's campaign.
+    for (const e of dueEnrollments(d.leads, d.campaigns, now, suppressed).slice(0, 25)) {
+      if (Date.now() > deadline - 30000) break;
+      const updated = await casUpdate(admin, owner, "leads", e.id, (x) => {
+        if (!x || (x.seq && (LIVE_SEQ.includes(x.seq.status) || x.seq.sendingStep != null)) || (x.enrolled || {})[e.campaign]) return null;
+        return { ...x, ...enrollPatch(x, e.campaign, today, false) };
+      });
+      if (updated) { d.leads[e.id] = updated; report.enrolled++; }
+    }
+
+    // 3. Sending: at most one email per run, so the day's emails are spread out.
+    if (!state.today || state.today.date !== today) state.today = { date: today, sent: 0, by: {} };
+    const pick: any = pickNext({ leads: d.leads, campaigns: d.campaigns, settings, state, suppressed, now });
+    report.why = pick.why || "";
+    if (pick.id && Date.now() < deadline - 20000) {
+      const c = d.campaigns[pick.campaign], l = d.leads[pick.id];
+      const mail = composeEmail(l, c, settings, pick.step);
+      if (!mail || mail.missing.length) {
+        report.why = "template"; state.lastError = `${c.name || pick.campaign}: fill in ${mail ? mail.missing.join(", ") : "the email"} before it can send.`;
+      } else {
+        // Claim the slot and mark the lead before sending: if saving fails after Gmail accepted the email,
+        // the marker keeps it from going out twice (the app shows it under Needs a look).
+        state.lastSendAt = now.toISOString();
+        await put(admin, owner, "outreach", "state", state);
+        const claimed = await casUpdate(admin, owner, "leads", pick.id, (x) => (x && x.seq && x.seq.campaign === pick.campaign && ["queued", "active"].includes(x.seq.status) &&
+          x.seq.sendingStep == null && (Number(x.seq.step) || 0) === pick.step && !x.dnc) ? { ...x, seq: { ...x.seq, sendingStep: pick.step, sendingAt: now.toISOString() } } : null);
+        if (claimed) {
+          const raw = buildMime({ from: `${settings.fromName} <${me}>`, to: String(claimed.email).trim(), subject: mail.subject, text: mail.text,
+            inReplyTo: pick.step > 0 ? claimed.seq.rfcId : "", unsubUrl: await unsubUrl(owner, pick.id), unsubMail: me });
+          let sent: any;
+          try { sent = await sendMail(token, raw, pick.step > 0 ? claimed.seq.threadId || undefined : undefined); }
+          catch (e: any) {
+            // Gmail refused this one message (a bad address, say): after two tries the lead is paused so
+            // it can't hold up everyone else. Limits and outages don't count against it.
+            await casUpdate(admin, owner, "leads", pick.id, (x) => {
+              if (!x || !x.seq) return null;
+              const fails = e && e.status === 400 ? (Number(x.seq.failCount) || 0) + 1 : Number(x.seq.failCount) || 0;
+              return { ...x, seq: { ...x.seq, sendingStep: null, sendingAt: null, lastError: msgOf(e), failCount: fails, ...(fails >= 2 ? { status: "paused", pausedWhy: "failed" } : {}) } };
+            });
+            throw e;
+          }
+          state.today.sent = (state.today.sent || 0) + 1;
+          state.today.by = { ...(state.today.by || {}), [pick.campaign]: ((state.today.by || {})[pick.campaign] || 0) + 1 };
+          report.sent = 1;
+          try { await gm(token, `messages/${sent.id}/modify`, { method: "POST", body: JSON.stringify({ addLabelIds: [state.labels.outreach] }) }); } catch (e) { console.error("label", msgOf(e)); }
+          const after = await casUpdate(admin, owner, "leads", pick.id, (x) => afterSend(x || claimed, c, settings, pick.step, sent, now));
+          if (after) d.leads[pick.id] = after;
+          if (!settings.startedOn) await casUpdate(admin, owner, "outreach", "settings", (x) => ({ ...(x || {}), startedOn: (x && x.startedOn) || today }));
+          state.lastError = null;
+        }
+      }
+    }
+  } catch (e: any) {
+    state.lastRun = now.toISOString(); state.version = FN_VERSION; state.gmail = me; state.lastError = msgOf(e);
+    await put(admin, owner, "outreach", "state", state).catch(() => {});
+    if (e && typeof e === "object") e.stateSaved = true;
+    throw e;
   }
   state.lastRun = now.toISOString(); state.version = FN_VERSION; state.gmail = me; state.lastWhy = report.why;
   if (report.why !== "template" && !report.sent) state.lastError = null;
@@ -791,7 +816,7 @@ async function claudeFind(apiKey: string, model: string, job: any, known: string
   const client = new Anthropic({ apiKey, maxRetries: 1 });
   const messages: any[] = [{ role: "user", content: `Find up to 20 ${job.niche} businesses in ${job.area}.${known.length ? `\n\nAlready on my list, so skip them: ${known.join("; ")}.` : ""}` }];
   const usage: any = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, server_tool_use: { web_search_requests: 0 } };
-  let text = "";
+  let text = "", complete = false;
   for (let i = 0; i < 3; i++) {
     const left = deadline - Date.now();
     if (left < 15000) break;
@@ -804,9 +829,10 @@ async function claudeFind(apiKey: string, model: string, job: any, known: string
     usage.server_tool_use.web_search_requests += Number(u.server_tool_use && u.server_tool_use.web_search_requests) || 0;
     if (resp.stop_reason === "pause_turn") { messages.push({ role: "assistant", content: resp.content }); continue; }
     if (resp.stop_reason !== "refusal") text = (resp.content || []).filter((b: any) => b.type === "text").map((b: any) => b.text).join("");
+    complete = true;
     break;
   }
-  return { businesses: parseFinderJson(text), cost: usageCost(model, usage), searches: usage.server_tool_use.web_search_requests };
+  return { businesses: parseFinderJson(text), cost: usageCost(model, usage), searches: usage.server_tool_use.web_search_requests, complete };
 }
 const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 async function fetchPage(url: string, ms: number) {
@@ -868,28 +894,35 @@ export async function runFinder(admin: any, owner: string, d: any, apiKey: strin
     if (!dm || index.domains.has(dm) || index.names.has(normName(b.name) + "|" + String(b.state || "").toUpperCase())) return false;
     index.domains.add(dm); return true;
   });
-  const added: any[] = [];
-  let noEmail = 0;
+  const found: any[] = [];
+  let noEmail = 0, checked = 0;
   for (let i = 0; i < fresh.length; i += 5) {
     if (Date.now() > deadline - 8000) break;
-    await Promise.all(fresh.slice(i, i + 5).map(async (b: any) => {
+    const batch = fresh.slice(i, i + 5);
+    checked += batch.length;
+    await Promise.all(batch.map(async (b: any) => {
       const dm = domainOf(b.website);
       let got: any = b.email ? pickEmail([{ email: b.email, how: "text", page: b.emailSource || b.website }], dm) : null;
       if (!got) got = pickEmail(await crawl(b.website, deadline - 6000), dm);
       if (!got) { noEmail++; return; }
+      // Taken before any await, so two businesses in one batch that list the same address can't both get it.
       if (index.emails.has(got.email) || suppressed.has(got.email)) return;
-      if (!(await mx(got.email.split("@")[1]))) { noEmail++; return; }
       index.emails.add(got.email);
-      added.push(finderLead(b, got, job, now, today, !!f.review));
+      if (!(await mx(got.email.split("@")[1]))) { noEmail++; return; }
+      found.push(finderLead(b, got, job, now, today, !!f.review));
     }));
   }
-  for (const x of added) await insert(admin, owner, "leads", x.id, x.doc);
-  st.today.found += added.length; st.month.found += added.length; st.today.checked += fresh.length; st.today.noEmail += noEmail;
-  st.done = { ...(st.done || {}), [job.key]: today }; st.cursor = job.index + 1;
-  st.recent = [{ at: now.toISOString(), search: `${job.niche} in ${job.area}`, campaign: job.campaign, found: added.length, checked: fresh.length, cost: Math.round(res.cost * 1000) / 1000, names: added.slice(0, 6).map((x) => x.doc.name) }, ...(st.recent || [])].slice(0, 12);
+  const added: any[] = [];
+  for (const x of found) if (await insert(admin, owner, "leads", x.id, x.doc)) added.push(x);
+  st.today.found += added.length; st.month.found += added.length; st.today.checked += checked; st.today.noEmail += noEmail;
+  // A search cut short (no final answer in time, or businesses left unchecked) runs once more before it counts as done.
+  const whole = res.complete !== false && checked === fresh.length, again = st.retry && st.retry.key === job.key;
+  if (whole || again) { st.done = { ...(st.done || {}), [job.key]: today }; st.cursor = job.index + 1; st.retry = null; }
+  else st.retry = { key: job.key, at: now.toISOString() };
+  st.recent = [{ at: now.toISOString(), search: `${job.niche} in ${job.area}`, campaign: job.campaign, found: added.length, checked, cost: Math.round(res.cost * 1000) / 1000, names: added.slice(0, 6).map((x) => x.doc.name) }, ...(st.recent || [])].slice(0, 12);
   st.lastError = null;
   await save(added.length ? "found" : "none");
-  return { why: "ran", found: added.length, checked: fresh.length, job: job.key, search: `${job.niche} in ${job.area}`, cost: res.cost };
+  return { why: "ran", found: added.length, checked, job: job.key, search: `${job.niche} in ${job.area}`, cost: res.cost, complete: whole };
 }
 
 Deno.serve(async (req: Request) => {
@@ -951,11 +984,13 @@ Deno.serve(async (req: Request) => {
       try {
         if (!token) { token = await gmailToken(); me = (await gm(token, "profile")).emailAddress; }
         results[owner] = await runOwner(admin, owner, d, token, me, apiKey, new Date(), started + 110000);
-      } catch (e) {
+      } catch (e: any) {
         console.error(e);
         results[owner] = { error: msgOf(e) };
-        const state = { ...(d.outreach.state || {}), lastRun: new Date().toISOString(), lastError: msgOf(e), version: FN_VERSION };
-        await put(admin, owner, "outreach", "state", state).catch(() => {});
+        if (!(e && e.stateSaved)) {
+          const state = { ...(d.outreach.state || {}), lastRun: new Date().toISOString(), lastError: msgOf(e), version: FN_VERSION };
+          await put(admin, owner, "outreach", "state", state).catch(() => {});
+        }
       }
     }
     return json({ ok: true, results });
