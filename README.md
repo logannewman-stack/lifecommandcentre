@@ -151,7 +151,7 @@ Each campaign is a first email and two follow-ups in the same thread, three and 
 
 **Your mailing address.** US law (CAN-SPAM) requires a postal address at the bottom of every sales email. It is only a line of text: nothing is ever mailed to it. To keep your home address private, use a PO box or a virtual mailbox (iPostal1 or Anytime Mailbox, about $10 a month, set up online). Nothing sends until one is in **Settings**, which also has the forwarding address, the sending days and hours, the warm-up numbers and your time zone.
 
-**Updating from 1.9 or 2.0:** redeploy the `outreach` function with the new code (version 4; version 3 and later wait for your start day) and run the new `cron.sql` once (it adds the finder's schedule). Your 1.9 contacts become leads in the pipeline the first time you open the app.
+**Updating from 1.9, 2.0, 2.1 or 2.2:** redeploy the `outreach` function with the new code (version 5; version 3 and later wait for your start day) and run the new `cron.sql` once (it adds the finder's schedule). Redeploy the `assistant` function too (version 7), so Ask knows when sending starts. The app shows **Update needed** until both are current. Your 1.9 contacts become leads in the pipeline the first time you open the app.
 
 **Good to know:** start with the warm-up as it is; sending a lot from a new mailbox is the fastest way into spam folders. One Gmail inbox sends about 50 emails a day once warmed up, follow-ups included, so the finder's 50 a day keeps it full. More than that takes more inboxes. Keep an eye on the first replies and fix any that were sorted wrong (**Sorted as** on the reply, with Undo). If the engine or the finder hits a problem (an expired Google token, say), the Email tab shows it in red with what to do.
 
