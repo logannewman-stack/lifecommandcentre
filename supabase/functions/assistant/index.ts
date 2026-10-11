@@ -17,7 +17,7 @@ import Anthropic from "npm:@anthropic-ai/sdk@0.131.0";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
 // ---- pure logic (no imports; the Deno test imports this section) ----
-export const FN_VERSION = 6;
+export const FN_VERSION = 7;
 export const MODEL = "claude-opus-5-5";
 const AREAS = ["Sales", "Build", "Pickleball", "Body", "Money", "Move", "DoD", "Fix", "Other"];
 const SESSION_TYPES = ["Drill", "Competitive", "Rec play", "Tournament", "Lesson"];
@@ -168,7 +168,9 @@ export function buildContext(d: any, today: string, now: string, tz: string) {
   const os = (d.outreach || {}).settings || {}, ost = (d.outreach || {}).state || {}, ofi = (d.outreach || {}).finder || {};
   const sentToday = ost.today && ost.today.date === today ? ost.today.sent || 0 : 0, foundToday = ofi.today && ofi.today.date === today ? ofi.today.found || 0 : 0;
   const inSeq = allLeads.filter((l: any) => l.seq && ["queued", "active"].includes(l.seq.status)).length;
-  if (os.createdAt || hot.length || inSeq) lines.push(`EMAIL OUTREACH: sending ${os.enabled ? "on" : "paused"}, ${sentToday} sent today, ${inSeq} leads waiting in campaigns; lead finder ${os.finder && os.finder.enabled ? "on" : "off"}, ${foundToday} found today. Hot replies to answer (${hot.length}):\n${hot.slice(0, 10).map((r: any) => { const l = leads[r.lead || r.prospect] || {}; return `- [${r.lead || r.prospect}] ${l.name || r.business || r.email}: ${clip(r.summary || r.snippet || r.text || "", 120)}${l.phone ? " | " + l.phone : ""}`; }).join("\n") || "- none"}`);
+  // The engine's rule (sendingState): on, or set to start on a day, or paused.
+  const sending = !(os.enabled || os.autoStart) ? "paused" : os.startOn && today < os.startOn ? `set to start ${dowOf(os.startOn)} ${os.startOn}` : "on";
+  if (os.createdAt || hot.length || inSeq) lines.push(`EMAIL OUTREACH: sending ${sending}, ${sentToday} sent today, ${inSeq} leads waiting in campaigns; lead finder ${os.finder && os.finder.enabled ? "on" : "off"}, ${foundToday} found today. Hot replies to answer (${hot.length}):\n${hot.slice(0, 10).map((r: any) => { const l = leads[r.lead || r.prospect] || {}; return `- [${r.lead || r.prospect}] ${l.name || r.business || r.email}: ${clip(r.summary || r.snippet || r.text || "", 120)}${l.phone ? " | " + l.phone : ""}`; }).join("\n") || "- none"}`);
   const ws = weekStartOf(today);
   const st: any = { dials: 0, convos: 0, demos: 0, dms: 0, proposals: 0, deals: 0, mockups: 0, cash: 0, gym: 0, mobility: 0, drill: 0, competitive: 0, checkins: 0 };
   for (let i = 0; i < 7; i++) {

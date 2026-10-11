@@ -377,13 +377,14 @@ function applyFreshStart(date, sun) {
     if (['makeup','top3'].includes(x.kind)) { setDoc('tasks', id, {...body, dropped:true, droppedOn:t}); dropped++; }
     else if (x.due && x.due < date) { setDoc('tasks', id, {...body, due:date, origDue:x.origDue || x.due}); moved++; }
   }
-  for (const [id, l] of Object.entries(S.data.leads)) {
-    if (l.stage !== 'Lost' && l.nextDate && l.nextDate < date) { setDoc('leads', id, {...l, nextDate:date, updatedAt:Date.now()}); leadsMoved++; }
-  }
   setDoc('meta', 'rollover', {through:addDays(date, -1), at:new Date().toISOString(), created:0, freshStart:date});
   const prof = {startDate:date}; if (sun) prof.restDays = ['Sun'];
   patchDoc('config', 'profile', prof);
   if (sun) patchDoc('config', 'schedule', {days:{Sun:REST_SUNDAY}});
+  // Last, and only the date: one small patch per lead keeps whatever the email engine wrote on it.
+  for (const [id, l] of Object.entries(S.data.leads)) {
+    if (l.stage !== 'Lost' && l.nextDate && l.nextDate < date) { patchDoc('leads', id, {nextDate:date, updatedAt:Date.now()}); leadsMoved++; }
+  }
   return {moved, dropped, leadsMoved};
 }
 // Both one-time runs decide once per page load and record themselves before any other write:
@@ -1992,6 +1993,8 @@ const EM_FILTERS = [
 ];
 const outDoc = id => (S.data.outreach || {})[id] || null;
 const emSettings = () => outSettings(outDoc('settings'));
+// The shared rule for whether email is going out: paused, later (armed for startOn) or on.
+const emMode = (s = emSettings()) => sendingState(s, localClock(s.tz).date);
 const emState = () => outDoc('state') || {};
 const emCampaigns = () => Object.entries(S.data.campaigns || {}).filter(([, c]) => c && c.name).map(([id, c]) => ({id, ...c})).sort((a, b) => (a.order || 9) - (b.order || 9) || String(a.name).localeCompare(String(b.name)));
 const allLeads = () => Object.entries(S.data.leads || {}).filter(([, l]) => l && (l.name || l.email)).map(([id, l]) => ({id, ...l}));
@@ -2416,7 +2419,8 @@ function emCampaignCard(c, list, st, s) {
 function emUpNext(s, st, camps) {
   const list = upNext(S.data.leads, S.data.campaigns, s, new Date(), emSuppressed());
   const ready = list.filter(x => x.ready).length;
-  const why = !s.enabled ? 'Sending is paused, so this is what goes out once you start.' : EM_WHY[st.lastWhy] || '';
+  const mode = emMode(s);
+  const why = mode === 'paused' ? 'Sending is paused, so this is what goes out once you start.' : mode === 'later' ? `Sending starts ${fmtDay(s.startOn)}, so this is what goes out first.` : EM_WHY[st.lastWhy] || '';
   return `<section class="card ord-7"><div class="card-h"><h2>Up next</h2><span class="meta">${ready} ready</span></div>
     ${why && list.length ? `<div class="meta" style="margin-bottom:4px">${esc(why)}</div>` : ''}
     ${list.length ? `<div class="elist">${list.slice(0, 6).map(x => { const c = (S.data.campaigns || {})[x.campaign] || {}; return `<button class="erow" data-act="lead-open" data-id="${esc(x.id)}"><div class="min0"><b>${esc(x.l.name || x.l.email)}</b><div class="meta">${esc(emStepName(x.step, (c.steps || []).length))} · ${esc(c.name || '')}</div></div><span class="meta">${x.ready ? (x.step ? 'due now' : 'in line') : esc(fmtDay(x.due))}</span></button>`; }).join('')}</div>${list.length > 6 ? `<div class="meta" style="margin-top:6px">and ${list.length - 6} more</div>` : ''}`
@@ -3103,7 +3107,7 @@ function handle(act, el, ev) {
       if (!c.trigger && !['New lead','Contacted'].includes(l.stage || 'New lead')) { toast(`${c.name} is for businesses you haven't talked to yet. Move ${l.name} back to New lead first, or pick another campaign.`); break; }
       const r = enrollLeads([d.id], cid);
       if (!r.n) { toast("Couldn't start it. Check the email address and your do-not-contact list."); break; }
-      toast(`${l.name} is in ${c.name}.${!liveCampaign(c) ? ' Nothing goes out until you approve the campaign.' : emSettings().enabled ? ' The first email goes out on its turn.' : ' Tap Start sending on the Email tab when you are ready.'}`, true); render(); break;
+      toast(`${l.name} is in ${c.name}.${!liveCampaign(c) ? ' Nothing goes out until you approve the campaign.' : emMode() === 'on' ? ' The first email goes out on its turn.' : emMode() === 'later' ? ` Its first email goes out once sending starts ${fmtDay(emSettings().startOn)}.` : ' Tap Start sending on the Email tab when you are ready.'}`, true); render(); break;
     }
     case 'lead-undnc': {
       const l = S.data.leads[d.id]; if (!l) break;
@@ -3317,7 +3321,7 @@ function handle(act, el, ev) {
       setDoc('campaigns', id, {...c, reviewed:true, reviewedAt:Date.now(), status:'running', updatedAt:Date.now()});
       S.lastUndo = {type:'restore', ops:[{set:['campaigns', id, clone(prev)]}]};
       clearDrafts('ec-'); closeModal();
-      toast(`${c.name} is approved and on. ${emSettings().enabled ? 'Its emails join the line now.' : 'Tap Start sending when you are ready.'}`, true); render(); break;
+      toast(`${c.name} is approved and on. ${emMode() === 'on' ? 'Its emails join the line now.' : emMode() === 'later' ? `Its emails start going out ${fmtDay(emSettings().startOn)}.` : 'Tap Start sending when you are ready.'}`, true); render(); break;
     }
     case 'ec-reset': {
       const id = S.modal && S.modal.id, prev = id && S.data.campaigns[id]; if (!prev || !DEFAULT_CAMPAIGNS[id]) break;
@@ -3339,7 +3343,7 @@ function handle(act, el, ev) {
       const on = c.status !== 'running';
       patchDoc('campaigns', d.id, {status:on ? 'running' : 'paused'});
       S.lastUndo = {type:'restore', ops:[{patch:['campaigns', d.id, {status:c.status || 'paused'}]}]};
-      toast(on ? `${c.name} is on.${emSettings().enabled ? '' : ' Sending is still paused overall.'}` : `${c.name} is paused. Follow-ups wait too.`, true); render(); break;
+      toast(on ? `${c.name} is on.${emMode() === 'on' ? '' : emMode() === 'later' ? ` Sending starts ${fmtDay(emSettings().startOn)}.` : ' Sending is still paused overall.'}` : `${c.name} is paused. Follow-ups wait too.`, true); render(); break;
     }
     case 'em-camp-filter': S.emCamp = d.id || 'all'; S.emFilter = 'all'; S.emLimit = 40; render(); if (d.go) setTimeout(() => { const x = document.getElementById('em-contacts'); if (x) x.scrollIntoView({behavior:'smooth', block:'start'}); }, 30); break;
     case 'em-filter': S.emFilter = d.f; S.emLimit = 40; render(); break;
