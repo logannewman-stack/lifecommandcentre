@@ -11,10 +11,10 @@ export const FINDER_AREAS = 'Des Moines, IA; West Des Moines, IA; Urbandale, IA;
   'Phoenix, AZ; Scottsdale, AZ; Mesa, AZ; Chandler, AZ; Gilbert, AZ; Tempe, AZ; Glendale, AZ; Peoria, AZ; Surprise, AZ; Goodyear, AZ; Queen Creek, AZ; ' +
   'Fountain Hills, AZ; Tucson, AZ; Flagstaff, AZ; Prescott, AZ';
 export const FINDER_DEFAULTS = {
-  enabled: false, perDay: 50, budget: 3, model: 'claude-opus-5-5', review: false,
+  enabled: false, perDay: 100, budget: 5, keep: 300, model: 'claude-opus-5-5', review: false,
   targets: {
     'front-desk': { on: true, niches: 'HVAC, plumber, electrician, roofer, landscaping, lawn care, house cleaning, carpet cleaning, pest control, garage door repair, pool service, handyman, house painter, remodeling contractor, tree service, junk removal, moving company, pressure washing, auto repair, auto detailing, towing, locksmith, appliance repair, water damage restoration, dentist, orthodontist, pediatric dentist, cosmetic dentist', areas: FINDER_AREAS },
-    'home-screen': { on: false, niches: 'med spa, IV therapy, chiropractor, pilates studio, yoga studio, boutique gym, pickleball club, hair salon, massage therapy', areas: FINDER_AREAS },
+    'home-screen': { on: true, niches: 'med spa, IV therapy, chiropractor, pilates studio, yoga studio, boutique gym, pickleball club, hair salon, massage therapy', areas: FINDER_AREAS },
   },
 };
 export const DEFAULT_SETTINGS = {
@@ -28,6 +28,17 @@ function finderWithDefaults(f) {
   return { ...FINDER_DEFAULTS, ...x, targets };
 }
 export const withDefaults = s => ({ ...DEFAULT_SETTINGS, ...(s || {}), days: Array.isArray(s && s.days) && s.days.length ? s.days : DEFAULT_SETTINGS.days, finder: finderWithDefaults(s && s.finder) });
+// Leads waiting for their first email in each campaign: queued, or held for you to check first.
+// The finder keeps this at `finder.keep` for every campaign it searches for.
+export function inLine(leads) {
+  const out = {};
+  for (const l of Object.values(leads || {})) {
+    const q = l && l.seq;
+    if (!q || !q.campaign || !['queued', 'hold'].includes(q.status) || Number(q.step) > 0 || l.dnc || l.emailBad) continue;
+    out[q.campaign] = (out[q.campaign] || 0) + 1;
+  }
+  return out;
+}
 const num = (v, d) => (v === '' || v === null || v === undefined || !Number.isFinite(Number(v)) ? d : Number(v));
 export const isEmail = e => /^[^\s@<>(),;:"]+@[^\s@<>(),;:"]+\.[a-z]{2,}$/i.test(String(e || '').trim());
 export const STATE_TZ = { AZ: 'America/Phoenix', IA: 'America/Chicago', IL: 'America/Chicago', MN: 'America/Chicago', WI: 'America/Chicago', MO: 'America/Chicago',

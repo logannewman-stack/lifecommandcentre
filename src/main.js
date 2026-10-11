@@ -10,7 +10,7 @@ import { supabase, config as sbConfig, configSource, saveConfig, clearConfig } f
 import { createDb } from './db.js';
 import { parseQuick } from './quickadd.js';
 import { parseDayText, buildDay } from './planday.js';
-import { SEQ_STATUS, DEFAULT_CAMPAIGNS, wordingUpdates, withDefaults as outSettings, sendingState, launchWrites, composeEmail, segmentOf, parseCSV, importLeads, campaignStats, tzFor, localClock, dailyCap, nextSendDay, upNext, isEmail, SUPPRESS, HOT, LIVE_SEQ, stagePatch, replyPatch, enrollPatch, heatOf, liveCampaign, leadIdFor } from './outreach.js';
+import { SEQ_STATUS, DEFAULT_CAMPAIGNS, wordingUpdates, withDefaults as outSettings, sendingState, inLine, launchWrites, composeEmail, segmentOf, parseCSV, importLeads, campaignStats, tzFor, localClock, dailyCap, nextSendDay, upNext, isEmail, SUPPRESS, HOT, LIVE_SEQ, stagePatch, replyPatch, enrollPatch, heatOf, liveCampaign, leadIdFor } from './outreach.js';
 import REMINDERS_FN from '../supabase/functions/reminders/index.ts?raw';
 import CRON_SQL from '../supabase/functions/reminders/cron.sql?raw';
 import ASSISTANT_FN from '../supabase/functions/assistant/index.ts?raw';
@@ -2152,7 +2152,7 @@ async function emTestBoth() {
   if (done.length) toast(`${done.length === 1 ? 'A test is' : 'Both tests are'} in ${done[0].to}. They show exactly what businesses get, with [Test] in the subject.`);
 }
 // Runs the finder once now instead of waiting for its schedule, to see it work.
-const FIND_WHY = {off:'The finder is off. Turn it on first.', key:'The finder needs your Anthropic key in Supabase (ANTHROPIC_API_KEY).', target:"Today's number of new leads is reached. It starts again tomorrow.", budget:"Today's spending limit is reached. It starts again tomorrow.", done:'Every search in your list ran in the last 90 days. Add types of business or cities in its Settings.', error:'The search didn\'t finish. It tries again on the next run.'};
+const FIND_WHY = {off:'The finder is off. Turn it on first.', key:'The finder needs your Anthropic key in Supabase (ANTHROPIC_API_KEY).', target:"Today's number of new leads is reached. It starts again tomorrow.", budget:"Today's spending limit is reached. It starts again tomorrow.", done:'Every search in your list ran in the last 90 days. Add types of business or cities in its Settings.', full:'Each campaign already has its leads waiting. The finder adds more as emails go out, or raise the number in its Settings.', error:'The search didn\'t finish. It tries again on the next run.'};
 async function emFindNow() {
   if (S.emFindBusy) return;
   S.emFindBusy = true; render();
@@ -2293,6 +2293,7 @@ function emChecklist(s, camps, list) {
     [list.length > 0 || s.finder.enabled, 'Add leads', 'Turn on the finder, or add outreach-list.csv or any spreadsheet with emails.', 'em-finder', 'Set up the finder'],
     [camps.some(c => c.reviewed), 'Read and approve the emails', 'Nothing goes out until you approve the wording.', 'em-review', 'Read them'],
     [sendingState(s, localClock(s.tz).date) !== 'paused' && camps.some(liveCampaign), 'Pick your start day', `${s.capStart} a day to start, a few more each day, ${emDays(s.days)}.`, 'em-launch', 'Start'],
+    [Object.values(S.data.push || {}).some(p => p && p.endpoint && p.enabled !== false) || isEmail(String(s.forwardTo || '').trim()), 'Get hot leads on your phone', 'When a business replies with interest, your phone pings right away. Turn on phone notifications on your phone, or forward hot replies to another inbox in Settings.', 'notif-setup', 'Turn on'],
   ];
   const done = items.filter(x => x[0]).length, first = items.findIndex(x => !x[0]);
   if (done === items.length) return '';
@@ -2382,13 +2383,21 @@ function emFinderCard(s) {
   const f = s.finder, st = outDoc('finder') || {}, today = localClock(s.tz).date;
   const td = st.today && st.today.date === today ? st.today : {found:0, spent:0, runs:0, checked:0, noEmail:0};
   const mo = st.month && st.month.month === today.slice(0, 7) ? st.month : {found:0, spent:0};
-  const per = Number(f.perDay) || 50, cap = Number(f.budget) || 3;
-  const state = !f.enabled ? ['Off', ''] : td.found >= per ? ['Done for today', 'good'] : td.spent >= cap ? ['Spending limit reached', 'warn'] : ['Searching', 'good'];
+  const per = Number(f.perDay) || 100, cap = Number(f.budget) || 5, keep = Number(f.keep) || 300;
+  // Each campaign it searches for: leads waiting for their first email against the number to keep waiting.
+  const waiting = inLine(S.data.leads), totals = {};
+  for (const l of Object.values(S.data.leads || {})) if (l && l.seq && l.seq.campaign) totals[l.seq.campaign] = (totals[l.seq.campaign] || 0) + 1;
+  const onIds = Object.entries(f.targets || {}).filter(([, t]) => t && t.on).map(([cid]) => cid);
+  const allFull = onIds.length > 0 && onIds.every(cid => (waiting[cid] || 0) >= keep);
+  const state = !f.enabled ? ['Off', ''] : allFull ? ['Enough waiting', 'good'] : td.found >= per ? ['Done for today', 'good'] : td.spent >= cap ? ['Spending limit reached', 'warn'] : ['Searching', 'good'];
+  const campRows = onIds.map(cid => { const n = waiting[cid] || 0, name = ((S.data.campaigns || {})[cid] || DEFAULT_CAMPAIGNS[cid] || {}).name || cid;
+    return `<div class="fcamp"><div class="fcamp-h"><b>${esc(name)}</b><span class="meta">${n} of ${keep} waiting · ${totals[cid] || 0} in the campaign</span></div><div class="bar ${n >= keep ? 'good' : ''}"><i style="width:${Math.min(100, Math.round(n / keep * 100))}%"></i></div></div>`; }).join('');
   const ran = st.lastRun ? (Date.now() - Date.parse(st.lastRun)) / 60000 : null;
   const camps = Object.entries(f.targets || {}).filter(([, t]) => t && t.on).map(([cid]) => ((S.data.campaigns || {})[cid] || {}).name || cid);
   const costEach = mo.found ? mo.spent / mo.found : td.found ? td.spent / td.found : 0;
   return `<section class="card finder ord-4"><div class="card-h"><h2>Finding new leads</h2><span class="pill ${state[1]}">${state[0]}</span></div>
-    <div class="meta" style="color:var(--ink-2)">${f.enabled ? `Every 15 minutes Claude searches the web for local businesses for ${esc(camps.join(' and ') || 'your campaigns')} and reads each website for an email: up to ${per} new leads a day, ${dollars(cap)} a day at most.` : 'Turn it on and Claude searches the web every 15 minutes for local businesses, reads each website for an email, and adds them to your pipeline and campaign, up to the number you set each day.'}</div>
+    <div class="meta" style="color:var(--ink-2)">${f.enabled ? `Every 15 minutes Claude searches the web for local businesses for ${esc(camps.join(' and ') || 'your campaigns')} and reads each website for an email. It keeps ${keep} leads waiting for each campaign and adds more as emails go out: up to ${per} a day, ${dollars(cap)} a day at most.` : `Turn it on and Claude searches the web every 15 minutes for local businesses, reads each website for an email, and adds them to your pipeline and campaign until each campaign has ${keep} leads waiting.`}</div>
+    ${campRows ? `<div class="fcamps">${campRows}</div>` : ''}
     ${f.enabled || td.found || mo.found ? `<div class="progress"><div class="bar ${td.found >= per ? 'good' : ''}"><i style="width:${Math.min(100, Math.round(td.found / Math.max(1, per) * 100))}%"></i></div><span class="meta mono">${td.found}/${per} today</span></div>
     <div class="emc-n"><span><b>${dollars(td.spent)}</b> today</span><span><b>${mo.found}</b> this month</span><span><b>${dollars(mo.spent)}</b> this month</span>${costEach ? `<span><b>${Math.round(costEach * 100)}¢</b> a lead</span>` : ''}</div>` : ''}
     ${st.lastError ? `<div class="err">${esc(st.lastError)}</div>` : ''}
@@ -2622,12 +2631,13 @@ function emFinderSheet() {
   const f = emSettings().finder, v = (k, def) => draft('ef-' + k, def ?? '');
   const camps = Object.keys(f.targets || {}).filter(cid => (S.data.campaigns || {})[cid] || DEFAULT_CAMPAIGNS[cid]);
   return `<div class="card-h"><h2>Finding new leads</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
-  <p class="meta" style="margin:0;color:var(--ink-2)">Every 15 minutes the finder takes the next search from your list (one type of business in one city), asks Claude to find local businesses on the web, reads each business's own website for a contact email, and adds the ones it finds to your pipeline and that campaign. It never adds a business twice, skips your do-not-contact list, and each search runs at most once every 90 days. It stops for the day at your number or your spending limit.</p>
+  <p class="meta" style="margin:0;color:var(--ink-2)">Every 15 minutes the finder takes the next search from your list (one type of business in one city), asks Claude to find local businesses on the web, reads each business's own website for a contact email, and adds the ones it finds to your pipeline and that campaign. It only uses an address it finds on a real page, never adds a business twice, skips your do-not-contact list, and each search runs at most once every 90 days. It stops for the day at your number or your spending limit, and rests a campaign while it has enough leads waiting.</p>
   <form class="stack" data-form="em-finder" novalidate>
     <div class="grid3"><div class="fld"><label for="ef-perDay">New leads a day</label><input class="in" type="number" min="1" max="500" inputmode="numeric" id="ef-perDay" data-draft value="${esc(v('perDay', f.perDay))}"></div>
       <div class="fld"><label for="ef-budget">Spend at most ($ a day)</label><input class="in" type="number" min="0.5" max="100" step="0.5" inputmode="decimal" id="ef-budget" data-draft value="${esc(v('budget', f.budget))}"></div>
       <div class="fld"><label for="ef-model">Model</label><select class="in" id="ef-model" data-draft>${EM_MODELS.map(([k, l]) => `<option value="${k}" ${v('model', f.model) === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div></div>
     <span class="meta">Each search costs about 10 to 25 cents with Opus and usually finds a handful of businesses with an email. The finder card shows what it really spends, today and this month. Your Anthropic account is billed.</span>
+    <div class="fld"><label for="ef-keep">Leads to keep waiting for each campaign</label><input class="in" type="number" min="10" max="5000" inputmode="numeric" id="ef-keep" data-draft value="${esc(v('keep', f.keep))}" style="max-width:160px"><span class="meta">It searches until each campaign has this many leads waiting for their first email, then adds more as emails go out. One inbox emails about 200 new businesses a month for each campaign, so 300 is about six weeks of emails.</span></div>
     ${toggleRow('ef-review', S.drafts['ef-review'] !== undefined ? !!S.drafts['ef-review'] : !!f.review, 'Let me check each new lead before it is emailed (they wait under Check first)')}
     ${camps.map(cid => { const t = f.targets[cid], name = ((S.data.campaigns || {})[cid] || DEFAULT_CAMPAIGNS[cid]).name, on = S.drafts[`ef-${cid}-on`] !== undefined ? !!S.drafts[`ef-${cid}-on`] : !!t.on;
       return `<div class="ftarget"><h3>${esc(name)}</h3>
@@ -2784,7 +2794,7 @@ function emLaunchSheet() {
     <p class="meta" style="margin:0;color:var(--ink-2)">Everything for your first sending day on one page. Nothing goes out before the day you pick, and Pause on the Email tab stops it any time. Replies are read either way.</p>
     ${step(1, 'The engine', `<div class="meta" style="color:var(--ink-2)">${engLine}</div>${engineOk ? '' : '<div class="btnrow"><button class="btn sm" data-act="em-setup">Engine setup</button></div>'}`, engineOk)}
     ${step(2, 'Your mailing address', `<textarea class="in" id="lx-address" rows="2" data-draft placeholder="PO Box 123, Des Moines, IA 50309">${esc(addr)}</textarea><span class="meta">One line of text at the bottom of each email, which US law requires in sales email. Nothing is ever mailed to it. A PO box or a virtual mailbox (iPostal1 or Anytime Mailbox, about $10 a month) keeps your home address private.</span>`, !!String(addr).trim())}
-    ${step(3, 'The emails', `${campRows}${engineOk ? `<div class="btnrow"><button class="btn sm" data-act="lx-test" ${S.emTestBusy ? 'disabled' : ''}>${S.emTestBusy ? 'Sending…' : 'Send me both as a test'}</button><span class="meta">To your own inbox, so you see exactly what goes out.</span></div>` : ''}<span class="meta">The finder adds up to ${f.perDay} new leads a day in all and spends at most ${dollars(f.budget)} a day on your Anthropic account. Change that in its Settings.</span>`, !need.length)}
+    ${step(3, 'The emails', `${campRows}${engineOk ? `<div class="btnrow"><button class="btn sm" data-act="lx-test" ${S.emTestBusy ? 'disabled' : ''}>${S.emTestBusy ? 'Sending…' : 'Send me both as a test'}</button><span class="meta">To your own inbox, so you see exactly what goes out.</span></div>` : ''}<span class="meta">The finder keeps ${f.keep} leads waiting for each campaign it searches for, adding up to ${f.perDay} a day in all and spending at most ${dollars(f.budget)} a day on your Anthropic account. Change that in its Settings.</span>`, !need.length)}
     ${step(4, 'Your first sending day', `<input class="in" type="date" id="lx-date" data-draft data-rerender min="${t}" value="${esc(startOn)}" style="max-width:220px"><span class="meta">${fmtTap(s.start)} to ${fmtTap(s.end)} in each business's own time, ${esc(emDays(s.days))}. ${s.capStart} emails on the first day and ${s.capStep} more each sending day, up to ${s.capMax} a day, follow-ups included.</span>`, false)}
     <div class="btnrow emfoot"><button class="btn primary" data-act="lx-go">${esc(label)} ${esc(dayWord(startOn))}</button><button class="btn ghost" data-act="modal-close">Not yet</button></div>
     ${need.length ? `<div class="meta">This approves ${need.length > 1 ? 'both first emails and their follow-ups' : 'that campaign\'s emails'} as they read now.</div>` : ''}`;
@@ -3651,9 +3661,10 @@ function submit(form) {
     case 'em-finder': {
       const f = emSettings().finder;
       const n = (id, lo, hi) => { const raw = String(v(id)).trim(), x = Number(raw); return raw !== '' && Number.isFinite(x) && x >= lo && x <= hi ? x : null; };
-      const perDay = n('ef-perDay', 1, 500), budget = n('ef-budget', 0.5, 100);
+      const perDay = n('ef-perDay', 1, 500), budget = n('ef-budget', 0.5, 100), keep = n('ef-keep', 10, 5000);
       if (perDay === null) { toast('New leads a day: pick a number from 1 to 500.'); return; }
       if (budget === null) { toast('Spend at most: pick from $0.50 to $100 a day.'); return; }
+      if (keep === null) { toast('Leads to keep waiting: pick a number from 10 to 5,000.'); return; }
       const targets = {};
       for (const [cid, tg] of Object.entries(f.targets || {})) {
         const on = S.drafts[`ef-${cid}-on`] !== undefined ? !!S.drafts[`ef-${cid}-on`] : !!tg.on;
@@ -3665,8 +3676,8 @@ function submit(form) {
       }
       const model = EM_MODELS.some(m => m[0] === v('ef-model')) ? v('ef-model') : f.model;
       const review = S.drafts['ef-review'] !== undefined ? !!S.drafts['ef-review'] : !!f.review;
-      S.lastUndo = {type:'restore', ops:[{patch:['outreach', 'settings', {finder:{perDay:f.perDay, budget:f.budget, model:f.model, review:!!f.review, targets:clone(f.targets)}}]}]};
-      patchDoc('outreach', 'settings', {finder:{perDay:Math.round(perDay), budget:Math.round(budget * 100) / 100, model, review, targets}, updatedAt:Date.now()});
+      S.lastUndo = {type:'restore', ops:[{patch:['outreach', 'settings', {finder:{perDay:f.perDay, budget:f.budget, keep:f.keep, model:f.model, review:!!f.review, targets:clone(f.targets)}}]}]};
+      patchDoc('outreach', 'settings', {finder:{perDay:Math.round(perDay), budget:Math.round(budget * 100) / 100, keep:Math.round(keep), model, review, targets}, updatedAt:Date.now()});
       clearDrafts('ef-'); closeModal();
       toast(Object.values(targets).some(x => x.on) ? 'Finder settings saved.' : 'Saved. No campaign is picked, so the finder has nothing to look for.', true); render(); break;
     }

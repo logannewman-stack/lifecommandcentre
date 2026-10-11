@@ -658,6 +658,10 @@ body.pipe-drag .pcards{min-height:120px}
 .ftarget{border:1px solid var(--line);border-radius:12px;padding:10px 12px;display:flex;flex-direction:column;gap:8px}
 .ftarget h3{margin:0}
 .finder details{margin-top:4px}
+.fcamps{display:flex;flex-direction:column;gap:8px;margin:8px 0 4px}
+.fcamp{display:flex;flex-direction:column;gap:5px}
+.fcamp .bar{flex:none;width:100%}
+.fcamp-h{display:flex;justify-content:space-between;align-items:baseline;gap:4px 10px;flex-wrap:wrap;font-size:14px}
 @media (min-width:1100px){
   .pcol{flex:1 0 236px;max-height:calc(100dvh - 230px)}
   .pipefilters.all{flex-wrap:nowrap}
