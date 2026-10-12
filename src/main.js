@@ -2765,7 +2765,9 @@ const LAUNCH_CAMPS = ['home-screen', 'front-desk'];
 const lxFind = cid => { const f = emSettings().finder; return S.drafts['lx-f-' + cid] !== undefined ? !!S.drafts['lx-f-' + cid] : f.enabled ? !!(f.targets[cid] || {}).on : true; };
 function emLaunchSheet() {
   const s = emSettings(), eng = S.outEng || {}, t = todayISO(), list = emLeads();
-  const startOn = draft('lx-date', s.startOn && s.startOn >= t ? s.startOn : nextSendDay(addDays(t, 1), s.days));
+  // The first sending day: today while today's sending hours aren't over, else the next sending day.
+  const firstDay = s.days.includes(dowOf(t)) && nowMin() < toMin(s.end) ? t : nextSendDay(addDays(t, 1), s.days);
+  const startOn = draft('lx-date', s.startOn && s.startOn >= t ? s.startOn : firstDay);
   const addr = draft('lx-address', s.address || ''), preview = {...s, address:addr};
   const outdated = eng.fn === 'ok' && (eng.version || 1) < OUTREACH_V, gm = eng.gmail || {};
   const engineOk = eng.fn === 'ok' && !outdated && !!gm.ok;
