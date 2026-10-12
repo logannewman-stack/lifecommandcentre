@@ -112,9 +112,22 @@ export function firstNameOf(l) {
   return firstNameFrom(l.email);
 }
 export const bizName = l => String((l && (l.name || l.business)) || '').trim();
+// The name as it goes in an email: a note in brackets at the end ("(4 Valley clubs)") and a trailing
+// " - Scottsdale" that only repeats the lead's city are for you, not for the business.
+export function mailName(l) {
+  const raw = bizName(l), city = String((l && l.city) || '').trim().toLowerCase();
+  let s = raw, prev;
+  do {
+    prev = s;
+    s = s.replace(/\s*[([][^()[\]]*[)\]]\s*$/, '').trim();
+    const m = city ? s.match(/^(.*\S)\s*[-\u2013\u2014|,]\s*([^-\u2013\u2014|,]+)$/) : null;
+    if (m && m[2].trim().toLowerCase() === city) s = m[1].trim();
+  } while (s && s !== prev);
+  return s || raw;
+}
 export function renderText(tpl, l, c, s) {
   const segs = (c && c.segments) || {}, seg = segs[(l && (l.segment || segmentOf(l.kind || l.business))) || 'general'] || segs.general || {};
-  const name = bizName(l), first = firstNameOf(l);
+  const name = mailName(l), first = firstNameOf(l);
   const v = {
     business: name || 'your business', greeting: first || `${name || 'there'} team`, first_name: first, city: (l && l.city) || '',
     question: seg.question || '', features: seg.features || '', price: (c && c.price) || '', name: (s && s.fromName) || '', website: (s && s.website) || '',

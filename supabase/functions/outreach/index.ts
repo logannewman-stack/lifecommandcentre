@@ -27,7 +27,7 @@ import * as webpush from "jsr:@negrel/webpush@0.5.0";
 import Anthropic from "npm:@anthropic-ai/sdk@0.131.0";
 
 // ---- pure logic (plain JavaScript; the tests import this section) ----
-export const FN_VERSION = 6;
+export const FN_VERSION = 7;
 export const MODEL = "claude-opus-5-5";
 export const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 export const SEND_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -143,10 +143,23 @@ export function firstNameOf(l: any) {
   return firstNameFrom(l.email);
 }
 export const bizName = (l: any) => String((l && (l.name || l.business)) || "").trim();
+// The name as it goes in an email: a note in brackets at the end ("(4 Valley clubs)") and a trailing
+// " - Scottsdale" that only repeats the lead's city are for you, not for the business.
+export function mailName(l: any) {
+  const raw = bizName(l), city = String((l && l.city) || "").trim().toLowerCase();
+  let s = raw, prev;
+  do {
+    prev = s;
+    s = s.replace(/\s*[([][^()[\]]*[)\]]\s*$/, "").trim();
+    const m = city ? s.match(/^(.*\S)\s*[-\u2013\u2014|,]\s*([^-\u2013\u2014|,]+)$/) : null;
+    if (m && m[2].trim().toLowerCase() === city) s = m[1].trim();
+  } while (s && s !== prev);
+  return s || raw;
+}
 // Fills {business}, {greeting}, {question}, {features}, {price}… and tidies the gaps an empty one leaves.
 export function renderText(tpl: any, l: any, c: any, s: any) {
   const segs = (c && c.segments) || {}, seg = segs[(l && (l.segment || segmentOf(l.kind || l.business))) || "general"] || segs.general || {};
-  const name = bizName(l), first = firstNameOf(l);
+  const name = mailName(l), first = firstNameOf(l);
   const v: any = {
     business: name || "your business", greeting: first || `${name || "there"} team`, first_name: first, city: (l && l.city) || "",
     question: seg.question || "", features: seg.features || "", price: (c && c.price) || "", name: (s && s.fromName) || "", website: (s && s.website) || "",
