@@ -99,6 +99,18 @@ Each question costs a few cents. The function checks that the request comes from
 
 **After an app update** that changes a function, its setup sheet shows **Update needed**: tap **Copy the code**, open that function in Supabase, replace all of its code, **Deploy**, and tap **Check**. Your key and settings stay.
 
+## Claude: talk to it from the Claude app, no API key
+
+You can also run your Command Center from Claude itself: the Claude app on your phone, claude.ai or the desktop app, typing or by voice. It runs on your Claude plan, so it needs no Anthropic key and costs nothing extra. Claude reads the same live data as Ask and uses the same tools, plus three more: find a lead by name, move a lead to another stage, and add leads it finds on the web to one of your email campaigns ("find 20 dentists in Ankeny with emails and add them to Front Desk AI"; it only adds an address it saw on the business's own site, and skips anyone already in your pipeline or on your do-not-contact list).
+
+Plan → This device → **Claude** → **Connect Claude** walks you through it once:
+
+1. Update the `assistant` function in Supabase with the app's **Copy the code** (version 9 or later; no Anthropic key needed for this) and turn off **Verify JWT**.
+2. **Make my link** creates your private link and tests it. It works like a password: anyone who has it can read and change your Command Center. The app keeps only a fingerprint of it (a SHA-256 hash), shows it once, and **Make a new link** or **Turn it off** stops the old one at once.
+3. On claude.ai open **Settings → Connectors → Add custom connector**, name it Life Command Center and paste the link. It shows up in the Claude app on your phone too. In a chat, turn it on in the tools menu and ask "What's on my plan today?"
+
+Claude works on your clock: the app keeps the connector's time zone in step with your phone or laptop, the move to Arizona included.
+
 ## Pipeline: every lead in one place
 
 The **Pipeline** tab is your CRM. Every business is one lead, whether you call it, email it, or the finder found it.
@@ -151,7 +163,7 @@ Each campaign is a first email and two follow-ups in the same thread, three and 
 
 **Your mailing address.** US law (CAN-SPAM) requires a postal address at the bottom of every sales email. It is only a line of text: nothing is ever mailed to it. To keep your home address private, use a PO box or a virtual mailbox (iPostal1 or Anytime Mailbox, about $10 a month, set up online). Nothing sends until one is in **Settings**, which also has the forwarding address, the sending days and hours, the warm-up numbers and your time zone.
 
-**Updating from 1.9 to 2.4:** redeploy the `outreach` function with the new code (version 7; version 3 and later wait for your start day) and run the new `cron.sql` once (it adds the finder's schedule). Redeploy the `assistant` function too (version 8), so Ask knows when sending starts and how many leads each campaign has waiting. The app shows **Update needed** until both are current. Your 1.9 contacts become leads in the pipeline the first time you open the app.
+**Updating from 1.9 to 2.5:** redeploy the `outreach` function with the new code (version 7; version 3 and later wait for your start day) and run the new `cron.sql` once (it adds the finder's schedule). Redeploy the `assistant` function too (version 9), so Ask knows when sending starts and how many leads each campaign has waiting, and so Claude can connect to it. The app shows **Update needed** until both are current. Your 1.9 contacts become leads in the pipeline the first time you open the app.
 
 **Good to know:** start with the warm-up as it is; sending a lot from a new mailbox is the fastest way into spam folders. One Gmail inbox sends about 50 emails a day once warmed up, follow-ups included: with three emails per business, that is about 200 new businesses a month for each campaign, so 300 waiting is about six weeks of emails. More than that takes more inboxes. **Get hot leads on your phone** (the last step of the Email tab's checklist) turns on phone notifications, so a business that replies with interest pings you right away; forwarding hot replies to another inbox in Settings works too. Keep an eye on the first replies and fix any that were sorted wrong (**Sorted as** on the reply, with Undo). If the engine or the finder hits a problem (an expired Google token, say), the Email tab shows it in red with what to do.
 
