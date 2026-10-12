@@ -12,12 +12,15 @@
 //
 //   GET  ?status=1  → {ok, hasKey, model, version}
 //   POST            → {message, history, tz, today, now} → {reply, actions}
+//   POST /mcp/<key> → the Claude connector: Claude (on Logan's own Claude plan) reads and changes the app
+//                     through MCP. No Anthropic key needed. The key is made in the app; only its SHA-256
+//                     is kept, in meta/connector.
 // deno-lint-ignore-file no-explicit-any
 import Anthropic from "npm:@anthropic-ai/sdk@0.131.0";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
 // ---- pure logic (no imports; the Deno test imports this section) ----
-export const FN_VERSION = 8;
+export const FN_VERSION = 9;
 export const MODEL = "claude-opus-5-5";
 const AREAS = ["Sales", "Build", "Pickleball", "Body", "Money", "Move", "DoD", "Fix", "Other"];
 const SESSION_TYPES = ["Drill", "Competitive", "Rec play", "Tournament", "Lesson"];
@@ -434,6 +437,185 @@ export async function runTool(store: any, name: string, input: any, today: strin
   }
   return err("unknown tool");
 }
+
+// ---- the Claude connector (MCP) ----
+// Logan adds https://<project>.supabase.co/functions/v1/assistant/mcp/<key> to Claude as a custom connector,
+// then talks to the app from any Claude chat on his own Claude plan. Same tools as the in-app assistant,
+// plus get_overview (the live data the assistant gets as context), lead search, stage moves and add_leads
+// for leads Claude finds on the web in a chat.
+export const MCP_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+export const LEAD_STAGES = ["New lead", "Contacted", "Talking", "Demo booked", "Proposal sent", "Won", "Not now", "Lost"];
+const LIVE_SEQ = ["hold", "queued", "active", "paused"];
+export const CAMPAIGN_NAMES: any = { "home-screen": "Own the Home Screen", "front-desk": "Front Desk AI" };
+// The same rules as the email engine and src/outreach.js (a test compares them).
+const FREEMAIL = new Set(["gmail.com", "googlemail.com", "yahoo.com", "ymail.com", "hotmail.com", "outlook.com", "live.com", "msn.com", "aol.com", "icloud.com", "me.com", "mac.com",
+  "comcast.net", "att.net", "sbcglobal.net", "bellsouth.net", "cox.net", "charter.net", "verizon.net", "mchsi.com", "q.com", "centurylink.net", "frontier.com",
+  "protonmail.com", "proton.me", "mail.com", "gmx.com", "zoho.com"]);
+const msOf = (now: any) => (now instanceof Date ? now.getTime() : Number(now) || Date.now());
+export const isEmail = (e: any) => /^[^\s@<>(),;:"]+@[^\s@<>(),;:"]+\.[a-z]{2,}$/i.test(String(e || "").trim());
+export const leadIdFor = (email: any) => "e-" + String(email || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+export const domainOf = (u: any) => { try { return new URL(/^https?:\/\//i.test(String(u)) ? String(u) : "https://" + String(u)).hostname.replace(/^www\./i, "").toLowerCase(); } catch (_e) { return ""; } };
+const siteOf = (u: any) => { try { return u ? new URL(/^https?:\/\//i.test(String(u)) ? String(u) : "https://" + String(u)).origin : ""; } catch (_e) { return ""; } };
+const normName = (s: any) => String(s || "").toLowerCase().replace(/&/g, " and ").replace(/\b(llc|inc|co|corp|the|pllc|pc|ltd)\b/g, " ").replace(/[^a-z0-9]+/g, " ").trim();
+export function stagePatch(l: any, to: string, by: string, now: any) {
+  const from = (l && l.stage) || "New lead", at = msOf(now);
+  if (!LEAD_STAGES.includes(to) || from === to) return {};
+  const patch: any = { stage: to, stageAt: at, history: [...((l && l.history) || []), { at, from, to, by }].slice(-25) };
+  const seq = l && l.seq;
+  if (seq && LIVE_SEQ.includes(seq.status) && !["New lead", "Contacted"].includes(to)) patch.seq = { ...seq, status: "stopped", nextOn: null, stoppedWhy: to };
+  return patch;
+}
+export function enrollPatch(l: any, cid: string, today: string, hold: boolean) {
+  const prev = l && l.seq;
+  const threads = [...new Set([...((l && l.threads) || []), ...(prev && prev.threadId ? [prev.threadId] : [])])].slice(-10);
+  return {
+    seq: { campaign: cid, status: hold ? "hold" : "queued", step: 0, startedAt: today, nextOn: null, threadId: null, rfcId: null, lastAt: null,
+      sendingStep: null, sendingAt: null, failCount: 0, lastError: null, pausedWhy: null, stoppedWhy: null },
+    enrolled: { ...((l && l.enrolled) || {}), [cid]: today }, threads,
+  };
+}
+// The date and time on Logan's clock (the time zone the app saved with the connector key).
+export function clockIn(tz: string, date = new Date()) {
+  const opts: any = { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" };
+  let parts: any[];
+  try { parts = new Intl.DateTimeFormat("en-US", { ...opts, timeZone: tz || "UTC" }).formatToParts(date); }
+  catch (_e) { parts = new Intl.DateTimeFormat("en-US", { ...opts, timeZone: "UTC" }).formatToParts(date); }
+  const get = (t: string) => (parts.find((p: any) => p.type === t) || {}).value || "";
+  return { today: `${get("year")}-${get("month")}-${get("day")}`, now: `${get("hour") === "24" ? "00" : get("hour")}:${get("minute")}` };
+}
+export async function sha256Hex(s: string) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(s)));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Leads by name, type, email, city or website, for the questions the overview's short list can't answer.
+export function searchLeads(d: any, input: any) {
+  input = input || {};
+  const q = str(input.query).toLowerCase(), stage = LEAD_STAGES.includes(input.stage) ? input.stage : "";
+  const limit = Math.max(1, Math.min(30, Math.round(Number(input.limit) || 15)));
+  const hits = Object.entries(d.leads || {}).map(([id, l]: any) => ({ id, ...(l || {}) })).filter((l: any) => l.name &&
+    (!stage || (l.stage || "New lead") === stage) &&
+    (!q || [l.name, l.business, l.kind, l.email, l.city, l.state, l.website, l.contact].some((v: any) => String(v || "").toLowerCase().includes(q))));
+  if (!hits.length) return `No lead matches${q ? ` "${clip(input.query, 60)}"` : ""}${stage ? ` in ${stage}` : ""}.`;
+  hits.sort((a: any, b: any) => String(a.name).localeCompare(String(b.name)) || a.id.localeCompare(b.id));
+  const line = (l: any) => `- [${l.id}] ${l.name}${l.city ? `, ${l.city}${l.state ? " " + l.state : ""}` : ""} | ${l.type || "Cold"}/${l.stage || "New lead"}` +
+    `${l.email ? " | " + l.email : ""}${l.phone ? " | " + l.phone : ""}` +
+    `${l.nextStep || l.nextDate ? ` | next: ${clip(l.nextStep, 60) || "-"}${l.nextDate ? ` (${l.nextDate})` : ""}` : ""}` +
+    `${l.seq && l.seq.campaign ? ` | email: ${CAMPAIGN_NAMES[l.seq.campaign] || l.seq.campaign}, ${l.seq.status}${Number(l.seq.step) ? `, ${l.seq.step} sent` : ""}` : ""}` +
+    `${l.reply && l.reply.label ? ` | replied: ${l.reply.label}` : ""}${l.dnc ? " | do not contact" : ""}`;
+  return `${hits.length} lead${hits.length === 1 ? "" : "s"}${hits.length > limit ? `, the first ${limit}` : ""}:\n` + hits.slice(0, limit).map(line).join("\n");
+}
+// A stage move, the same as dragging the card in the app: history, and a live email sequence stops past Contacted.
+export async function moveLead(store: any, input: any, d: any, now: any) {
+  input = input || {};
+  const id = str(input.lead_id), to = String(input.stage || "");
+  if (!LEAD_STAGES.includes(to)) return { result: `error: stage must be one of ${LEAD_STAGES.join(", ")}` };
+  const cur = await store.get("leads", id);
+  if (!cur) return { result: `error: no lead [${id}]` };
+  const p = stagePatch(cur, to, "you", now);
+  if (!Object.keys(p).length) return { result: `[${id}] ${cur.name} is already in ${to}` };
+  const next = merge(cur, { ...p, updatedAt: msOf(now) });
+  await store.put("leads", id, next); (d.leads ||= {})[id] = next;
+  return { result: `moved [${id}] ${cur.name} from ${cur.stage || "New lead"} to ${to}${p.seq ? "; its email sequence stopped" : ""}`, action: `${cur.name}: ${to}` };
+}
+// Businesses Claude found on the web in a chat, added to a cold campaign the way the finder adds them.
+export async function addLeads(store: any, input: any, today: string, d: any, now: any) {
+  input = input || {};
+  const cid = String(input.campaign || "");
+  if (!CAMPAIGN_NAMES[cid]) return { result: "error: campaign must be home-screen or front-desk" };
+  const list = Array.isArray(input.leads) ? input.leads.slice(0, 50) : [];
+  if (!list.length) return { result: "error: no leads given" };
+  const hold = !!input.check_first, at = msOf(now);
+  const emails = new Set<string>(), domains = new Set<string>(), names = new Set<string>();
+  for (const l of Object.values(d.leads || {}) as any) {
+    if (!l) continue;
+    if (l.email) emails.add(String(l.email).toLowerCase());
+    const dm = domainOf(l.website); if (dm) domains.add(dm);
+    if (l.name) names.add(normName(l.name) + "|" + String(l.state || l.region || "").toUpperCase());
+  }
+  const suppressed = new Set(Object.keys(d.suppress || {}).map((e) => e.toLowerCase()));
+  const added: string[] = [], skipped: string[] = [];
+  for (const raw of list) {
+    const b = raw && typeof raw === "object" ? raw : {};
+    const name = clip(b.name, 120), email = String(b.email || "").trim().toLowerCase().replace(/^mailto:/, "");
+    const state = String(b.state || "").trim().toUpperCase().slice(0, 2), city = clip(b.city, 60), site = siteOf(b.website);
+    const home = domainOf(site || b.source_url), ed = email.split("@")[1] || "", key = normName(name) + "|" + state;
+    const why = !name ? "no name" : !isEmail(email) ? "not an email address" : suppressed.has(email) ? "on the do-not-contact list"
+      : emails.has(email) || (site && domains.has(domainOf(site))) || names.has(key) ? "already in the pipeline"
+      : !(FREEMAIL.has(ed) || (!!home && (ed === home || ed.endsWith("." + home)))) ? "the email isn't on the business's own website domain" : "";
+    if (why) { skipped.push(`${name || email || "?"} (${why})`); continue; }
+    const id = leadIdFor(email);
+    if (await store.get("leads", id)) { skipped.push(`${name} (already in the pipeline)`); continue; }
+    const kind = clip(b.kind, 60);
+    const doc = {
+      name, business: [kind, city].filter(Boolean).join(", "), contact: "", firstName: "", email, phone: clip(b.phone, 40), website: site,
+      city, state, region: ["IA", "AZ"].includes(state) ? state : "", kind, type: "Cold", stage: "New lead", stageAt: at,
+      source: "Finder", foundAt: clip(b.source_url || site, 300), confidence: "Good", callList: false, touches: 0, notes: "",
+      createdAt: at, updatedAt: at, history: [{ at, from: "", to: "New lead", by: "finder" }], ...enrollPatch(null, cid, today, hold),
+    };
+    await store.put("leads", id, doc); (d.leads ||= {})[id] = doc;
+    emails.add(email); if (site) domains.add(domainOf(site)); names.add(key); added.push(name);
+  }
+  const res = `added ${added.length} to ${CAMPAIGN_NAMES[cid]}${hold && added.length ? ", waiting under Check first" : ""}${added.length ? ": " + added.join(", ") : ""}` +
+    `${skipped.length ? `\nskipped ${skipped.length}: ${skipped.join("; ")}` : ""}`;
+  return added.length ? { result: res, action: `Added ${added.length} lead${added.length === 1 ? "" : "s"} to ${CAMPAIGN_NAMES[cid]}` } : { result: res };
+}
+
+const ONLY_READ = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+const CHANGES = { readOnlyHint: false, destructiveHint: false, openWorldHint: false };
+const CONNECTOR_TOOLS: any[] = [
+  { name: "get_overview", title: "Read the Command Center", description: "Logan's live data: today's and tomorrow's plan with block keys in [brackets], what's done and what moved, one-off changes for the week, the weekly plan, to-dos with ids, calls and leads due, the pipeline, email outreach, this week's numbers against targets, roadmap, money, body and pickleball sessions with ids. Call it first in a conversation and again after a few changes.", input_schema: { type: "object", properties: {} } },
+  { name: "search_leads", title: "Find leads", description: "Find leads in the pipeline by name, type of business, email, city or website, optionally only in one stage. Each comes with its id in brackets, stage, next step and email campaign; use the id with add_lead_note and move_lead.", input_schema: { type: "object", properties: { query: { type: "string" }, stage: { type: "string", enum: LEAD_STAGES }, limit: { type: "number", description: "Up to 30, 15 by default" } } } },
+  { name: "move_lead", title: "Move a lead", description: "Move a lead to another stage, like a call that booked a demo or a deal that closed. Moving it past Contacted stops its email sequence, the same as moving it in the app.", input_schema: { type: "object", properties: { lead_id: { type: "string" }, stage: { type: "string", enum: LEAD_STAGES } }, required: ["lead_id", "stage"] } },
+  { name: "add_leads", title: "Add leads to a campaign", description: "Add local businesses to one of Logan's cold email campaigns: home-screen (Own the Home Screen: med spas, IV therapy, chiropractors, pilates and yoga studios, boutique gyms, pickleball clubs, hair salons, massage) or front-desk (Front Desk AI: HVAC, plumbers, electricians, roofers, landscapers, cleaners and other service businesses, and dental offices). Only add an email address you saw on the business's own website in this conversation, with that page in source_url; never guess one. Businesses already in the pipeline, on the do-not-contact list, or with an email on another domain than their website are skipped. New leads wait in the campaign and go out on Logan's sending days.", input_schema: { type: "object", properties: { campaign: { type: "string", enum: ["home-screen", "front-desk"] }, check_first: { type: "boolean", description: "Hold them under Check first in the app instead of lining them up" }, leads: { type: "array", maxItems: 50, items: { type: "object", properties: { name: { type: "string" }, email: { type: "string" }, website: { type: "string" }, source_url: { type: "string", description: "The page the email is on" }, phone: { type: "string" }, city: { type: "string" }, state: { type: "string", description: "Two letters, like IA or AZ" }, kind: { type: "string", description: "Type of business, like Med spa or HVAC" } }, required: ["name", "email", "city", "state"] } } }, required: ["campaign", "leads"] } },
+];
+const TITLES: any = { move_block: "Move a block", skip_block: "Cancel a block", set_day_off: "Day off", check_block: "Check off a block", add_event: "Add a one-off", update_event: "Change a one-off", edit_weekly_block: "Change the weekly plan", add_weekly_block: "Add to the weekly plan", remove_weekly_block: "Remove from the weekly plan", add_task: "Add a to-do", update_task: "Change a to-do", add_lead_note: "Note a lead", log_checkin: "Log the check-in", log_session: "Log a session", log_dupr: "Log DUPR" };
+export const MCP_TOOLS: any[] = [CONNECTOR_TOOLS[0], ...TOOLS, ...CONNECTOR_TOOLS.slice(1)].map((t: any) => ({
+  name: t.name, title: t.title || TITLES[t.name] || t.name, description: t.description, inputSchema: t.input_schema,
+  annotations: { title: t.title || TITLES[t.name] || t.name, ...(["get_overview", "search_leads"].includes(t.name) ? ONLY_READ : { ...CHANGES, destructiveHint: ["remove_weekly_block", "update_event"].includes(t.name) }) },
+}));
+export const MCP_INSTRUCTIONS = `Life Command Center is Logan's personal daily-plan app: each day's plan, to-dos, calls and sales pipeline, email outreach, check-ins, pickleball and money. Call get_overview at the start of a conversation (and again after a few changes) to read his live data, then use the other tools to change things. Times are 24-hour HH:MM in Logan's time zone, and dates are YYYY-MM-DD from today's date in the overview.
+
+To find new leads for his email campaigns: search the web for local businesses of the kind the campaign is for, open each business's own website to find its contact email, and add the ones you found with add_leads. Never guess an email address.
+
+` + SYSTEM.slice(SYSTEM.indexOf("How to talk")).replace(/\bthe context\b/g, "the overview");
+const rpcError = (id: any, code: number, message: string) => ({ jsonrpc: "2.0", id, error: { code, message } });
+// One JSON-RPC message from Claude. ctx.load() gives {d, store, today, now, tz, at} for the tools.
+// Notifications (no id) need no answer.
+export async function mcpHandle(msg: any, ctx: any): Promise<any> {
+  const id = msg && typeof msg === "object" ? msg.id : undefined, method = msg && msg.method;
+  if (!msg || typeof msg !== "object" || typeof method !== "string") return id === undefined || id === null ? null : rpcError(id, -32600, "Invalid request");
+  if (id === undefined || id === null) return null;
+  const ok = (result: any) => ({ jsonrpc: "2.0", id, result });
+  switch (method) {
+    case "initialize": {
+      const asked = msg.params && msg.params.protocolVersion;
+      return ok({ protocolVersion: MCP_PROTOCOLS.includes(asked) ? asked : MCP_PROTOCOLS[0], capabilities: { tools: { listChanged: false } },
+        serverInfo: { name: "life-command-center", title: "Life Command Center", version: String(FN_VERSION) }, instructions: MCP_INSTRUCTIONS });
+    }
+    case "ping": return ok({});
+    case "tools/list": return ok({ tools: MCP_TOOLS });
+    case "resources/list": return ok({ resources: [] });
+    case "resources/templates/list": return ok({ resourceTemplates: [] });
+    case "prompts/list": return ok({ prompts: [] });
+    case "tools/call": {
+      const name = msg.params && msg.params.name, args = (msg.params && msg.params.arguments) || {};
+      if (!MCP_TOOLS.some((t: any) => t.name === name)) return rpcError(id, -32602, `Unknown tool: ${name}`);
+      let r: { result: string; action?: string };
+      try {
+        const c = await ctx.load();
+        if (name === "get_overview") r = { result: buildContext(c.d, c.today, c.now, c.tz) };
+        else if (name === "search_leads") r = { result: searchLeads(c.d, args) };
+        else if (name === "move_lead") r = await moveLead(c.store, args, c.d, c.at);
+        else if (name === "add_leads") r = await addLeads(c.store, args, c.today, c.d, c.at);
+        else r = await runTool(c.store, name, args, c.today, c.d);
+      } catch (e: any) { r = { result: "error: " + ((e && e.message) || String(e)) }; }
+      const isError = r.result.startsWith("error");
+      return ok({ content: [{ type: "text", text: r.action && !isError ? `${r.action}. (${r.result})` : r.result }], isError });
+    }
+    default: return rpcError(id, -32601, `Method not found: ${method}`);
+  }
+}
 // ---- end pure logic ----
 
 const CORS = {
@@ -443,9 +625,68 @@ const CORS = {
 };
 const json = (body: any, status = 200) => new Response(JSON.stringify(body), { status, headers: { ...CORS, "Content-Type": "application/json" } });
 
+// Every row of one owner, and a store that reads right before each write, so a change made on a phone
+// (or by the email engine) a second ago is kept.
+export async function ownerData(admin: any, uid: string) {
+  const rows: any[] = [];
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await admin.from("docs").select("collection,id,data").eq("owner", uid).range(from, from + 999);
+    if (error) throw new Error("Could not read your data: " + error.message);
+    rows.push(...(data || [])); if (!data || data.length < 1000) break;
+  }
+  const store = {
+    get: async (col: string, id: string) => { const { data, error } = await admin.from("docs").select("data").match({ owner: uid, collection: col, id }).maybeSingle(); if (error) throw new Error(error.message); return data ? data.data : null; },
+    put: async (col: string, id: string, data: any) => { const { error } = await admin.from("docs").upsert({ owner: uid, collection: col, id, data, updated_at: new Date().toISOString() }, { onConflict: "owner,collection,id" }); if (error) throw new Error(error.message); },
+    del: async (col: string, id: string) => { const { error } = await admin.from("docs").delete().match({ owner: uid, collection: col, id }); if (error) throw new Error(error.message); },
+  };
+  return { d: byCol(rows), store };
+}
+
+// The Claude connector: POST /assistant/mcp/<key> with JSON-RPC from Claude. The key's SHA-256 has to match
+// meta/connector.hash of some owner; a key that was turned off or replaced gets a 404.
+export async function mcpRoute(req: Request, key: string, admin: any, now = new Date()) {
+  if (req.method !== "POST") return new Response(null, { status: 405, headers: { ...CORS, Allow: "POST" } });
+  const hash = key.length >= 20 ? await sha256Hex(key) : "";
+  const { data: rows, error } = hash ? await admin.from("docs").select("owner,data").eq("collection", "meta").eq("id", "connector") : { data: [], error: null };
+  if (error) return json({ error: error.message }, 500);
+  const row = (rows || []).find((r: any) => r && r.data && r.data.hash === hash);
+  if (!row) return json({ error: "This link was turned off or replaced. Make a new one in the app: Plan › This device › Claude." }, 404);
+  let body: any;
+  try { body = await req.json(); } catch (_e) { return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, 400); }
+  const tz = String(row.data.tz || "America/Chicago").slice(0, 60);
+  let loaded: any = null;
+  const ctx = {
+    load: async () => {
+      if (loaded) return loaded;
+      const { d, store } = await ownerData(admin, row.owner), c = clockIn(tz, now);
+      loaded = { d, store, today: c.today, now: c.now, tz, at: now.getTime() };
+      // When it was last used, for the app's Claude sheet (at most once a minute). Only while the stored
+      // fingerprint is still this key's, so a link made in the app this very second is never undone.
+      if (!row.data.usedAt || now.getTime() - Date.parse(row.data.usedAt) > 60000) {
+        try {
+          await admin.from("docs").update({ data: { ...row.data, usedAt: now.toISOString() }, updated_at: now.toISOString() })
+            .match({ owner: row.owner, collection: "meta", id: "connector" }).eq("data->>hash", hash);
+        } catch (_e) { /* not worth failing the call */ }
+      }
+      return loaded;
+    },
+  };
+  const msgs = Array.isArray(body) ? body : [body], out: any[] = [];
+  for (const m of msgs) { const r = await mcpHandle(m, ctx); if (r) out.push(r); }
+  if (!out.length) return new Response(null, { status: 202, headers: CORS });
+  return json(Array.isArray(body) ? out : out[0]);
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
   const url = new URL(req.url);
+  const parts = url.pathname.split("/").filter(Boolean), mcpAt = parts.indexOf("mcp");
+  if (mcpAt >= 0) {
+    try {
+      const admin = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!, { auth: { persistSession: false } });
+      return await mcpRoute(req, decodeURIComponent(parts[mcpAt + 1] || url.searchParams.get("key") || ""), admin);
+    } catch (e: any) { console.error(e); return json({ error: String((e && e.message) || e) }, 500); }
+  }
   const apiKey = Deno.env.get("ANTHROPIC_API_KEY") || "";
   if (url.searchParams.has("status")) return json({ ok: true, hasKey: !!apiKey, model: MODEL, version: FN_VERSION });
   if (req.method !== "POST") return json({ ok: true, hint: "POST {message, history, tz, today, now}" });
@@ -465,19 +706,7 @@ Deno.serve(async (req: Request) => {
     const tz = String(body.tz || "UTC").slice(0, 60);
 
     const admin = createClient(supaUrl, service, { auth: { persistSession: false } });
-    const rows: any[] = [];
-    for (let from = 0; ; from += 1000) {
-      const { data, error } = await admin.from("docs").select("collection,id,data").eq("owner", uid).range(from, from + 999);
-      if (error) return json({ error: "Could not read your data: " + error.message }, 500);
-      rows.push(...(data || [])); if (!data || data.length < 1000) break;
-    }
-    const d = byCol(rows);
-    // Reads go to the database right before each write, so a change made on a phone a second ago is kept.
-    const store = {
-      get: async (col: string, id: string) => { const { data, error } = await admin.from("docs").select("data").match({ owner: uid, collection: col, id }).maybeSingle(); if (error) throw new Error(error.message); return data ? data.data : null; },
-      put: async (col: string, id: string, data: any) => { const { error } = await admin.from("docs").upsert({ owner: uid, collection: col, id, data, updated_at: new Date().toISOString() }, { onConflict: "owner,collection,id" }); if (error) throw new Error(error.message); },
-      del: async (col: string, id: string) => { const { error } = await admin.from("docs").delete().match({ owner: uid, collection: col, id }); if (error) throw new Error(error.message); },
-    };
+    const { d, store } = await ownerData(admin, uid);
 
     const history: any[] = (Array.isArray(body.history) ? body.history : [])
       .filter((m: any) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string" && m.content.trim())
