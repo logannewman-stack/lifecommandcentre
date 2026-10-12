@@ -661,6 +661,9 @@ body.pipe-drag .pcards{min-height:120px}
 .fcamps{display:flex;flex-direction:column;gap:8px;margin:8px 0 4px}
 .fcamp{display:flex;flex-direction:column;gap:5px}
 .fcamp .bar{flex:none;width:100%}
+.connlink{display:flex;gap:8px;margin-top:8px;align-items:center}
+.connlink .in{flex:1;min-width:0;font-size:12px}
+.setupcard .btnrow{flex:none}
 .fcamp-h{display:flex;justify-content:space-between;align-items:baseline;gap:4px 10px;flex-wrap:wrap;font-size:14px}
 @media (min-width:1100px){
   .pcol{flex:1 0 236px;max-height:calc(100dvh - 230px)}

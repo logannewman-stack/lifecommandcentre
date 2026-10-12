@@ -459,6 +459,7 @@ function maybeRollover() {
   maybeAutoFreshStart();
   maybeRestart();
   maybeSeedOutreach();
+  maybeConnectorTz();
   const y = addDays(todayISO(), -1);
   const through = (S.data.meta.rollover || {}).through;
   if (through && through >= y) return;
@@ -1386,6 +1387,8 @@ function settingsCard() {
       <div class="btnrow"><button class="btn sm" data-act="calendar">Add to calendar</button><button class="btn sm ${pushDoc() && pushDoc().enabled ? '' : 'primary'}" data-act="notif-setup">Phone notifications</button></div></div>
     <div class="srow"><div class="lbl">Assistant<small>Talk to Claude inside the app. It sees your plan and numbers and can add to-dos and events. One-time, three-step setup with your own Anthropic key.</small></div>
       <div class="btnrow"><button class="btn sm" data-act="ask">Ask</button><button class="btn sm ghost" data-act="assistant-setup">Set up</button></div></div>
+    <div class="srow"><div class="lbl">Claude<small>${connDoc() ? `Connected${connDoc().usedAt ? `, last used ${esc(emAgo(connDoc().usedAt))}` : ''}. Talk to your Command Center from the Claude app on your Claude plan, no API key.` : 'Talk to your Command Center from the Claude app on your phone or laptop, on your own Claude plan. No API key, nothing extra to pay.'}</small></div>
+      <div class="btnrow"><button class="btn sm ${connDoc() ? '' : 'primary'}" data-act="claude-setup">${connDoc() ? 'Manage' : 'Connect Claude'}</button></div></div>
     <div class="srow"><div class="lbl">Fresh start<small>Begin the plan on a clean day: older to-dos move there, make-ups are dropped, Sundays rest.</small></div>
       <button class="btn sm" data-act="fresh-start">Set up</button></div>
     <div class="srow"><div class="lbl">Backup<small>Importing adds or replaces items with the same IDs. It never deletes anything. You can also drag a backup file onto the page.</small></div>
@@ -1870,6 +1873,47 @@ function blockEditForm() {
 
 /* ----- the assistant: talk to Claude inside the app ----- */
 const assistantUrl = () => sbConfig ? String(sbConfig.url).replace(/\/+$/, '') + '/functions/v1/assistant' : '';
+// The Claude connector: Claude, on your own Claude plan, talks to the app through the assistant function at
+// /assistant/mcp/<key>. The key is made here and shown once; only its SHA-256 and your time zone are saved,
+// in meta/connector, so the database never holds the key itself.
+const connDoc = () => ((S.data.meta || {}).connector && S.data.meta.connector.hash) ? S.data.meta.connector : null;
+const deviceTz = () => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'America/Chicago'; } catch (e) { return 'America/Chicago'; } };
+async function sha256Hex(text) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(text)));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+async function connMake() {
+  if (!assistantUrl()) { toast('Connect your Supabase project first.'); return; }
+  const had = !!connDoc(), bytes = crypto.getRandomValues(new Uint8Array(32));
+  const key = btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  setDoc('meta', 'connector', {hash:await sha256Hex(key), tz:deviceTz(), createdAt:Date.now()});
+  S.connLink = assistantUrl() + '/mcp/' + key;
+  S.connTest = {checking:true};
+  toast(had ? 'New link made. The old one stopped working, so paste this one into Claude.' : 'Your link is ready. Copy it into Claude.');
+  render();
+  await emSettle(['meta/connector']);
+  connTest();
+}
+// Sends the same first message Claude sends, so you know the link works before you paste it.
+async function connTest() {
+  if (!S.connLink) return;
+  S.connTest = {checking:true}; render();
+  let res;
+  try {
+    const r = await fetch(S.connLink, {method:'POST', headers:{'Content-Type':'application/json', 'Accept':'application/json, text/event-stream'},
+      body:JSON.stringify({jsonrpc:'2.0', id:1, method:'initialize', params:{protocolVersion:'2025-06-18', capabilities:{}, clientInfo:{name:'life-command-center-app', version:String(APP_VERSION)}}})});
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.result && j.result.serverInfo && j.result.serverInfo.name === 'life-command-center') res = {ok:true};
+    else if (r.status === 404 && /turned off|replaced/.test(String(j.error || ''))) res = {msg:"Supabase doesn't have your new link yet. Wait a few seconds, then test again."};
+    else if (r.status === 404) res = {msg:'No assistant function found. Do step 1 first.'};
+    else if (r.status === 401 && /Sign in/.test(String(j.error || ''))) res = {msg:'Supabase runs an older assistant. Do step 1: paste the new code over it and Deploy.'};
+    else if (r.status === 401 || r.status === 403) res = {msg:'The function still checks for a login. Turn off "Verify JWT" in its settings.'};
+    else res = {msg:`The function answered ${r.status}.`};
+  } catch (e) { res = {msg:"Couldn't reach the function. Check that the assistant is deployed (step 1)."}; }
+  S.connTest = res; render();
+}
+// The connector answers on your clock, so its time zone follows this device (the move to Arizona included).
+function maybeConnectorTz() { const c = connDoc(), tz = deviceTz(); if (c && c.tz !== tz) patchDoc('meta', 'connector', {tz}); }
 const coarsePointer = () => !!(window.matchMedia && matchMedia('(pointer: coarse)').matches);
 const chatDoc = () => (S.data.chat || {}).main || {messages:[]};
 const SR = typeof window !== 'undefined' ? (window.SpeechRecognition || window.webkitSpeechRecognition) : null;
@@ -1926,7 +1970,7 @@ function chatSheet() {
     : st.fn === 'ok' && (st.version || 1) < ASSISTANT_V ? ['A newer assistant is ready. Paste the new code over the old one in Supabase so it can move your schedule.', 'Update it'] : null;
   const sugg = ['What should I focus on right now?', 'I have pickleball 12 to 2 today', 'Move my drill to 6 am tomorrow', 'Push everything after lunch 30 minutes', "How's my week against the targets?", 'Add a to-do for tomorrow: '];
   return `<div class="card-h"><h2>Ask</h2><div class="btnrow"><button class="btn sm ghost" data-act="chat-clear" ${msgs.length ? '' : 'disabled'}>Clear</button><button class="btn sm ghost" data-act="modal-close">Close</button></div></div>
-    ${setup ? `<div class="setupcard"><span>${esc(setup[0])}</span><button class="btn sm primary" data-act="assistant-setup">${setup[1]}</button></div>` : ''}
+    ${setup ? `<div class="setupcard"><span>${esc(setup[0])}</span><div class="btnrow"><button class="btn sm primary" data-act="assistant-setup">${setup[1]}</button>${st.fn === 'missing' || (st.fn === 'ok' && !st.hasKey) ? '<button class="btn sm" data-act="claude-setup">Use the Claude app instead</button>' : ''}</div></div>` : ''}
     <div class="chat" id="chat-log">
       ${msgs.length ? msgs.map(m => `<div class="msg ${m.role}"><div class="bubble">${fmtChat(m.content)}</div>${m.actions && m.actions.length ? `<div class="done-acts">${m.actions.map(a => `<span class="pill good">${esc(a)}</span>`).join('')}</div>` : ''}</div>`).join('') : '<div class="meta">Ask about your day, your numbers or a lead, or tell me to add something. I can see your plan, to-dos, calls and week, and I can move, add and skip blocks, check things off, and log your check-in and sessions.</div>'}
       ${S.chatBusy ? '<div class="msg assistant"><div class="bubble thinking">Thinking…</div></div>' : ''}
@@ -1960,6 +2004,22 @@ function assistantSheet() {
     ${step(2, 'Create the function', `In Supabase open <b>Edge Functions</b> › <b>Deploy a new function</b> › <b>Via Editor</b>. Name it <span class="kbd">assistant</span>, replace all the code with the copied code, and <b>Deploy</b>. Then open the function's <b>Settings</b> and turn <b>off</b> "Verify JWT".<div class="btnrow" style="margin-top:6px"><button class="btn sm" data-act="copy-assistant">Copy the code</button><button class="btn sm ghost" data-act="assistant-check">${st.checking ? 'Checking…' : 'Check'}</button>${st.fn === 'ok' ? (outdated ? '<span class="pill warn">Update needed</span>' : '<span class="pill good">Found</span>') : st.fn === 'missing' ? '<span class="pill warn">Not found yet</span>' : st.fn === 'error' ? '<span class="pill bad">Problem</span>' : ''}</div>${outdated ? '<div class="meta" style="margin-top:6px">Supabase is running an older copy that cannot move your schedule. Copy the code, open the <b>assistant</b> function, replace all of its code, Deploy, then tap Check.</div>' : ''}${st.fn === 'error' && st.msg ? `<div class="err" style="margin-top:6px">${esc(st.msg)}</div>` : ''}`, st.fn === 'ok' && !outdated)}
     ${step(3, 'Give it the key', `In Supabase open <b>Edge Functions</b> › <b>Secrets</b> (or Project Settings › Edge Functions). Add a secret named <span class="kbd">ANTHROPIC_API_KEY</span> with the key from step 1. Then tap Check again.${st.fn === 'ok' ? (st.hasKey ? ' <span class="pill good">Key is set</span>' : ' <span class="pill warn">No key yet</span>') : ''}`, st.fn === 'ok' && !!st.hasKey)}
     <div class="btnrow">${st.fn === 'ok' && st.hasKey ? '<button class="btn primary" data-act="ask">Open the assistant</button>' : ''}<span class="meta">Model: ${esc(st.model || 'claude-opus-5-5')}. Each question costs a few cents.</span></div>`;
+}
+
+function claudeSheet() {
+  const st = S.assist || {}, c = connDoc(), outdated = st.fn === 'ok' && (st.version || 1) < ASSISTANT_V, fnOk = st.fn === 'ok' && !outdated, t = S.connTest;
+  const step = (n, title, body, ok) => `<div class="step ${ok ? 'ok' : ''}"><div class="num">${ok ? '✓' : n}</div><div class="min0"><b>${title}</b><div class="meta" style="color:var(--ink-2)">${body}</div></div></div>`;
+  const pill = st.fn === 'ok' ? (outdated ? '<span class="pill warn">Update needed</span>' : '<span class="pill good">Ready</span>') : st.fn === 'missing' ? '<span class="pill warn">Not found yet</span>' : st.fn === 'error' ? '<span class="pill bad">Problem</span>' : '';
+  const status = c ? ` Your link is on${c.createdAt ? `, made ${esc(fmtDay(iso(new Date(c.createdAt))))}` : ''}${c.usedAt ? `, last used by Claude ${esc(emAgo(c.usedAt))}` : ', not used by Claude yet'}.` : '';
+  const link = S.connLink ? `<div class="connlink"><input class="in mono" readonly value="${esc(S.connLink)}" aria-label="Your Claude link"><button class="btn sm primary" data-act="conn-copy">Copy</button></div>
+    <div class="btnrow" style="margin-top:6px">${t && t.checking ? '<span class="meta">Testing the link…</span>' : t && t.ok ? '<span class="pill good">Working</span>' : t && t.msg ? `<span class="err">${esc(t.msg)}</span>` : ''}<button class="btn sm ghost" data-act="conn-test" ${t && t.checking ? 'disabled' : ''}>Test it</button></div>
+    <div class="meta" style="margin-top:4px">This is the only time the link is shown. If you lose it, make a new one.</div>` : '';
+  return `<div class="card-h"><h2>Claude</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
+    <p class="meta" style="margin:0;color:var(--ink-2)">Talk to your Command Center from Claude: the Claude app on your phone, claude.ai or the desktop app, typing or by voice. Claude reads your plan, to-dos, pipeline and email, and changes things when you ask. It runs on your Claude plan, so there's no API key and nothing extra to pay.</p>
+    ${step(1, 'Update the assistant function', `Your link is answered by the <b>assistant</b> function in Supabase, and this part doesn't need an Anthropic key. Tap <b>Copy the code</b>. In Supabase open <b>Edge Functions</b> › <b>assistant</b> and replace all of its code, or if it isn't there, <b>Deploy a new function</b> › <b>Via Editor</b> named <span class="kbd">assistant</span>. <b>Deploy</b>, then turn <b>off</b> "Verify JWT" in its <b>Settings</b>.<div class="btnrow" style="margin-top:6px"><button class="btn sm" data-act="copy-assistant">Copy the code</button><button class="btn sm ghost" data-act="assistant-check">${st.checking ? 'Checking…' : 'Check'}</button>${pill}</div>${st.fn === 'error' && st.msg ? `<div class="err" style="margin-top:6px">${esc(st.msg)}</div>` : ''}`, fnOk)}
+    ${step(2, 'Make your private link', `It works like a password: anyone who has it can read and change your Command Center, so keep it to yourself.${status}<div class="btnrow" style="margin-top:6px"><button class="btn sm ${c ? '' : 'primary'}" data-act="conn-make">${c ? 'Make a new link' : 'Make my link'}</button>${c ? '<button class="btn sm ghost" data-act="conn-off">Turn it off</button>' : ''}</div>${link}${c && !S.connLink ? '<div class="meta" style="margin-top:4px">A new link turns the old one off, so you would paste the new one into Claude.</div>' : ''}`, !!c)}
+    ${step(3, 'Add it to Claude', `On a laptop, open <b>claude.ai</b> › <b>Settings</b> › <b>Connectors</b> › <b>Add custom connector</b>. Name it <b>Life Command Center</b>, paste your link as the URL and click <b>Add</b>. It shows up in the Claude app on your phone too. In a chat, turn it on in the tools menu and try: <i>What's on my plan today?</i>`, !!(c && c.usedAt))}
+    <div class="meta">Things to say: "I'm wiped, move gym to tomorrow." "Log my check-in: 182, slept 7 hours." "I booked a demo with Glow Med Spa for Thursday at 2." "Find 20 dentists in Ankeny with emails and add them to Front Desk AI." The first time, Claude asks before it uses each tool; you can let it always allow.</div>`;
 }
 
 /* ----- EMAIL AND THE PIPELINE ----- */
@@ -2929,7 +2989,7 @@ function renderModal() {
   const old = el.querySelector('.sheet'), top = old && el.dataset.sig === sig ? old.scrollTop : 0;
   const ty = S.modal.type;
   el.hidden = false;
-  el.innerHTML = `<div class="sheet ${old ? 'still' : ''} ${ty === 'sched' || ty === 'build' || ty === 'lead-view' || ty.startsWith('em-') ? 'wide' : ty === 'week' ? 'wide week' : ''}" role="dialog" aria-modal="true">${ty === 'em-campaign' ? emCampaignSheet() : ty === 'em-settings' ? emSettingsSheet() : ty === 'em-import' ? emImportSheet() : ty === 'em-finder' ? emFinderSheet() : ty === 'em-launch' ? emLaunchSheet() : ty === 'lead-view' ? leadSheet() : ty === 'em-setup' ? emSetupSheet() : ty === 'session' ? sessionForm() : ty === 'fresh' ? freshForm() : ty === 'block' ? blockSheet(S.modal.key, S.modal.date) : ty === 'task' ? taskSheet(S.modal.id) : ty === 'mile' ? mileSheet(S.modal.id) : ty === 'stat' ? statSheet(S.modal.id) : ty === 'notif' ? notifSheet() : ty === 'call' ? callSheet() : ty === 'event' ? eventForm() : ty === 'chat' ? chatSheet() : ty === 'assist' ? assistantSheet() : ty === 'sched' ? schedSheet() : ty === 'add' ? addForm() : ty === 'blockedit' ? blockEditForm() : ty === 'catchup' ? catchupSheet() : ty === 'quick' ? quickSheet() : ty === 'build' ? buildSheet() : ty === 'week' ? weekSheet() : leadEditForm()}</div>`;
+  el.innerHTML = `<div class="sheet ${old ? 'still' : ''} ${ty === 'sched' || ty === 'build' || ty === 'lead-view' || ty.startsWith('em-') ? 'wide' : ty === 'week' ? 'wide week' : ''}" role="dialog" aria-modal="true">${ty === 'em-campaign' ? emCampaignSheet() : ty === 'em-settings' ? emSettingsSheet() : ty === 'em-import' ? emImportSheet() : ty === 'em-finder' ? emFinderSheet() : ty === 'em-launch' ? emLaunchSheet() : ty === 'lead-view' ? leadSheet() : ty === 'em-setup' ? emSetupSheet() : ty === 'session' ? sessionForm() : ty === 'fresh' ? freshForm() : ty === 'block' ? blockSheet(S.modal.key, S.modal.date) : ty === 'task' ? taskSheet(S.modal.id) : ty === 'mile' ? mileSheet(S.modal.id) : ty === 'stat' ? statSheet(S.modal.id) : ty === 'notif' ? notifSheet() : ty === 'call' ? callSheet() : ty === 'event' ? eventForm() : ty === 'chat' ? chatSheet() : ty === 'assist' ? assistantSheet() : ty === 'claude' ? claudeSheet() : ty === 'sched' ? schedSheet() : ty === 'add' ? addForm() : ty === 'blockedit' ? blockEditForm() : ty === 'catchup' ? catchupSheet() : ty === 'quick' ? quickSheet() : ty === 'build' ? buildSheet() : ty === 'week' ? weekSheet() : leadEditForm()}</div>`;
   el.dataset.sig = sig;
   if (top) el.querySelector('.sheet').scrollTop = top;
   if (keep) { const n = document.getElementById(keep.id); if (n) { n.focus({preventScroll:true}); try { if (keep.s != null) n.setSelectionRange(keep.s, keep.e); } catch(e) {} } }
@@ -3212,6 +3272,17 @@ function handle(act, el, ev) {
     case 'chat-clear': setDoc('chat', 'main', {messages:[]}); S.chatErr = null; render(); break;
     case 'chat-mic': chatMic(); break;
     case 'assistant-setup': S.modal = {type:'assist'}; render(); if (!S.assist) assistantCheck(); break;
+    case 'claude-setup': S.modal = {type:'claude'}; render(); assistantCheck(true); break;
+    case 'conn-make': connMake(); break;
+    case 'conn-test': connTest(); break;
+    case 'conn-copy': if (S.connLink) navigator.clipboard.writeText(S.connLink).then(() => toast('Link copied. Paste it into Claude as the connector URL.'), () => toast("Couldn't copy. Select the link and copy it by hand.")); break;
+    case 'conn-off': {
+      const prev = connDoc(); if (!prev) break;
+      delDoc('meta', 'connector');
+      S.lastUndo = {type:'restore', ops:[{set:['meta', 'connector', prev]}]};
+      S.connLink = null; S.connTest = null;
+      toast('Claude is disconnected. The link stopped working.', true); render(); break;
+    }
     case 'assistant-check': assistantCheck(); break;
     case 'copy-assistant': navigator.clipboard.writeText(ASSISTANT_FN).then(() => toast('Function code copied. Paste it into the Supabase editor.'), () => toast("Couldn't copy. Open supabase/functions/assistant/index.ts in the repo instead.")); break;
     case 'undo': undo(); render(); break;
