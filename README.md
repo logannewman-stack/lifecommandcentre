@@ -122,7 +122,7 @@ The **Email** tab runs your cold email campaigns from your own Gmail (logan@loga
 
 Each campaign is a first email and two follow-ups in the same thread, three and five sending days apart. Nothing goes out until you approve a campaign's wording, add your mailing address, and pick a start day.
 
-**Start sending** (on the Email tab, or on Today's Pipeline card) opens one page with everything for your first sending day: whether the engine is ready, your mailing address, both cold campaigns with their first email to read and a switch to find new leads for each, and the first sending day (the next one, Monday, to start). **Approve both and start Mon, Oct 12** is your OK: it approves both emails as they read, saves the address, turns on the finder, and nothing goes out before that day, even if you tap it on a Saturday. Pause stops it any time, and Undo takes the tap back.
+**Start sending** (on the Email tab, or on Today's Pipeline card) opens one page with everything for your first sending day: whether the engine is ready, your mailing address, both cold campaigns with their first email to read and a switch to find new leads for each, and the first sending day (today while there is still sending time left, otherwise the next sending day). **Approve both and start Mon, Oct 12** is your OK: it approves both emails as they read, saves the address, turns on the finder, and nothing goes out before that day, even if you tap it on a Saturday. Pause stops it any time, and Undo takes the tap back.
 
 **What runs by itself, even with the app closed:**
 
