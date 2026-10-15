@@ -2777,11 +2777,11 @@ function emImportSheet() {
     const r = importLeads(imp.rows, {campaign:sel, leads:S.data.leads || {}, suppressed:emSuppressed(), now:Date.now(), today:todayISO()});
     const enroll = r.update.filter(x => x.enroll), all = [...r.create.map(x => x.doc), ...enroll.map(x => ({...S.data.leads[x.id], ...x.patch}))];
     const by = {}; all.forEach(d => { const k = d.seq.campaign; (by[k] = by[k] || {n:0, seg:{}}).n++; by[k].seg[d.segment || 'general'] = (by[k].seg[d.segment || 'general'] || 0) + 1; });
-    const sk = r.skipped, extra = [sk.dup ? `${sk.dup} already in a campaign` : '', sk.noEmail ? `${sk.noEmail} without an email` : '', sk.suppressed ? `${sk.suppressed} on your do-not-contact list` : '', sk.engaged ? `${sk.engaged} you're already talking to, or closed` : ''].filter(Boolean);
+    const sk = r.skipped, extra = [sk.dup ? `${sk.dup} listed twice or already in a campaign` : '', sk.noEmail ? `${sk.noEmail} without a usable email` : '', sk.closed ? `${sk.closed} closed ${sk.closed === 1 ? 'business' : 'businesses'}` : '', sk.suppressed ? `${sk.suppressed} on your do-not-contact list` : '', sk.engaged ? `${sk.engaged} you're already talking to, or closed` : ''].filter(Boolean);
     const total = r.create.length + enroll.length;
     body = `<div class="impbox">
       <div class="meta">${esc(imp.name)} · ${plural(imp.rows.length, 'row')}</div>
-      <b class="impn">${total ? `${plural(total, 'lead')} ready` : 'Nobody new in this file'}</b>
+      <b class="impn">${total ? `${plural(total, 'lead')} ready` : 'Nobody new to add'}</b>
       ${total ? `<div class="meta">${plural(r.create.length, 'new lead')}${enroll.length ? `, and ${enroll.length} already in your pipeline get the email` : ''}.</div>` : ''}
       ${extra.length ? `<div class="meta">Skipping ${esc(extra.join(', '))}.</div>` : ''}
       ${Object.entries(by).map(([cid, x]) => `<div><b>${esc(((S.data.campaigns || {})[cid] || {}).name || cid)}: ${x.n}</b> <span class="meta">${Object.entries(x.seg).map(([k, c]) => `${esc(emSegLabel(cid, k))} ${c}`).join(' · ')}</span></div>`).join('')}
@@ -2791,11 +2791,11 @@ function emImportSheet() {
     <div class="btnrow"><button class="btn primary" data-act="ei-add" ${total || r.update.length ? '' : 'disabled'}>Add ${plural(total, 'lead')}</button><button class="btn ghost" data-act="ei-clear">Use another file</button></div>
     <div class="meta">New leads stay off your call list. Adding doesn't send anything: emails only go out from a campaign you approved, after you tap Start sending.</div>`;
   } else {
-    body = `<div class="btnrow"><label class="btn primary" for="ei-file" style="cursor:pointer">Choose a CSV file</label><input type="file" id="ei-file" accept=".csv,.tsv,.txt,text/csv,text/plain" hidden><span class="meta">or drag it onto this page</span></div>
+    body = `<div class="btnrow"><label class="btn primary" for="ei-file" style="cursor:pointer">Choose CSV files</label><input type="file" id="ei-file" accept=".csv,.tsv,.txt,text/csv,text/plain" multiple hidden><span class="meta">or drag them onto this page, several at once if you like</span></div>
     <details><summary>Or paste rows from a spreadsheet</summary><div class="stack" style="margin-top:8px"><textarea class="in" id="ei-paste" rows="5" data-draft placeholder="business,email,type,city,state&#10;Glow Aesthetics,hello@glow.com,Med spa,Scottsdale,AZ">${esc(draft('ei-paste'))}</textarea><div class="btnrow"><button class="btn sm" data-act="ei-read">Read it</button><span class="meta">Include the header row.</span></div></div></details>`;
   }
   return `<div class="card-h"><h2>Add leads</h2><button class="btn sm ghost" data-act="modal-close">Close</button></div>
-    <p class="meta" style="margin:0;color:var(--ink-2)">A spreadsheet saved as CSV (Google Sheets: File › Download › CSV). It reads columns like business, email, first name, type, city, state, phone and website, so exports from Apollo or Outscraper work too. The list from Claude, <b>outreach-list.csv</b>, works as is. A business already in your pipeline gets the email instead of a second lead.</p>
+    <p class="meta" style="margin:0;color:var(--ink-2)">The CSV files your Google Maps scraper exports, or any spreadsheet saved as CSV (Google Sheets: File › Download › CSV). It finds the business, email, website, phone, city and state columns by itself, picks the best email when a business has several, and skips closed businesses and junk addresses. An email on a different domain than the business's website waits under Check first. A business already in your pipeline gets the email instead of a second lead.</p>
     <div class="fld"><label>Campaign</label><div class="seg scope">${[['auto','By type'], ...camps.map(c => [c.id, c.name])].map(([k, l]) => `<button type="button" class="${sel === k ? 'on' : ''}" data-act="ei-camp" data-k="${esc(k)}">${esc(l)}</button>`).join('')}</div>
       <span class="meta">${sel === 'auto' ? 'Dentists and service businesses get Front Desk AI. Everyone else gets Own the Home Screen.' : 'Everyone in the file gets this campaign.'}</span></div>
     ${body}`;
@@ -2937,11 +2937,13 @@ function emRelabel(rid, label) {
   S.lastUndo = {type:'restore', ops};
   toast(`Sorted as ${EM_LABEL[label][0]}.${HOT.includes(label) ? ' The lead is in Talking and on your hot list.' : ''}`, true);
 }
-async function emReadFile(f) {
+// One or more spreadsheets (a scraper often exports one file per search), read as one list.
+async function emReadFiles(files) {
   try {
-    const rows = parseCSV(await f.text());
-    if (!rows.length) { toast("That file is empty, or it isn't a spreadsheet."); return; }
-    S.emImport = {name:f.name, rows};
+    const rows = [];
+    for (const f of files) rows.push(...parseCSV(await f.text()));
+    if (!rows.length) { toast(files.length > 1 ? "Those files are empty, or they aren't spreadsheets." : "That file is empty, or it isn't a spreadsheet."); return; }
+    S.emImport = {name:files.length > 1 ? `${files.length} files` : files[0].name, rows};
     if (!S.modal || S.modal.type !== 'em-import') { S.confirm = null; S.modal = {type:'em-import', campaign:'auto'}; }
     render();
   } catch (e) { toast("Couldn't read that file."); }
@@ -3855,7 +3857,7 @@ document.addEventListener('change', ev => {
   if (el.id === 'fs-date') { S.drafts['fs-date'] = el.value; render(); return; }
   if (el.id === 'nt-lead') { S.drafts['nt-lead'] = el.value; if (pushDoc()) { patchDoc('push', deviceId(), {lead:Number(el.value), updatedAt:Date.now()}); toast('Saved.'); } return; }
   if (el.id === 'import-file' && el.files && el.files[0]) { importFile(el.files[0]); el.value = ''; return; }
-  if (el.id === 'ei-file' && el.files && el.files[0]) { emReadFile(el.files[0]); el.value = ''; return; }
+  if (el.id === 'ei-file' && el.files && el.files.length) { emReadFiles([...el.files]); el.value = ''; return; }
   if (el.id === 'pipe-source') { S.pipeSource = el.value; S.pipeLimit = 50; render(); return; }
   if (el.id === 'pipe-stage') { S.pipeStage = el.value; S.pipeLimit = 50; render(); return; }
   if (el.id === 'pipe-sort') { S.pipeSort = el.value; S.pipeLimit = 50; render(); return; }
@@ -3919,9 +3921,10 @@ document.addEventListener('drop', ev => {
     render(); return;
   }
   ev.preventDefault(); dragDepth = 0; document.body.classList.remove('dropping');
-  const f = ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files[0];
+  const files = [...((ev.dataTransfer && ev.dataTransfer.files) || [])], f = files[0];
   if (!f) return;
-  if (/\.(csv|tsv)$/i.test(f.name) || /csv|tab-separated/.test(f.type)) { emReadFile(f); return; }
+  const sheets = files.filter(x => /\.(csv|tsv)$/i.test(x.name) || /csv|tab-separated/.test(x.type));
+  if (sheets.length) { emReadFiles(sheets); return; }
   if (!/\.json$/i.test(f.name) && f.type !== 'application/json') { toast('Drop a backup .json file or a contacts .csv file.'); return; }
   importFile(f);
 });

@@ -308,9 +308,21 @@ export function upNext(leads, campaigns, settings, now = new Date(), suppressed 
   return out.sort((a, b) => { for (let i = 0; i < 3; i++) { if (a.rank[i] < b.rank[i]) return -1; if (a.rank[i] > b.rank[i]) return 1; } return 0; });
 }
 
-// A spreadsheet export (CSV or tab-separated) as rows of {header: value}. Handles quotes, commas and line breaks in cells.
+// The separator a file uses, from its first line: commas, tabs (rows pasted from a sheet) or semicolons
+// (Excel in some countries). Quoted text doesn't count.
+function sepOf(src) {
+  const n = { ',': 0, '\t': 0, ';': 0 };
+  let q = false;
+  for (const ch of src) {
+    if (ch === '"') q = !q;
+    else if (!q && (ch === '\n' || ch === '\r')) { if (n[','] + n['\t'] + n[';']) break; }
+    else if (!q && ch in n) n[ch]++;
+  }
+  return n['\t'] > n[','] && n['\t'] >= n[';'] ? '\t' : n[';'] > n[','] ? ';' : ',';
+}
+// A spreadsheet export (CSV, tab- or semicolon-separated) as rows of {header: value}. Handles quotes, separators and line breaks in cells.
 export function parseCSV(text) {
-  const rows = [], src = String(text || '').replace(/^﻿/, '');
+  const rows = [], src = String(text || '').replace(/^﻿/, ''), sep = sepOf(src);
   let row = [], cell = '', q = false;
   for (let i = 0; i < src.length; i++) {
     const ch = src[i];
@@ -318,7 +330,7 @@ export function parseCSV(text) {
       if (ch === '"') { if (src[i + 1] === '"') { cell += '"'; i++; } else q = false; }
       else cell += ch;
     } else if (ch === '"') q = true;
-    else if (ch === ',' || ch === '\t') { row.push(cell); cell = ''; }
+    else if (ch === sep) { row.push(cell); cell = ''; }
     else if (ch === '\n' || ch === '\r') { if (ch === '\r' && src[i + 1] === '\n') i++; row.push(cell); rows.push(row); row = []; cell = ''; }
     else cell += ch;
   }
@@ -328,11 +340,54 @@ export function parseCSV(text) {
   const head = clean[0].map(h => String(h).trim().toLowerCase());
   return clean.slice(1).map(r => Object.fromEntries(head.map((h, i) => [h, String(r[i] ?? '').trim()])));
 }
-const pick = (row, names) => { for (const n of names) { const v = row[n]; if (v) return String(v).trim(); } return ''; };
+// Scrapers and spreadsheets name their columns their own way ("Email 1", "email_1", "emails/0",
+// "categoryName"), so columns are matched without case, spaces or punctuation.
+const keyOf = h => String(h || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+const pick = (row, keys) => { for (const k of keys) { const v = row[k]; if (v) return String(v).trim(); } return ''; };
+const US_STATES = { alabama: 'AL', alaska: 'AK', arizona: 'AZ', arkansas: 'AR', california: 'CA', colorado: 'CO', connecticut: 'CT', delaware: 'DE', 'district of columbia': 'DC',
+  florida: 'FL', georgia: 'GA', hawaii: 'HI', idaho: 'ID', illinois: 'IL', indiana: 'IN', iowa: 'IA', kansas: 'KS', kentucky: 'KY', louisiana: 'LA', maine: 'ME', maryland: 'MD',
+  massachusetts: 'MA', michigan: 'MI', minnesota: 'MN', mississippi: 'MS', missouri: 'MO', montana: 'MT', nebraska: 'NE', nevada: 'NV', 'new hampshire': 'NH', 'new jersey': 'NJ',
+  'new mexico': 'NM', 'new york': 'NY', 'north carolina': 'NC', 'north dakota': 'ND', ohio: 'OH', oklahoma: 'OK', oregon: 'OR', pennsylvania: 'PA', 'rhode island': 'RI',
+  'south carolina': 'SC', 'south dakota': 'SD', tennessee: 'TN', texas: 'TX', utah: 'UT', vermont: 'VT', virginia: 'VA', washington: 'WA', 'west virginia': 'WV', wisconsin: 'WI', wyoming: 'WY' };
+const STATE_CODES = new Set(Object.values(US_STATES));
+// A state as its two letters, from "AZ", "az" or "Arizona". Anything else is left out.
+export function stateCode(s) {
+  const t = String(s || '').trim().replace(/\.$/, '');
+  return STATE_CODES.has(t.toUpperCase()) ? t.toUpperCase() : US_STATES[t.toLowerCase().replace(/\s+/g, ' ')] || '';
+}
+// City and state from a full address like "123 Main St, Mesa, AZ 85201, United States".
+export function cityStateFrom(address) {
+  const parts = String(address || '').split(',').map(x => x.trim()).filter(Boolean);
+  while (parts.length && /^(united states( of america)?|usa?)$/i.test(parts[parts.length - 1])) parts.pop();
+  const m = parts.length >= 2 && parts[parts.length - 1].match(/^([a-z .]+?)\.?(?:\s+\d{5}(?:-\d{4})?)?$/i), state = m ? stateCode(m[1]) : '';
+  return state ? { city: parts[parts.length - 2], state } : { city: '', state: '' };
+}
+// Text a scraper picks up that isn't anyone's inbox: image file names, website builders' and error
+// trackers' addresses, placeholders and no-reply boxes.
+const JUNK_DOMAIN = /(^|\.)(example\.(com|org|net)|domain\.com|email\.com|yourdomain\.com|yoursite\.com|yourwebsite\.com|mysite\.com|website\.com|company\.com|test\.com|sentry\.io|wixpress\.com|wix\.com|godaddy\.com|squarespace\.com|wordpress\.(com|org)|w3\.org|schema\.org|gravatar\.com|cloudflare\.com|googleapis\.com|google\.com|facebook\.com|mailchimp\.com|sendgrid\.net)$/;
+const JUNK_LOCAL = /^(no-?reply|do-?not-?reply|donotreply|bounces?|mailer-daemon|postmaster|abuse|privacy|legal|dmca|careers?|jobs?|hr|recruit(ing|er|ment)?|resumes?|billing|invoices?|accounting|payroll|press|media|webmaster|hostmaster|wordpress|example|test|user|username|name|yourname|your-?email|email|firstname|first\.?last|john\.?doe|jane\.?doe|johndoe|janedoe|someone|sentry|[0-9a-f]{20,})$/;
+export const junkEmail = e => {
+  const [local, domain] = String(e || '').toLowerCase().split('@');
+  return !local || !domain || local.length > 64 || /\.(png|jpe?g|gif|svg|webp|bmp|ico|css|js|pdf|mp4|woff2?)$/.test(domain) || JUNK_DOMAIN.test(domain) || JUNK_LOCAL.test(local);
+};
+const cleanMail = e => { let x = String(e || '').trim(); try { x = decodeURIComponent(x); } catch (err) { /* keep it as is */ } return x.replace(/^mailto:/i, '').split('?')[0].replace(/^[^a-z0-9]+|[^a-z0-9]+$/gi, '').toLowerCase(); };
+// Links that aren't the business's own website: maps, social pages, directories and booking apps.
+const NOT_A_SITE = /(^|\.)(google\.[a-z.]+|goo\.gl|g\.page|facebook\.com|fb\.com|instagram\.com|linkedin\.com|tiktok\.com|twitter\.com|x\.com|youtube\.com|yelp\.com|linktr\.ee|nextdoor\.com|angi\.com|homeadvisor\.com|thumbtack\.com|bbb\.org|yellowpages\.com|mapquest\.com|booksy\.com|vagaro\.com|square\.site|squareup\.com|glossgenius\.com|mindbodyonline\.com|schedulicity\.com|zocdoc\.com)$/;
+const ROLE_MAIL = /^(info|office|contact|contactus|hello|hi|service|services|admin|frontdesk|front\.desk|reception|appointments?|schedul(e|ing)|booking|bookings|book|team|support|sales|customerservice|help|inquiries|enquiries|mail|owner|manager|smile|smiles|care)$/;
+const onSite = (domain, site) => !!site && (domain === site || domain.endsWith('.' + site) || site.endsWith('.' + domain));
+// The address to use when a row lists several: one on the business's own domain, then a Gmail-type
+// address the business lists, then anything else, with a role address like info@ before a person's.
+function bestEmail(list, site) {
+  const rank = e => { const [local, d] = e.split('@'); return (onSite(d, site) ? 0 : FREE_DOMAINS.has(d) ? 2 : 4) + (ROLE_MAIL.test(local) ? 0 : 1); };
+  return list.slice().sort((a, b) => rank(a) - rank(b))[0] || '';
+}
+const firstNum = v => { const s = String(v || ''); if (/https?:|\//.test(s)) return null; const m = s.replace(/,/g, '').match(/\d+(\.\d+)?/); return m ? Number(m[0]) : null; };
 // Contacts from a spreadsheet, as changes to your leads. A business you already have (same id, email,
 // website or name) gets the email and the campaign; anyone else becomes a new lead that stays off your
-// call list. Businesses you're already talking to, clients and lost leads are not emailed.
-// Returns {create: [{id, doc}], update: [{id, patch, name, enroll}], skipped: {dup, suppressed, noEmail, engaged}, held}.
+// call list. Businesses you're already talking to, clients and lost leads are not emailed. Scraper
+// exports work as they are: closed businesses and junk addresses are skipped, a business listed twice
+// counts once, and an address on another company's domain waits under Check first.
+// Returns {create: [{id, doc}], update: [{id, patch, name, enroll}], skipped: {dup, suppressed, noEmail, engaged, closed}, held}.
 export function importLeads(rows, { campaign = 'auto', leads = {}, suppressed = new Set(), now = Date.now(), today = '' } = {}) {
   const byEmail = {}, byDomain = {}, byName = {};
   for (const [id, l] of Object.entries(leads || {})) {
@@ -341,25 +396,42 @@ export function importLeads(rows, { campaign = 'auto', leads = {}, suppressed = 
     const dm = domainOf(l.website); if (dm) byDomain[dm] = byDomain[dm] || id;
     const n = normName(l.name); if (n) (byName[n] = byName[n] || []).push(id);
   }
-  const create = [], update = [], skipped = { dup: 0, suppressed: 0, noEmail: 0, engaged: 0 }, seen = new Set(), touched = new Set();
+  const create = [], update = [], skipped = { dup: 0, suppressed: 0, noEmail: 0, engaged: 0, closed: 0 }, seen = new Set(), sites = new Set(), touched = new Set();
   let held = 0;
-  for (const r of rows || []) {
-    const email = pick(r, ['email', 'email address', 'e-mail', 'emails', 'email_1', 'contact email', 'work email', 'primary email']).split(/[\s,;]+/)[0].toLowerCase();
-    if (!isEmail(email)) { skipped.noEmail++; continue; }
-    if (seen.has(email)) { skipped.dup++; continue; }
-    seen.add(email);
+  for (const raw of rows || []) {
+    const r = {};
+    for (const [k, v] of Object.entries(raw || {})) { const kk = keyOf(k); if (kk && !r[kk]) r[kk] = v; }
+    if (/(permanently|temporarily)[ _]?closed|closed[ _](permanently|temporarily)/i.test(pick(r, ['businessstatus', 'status'])) || /^(true|yes|1)$/i.test(pick(r, ['permanentlyclosed', 'temporarilyclosed']))) { skipped.closed++; continue; }
+    const site0 = pick(r, ['website', 'site', 'websiteurl', 'companywebsite', 'web', 'domain', 'homepage', 'url']);
+    const website = NOT_A_SITE.test(domainOf(site0)) ? '' : site0, site = domainOf(website);
+    // Every address in every email column ("email", "Email 1", "emails/0"...), junk left out.
+    const mails = [];
+    for (const [k, v] of Object.entries(raw || {})) {
+      if (!keyOf(k).includes('email')) continue;
+      for (const part of String(v || '').split(/[\s,;|]+/)) { const e = cleanMail(part); if (isEmail(e) && !junkEmail(e) && !mails.includes(e)) mails.push(e); }
+    }
+    const email = bestEmail(mails, site);
+    if (!email) { skipped.noEmail++; continue; }
+    if (seen.has(email) || (site && sites.has(site))) { skipped.dup++; continue; }
+    seen.add(email); if (site) sites.add(site);
     if (suppressed.has(email)) { skipped.suppressed++; continue; }
-    const type = pick(r, ['type', 'category', 'industry', 'business type', 'subtypes', 'main category']);
-    const segment = segmentOf(type), cid = campaign === 'auto' ? campaignFor(segment) : campaign;
-    const confidence = pick(r, ['confidence']) || 'Good', hold = /check/i.test(confidence);
-    const name = pick(r, ['business', 'company', 'company name', 'name', 'business name', 'organization', 'account name']) || email.split('@')[1];
-    const website = pick(r, ['website', 'site', 'url', 'domain', 'company website']), phone = pick(r, ['phone', 'phone number', 'company phone', 'phone_1']);
-    const city = pick(r, ['city', 'town']), state = pick(r, ['state', 'region', 'state code']).toUpperCase().slice(0, 2);
-    const firstName = pick(r, ['first name', 'first_name', 'firstname', 'contact first name']) || firstNameFrom(email);
-    const foundAt = pick(r, ['found_at', 'found at', 'source url']);
-    const appId = pick(r, ['app_id', 'lead_id']);
+    const type = pick(r, ['type', 'category', 'industry', 'businesstype', 'maincategory', 'categoryname', 'primarycategory', 'subtypes', 'categories', 'categories0']);
+    // Google Maps calls a med spa a "Medical spa".
+    const segment = segmentOf(/medical spa|medi-?spa/i.test(type) ? 'med spa' : type), cid = campaign === 'auto' ? campaignFor(segment) : campaign;
     const eDom = email.split('@')[1];
-    let id = appId && leads[appId] ? appId : byEmail[email] || (domainOf(website) && byDomain[domainOf(website)]) || (!FREE_DOMAINS.has(eDom) && byDomain[eDom]) || '';
+    // An address on another company's domain is often the web designer's or a head office's, so it waits
+    // under Check first, unless the file itself says how sure it is (Claude's lists do).
+    const elsewhere = !!site && !FREE_DOMAINS.has(eDom) && !onSite(eDom, site);
+    const confidence = pick(r, ['confidence']) || (elsewhere ? 'Check first' : 'Good'), hold = /check/i.test(confidence);
+    const name = pick(r, ['business', 'company', 'companyname', 'name', 'businessname', 'organization', 'accountname', 'placename', 'title']) || eDom;
+    const phone = pick(r, ['phone', 'phonenumber', 'companyphone', 'phone1', 'phones0', 'phoneunformatted', 'internationalphone', 'telephone', 'tel']);
+    let city = pick(r, ['city', 'town', 'locality']), state = stateCode(pick(r, ['state', 'usstate', 'statecode', 'region', 'province']));
+    if (!city || !state) { const a = cityStateFrom(pick(r, ['fulladdress', 'address', 'formattedaddress', 'streetaddress', 'location'])); city = city || a.city; state = state || a.state; }
+    const firstName = pick(r, ['firstname', 'contactfirstname']) || firstNameFrom(email);
+    const foundAt = pick(r, ['foundat', 'sourceurl']), appId = pick(r, ['appid', 'leadid']);
+    const rating = firstNum(pick(r, ['rating', 'totalscore', 'stars', 'googlerating', 'averagerating']));
+    const reviews = firstNum(pick(r, ['reviews', 'reviewscount', 'reviewcount', 'numberofreviews', 'userratingstotal', 'totalreviews']));
+    let id = appId && leads[appId] ? appId : byEmail[email] || (site && byDomain[site]) || (!FREE_DOMAINS.has(eDom) && byDomain[eDom]) || '';
     if (!id) { const same = (byName[normName(name)] || []).find(x => { const l = leads[x]; return (digits(phone) && digits(l.phone) === digits(phone)) || (state && (l.state || l.region) === state); }); if (same) id = same; }
     if (id && touched.has(id)) { skipped.dup++; continue; }
     if (id) {
@@ -368,6 +440,8 @@ export function importLeads(rows, { campaign = 'auto', leads = {}, suppressed = 
       if (l.seq && (LIVE_SEQ.includes(l.seq.status) || l.seq.sendingStep != null)) { skipped.dup++; continue; }
       const info = {};
       if (!l.email) info.email = email;
+      if (!l.phone && phone) info.phone = phone;
+      if (!l.website && website) info.website = website;
       if (!l.city && city) info.city = city;
       if (!l.state && state) info.state = state;
       if (!l.kind && type) info.kind = type;
@@ -375,6 +449,8 @@ export function importLeads(rows, { campaign = 'auto', leads = {}, suppressed = 
       if (!l.firstName && firstName && !firstNameOf(l)) info.firstName = firstName;
       if (foundAt && !l.foundAt) info.foundAt = foundAt;
       if (!l.confidence) info.confidence = confidence;
+      if (rating != null && l.rating == null) info.rating = rating;
+      if (reviews != null && l.reviews == null) info.reviews = reviews;
       if ((l.email && l.email.toLowerCase() !== email) || l.dnc || !['New lead', 'Contacted', undefined, ''].includes(l.stage)) {
         skipped.engaged++; if (Object.keys(info).length) update.push({ id, patch: info, name: l.name, enroll: false });
         continue;
@@ -389,6 +465,7 @@ export function importLeads(rows, { campaign = 'auto', leads = {}, suppressed = 
       name, business: [type, city].filter(Boolean).join(', '), contact: '', email, firstName, phone, website, city, state,
       region: ['IA', 'AZ'].includes(state) ? state : '', kind: type, segment, type: 'Cold', stage: 'New lead', stageAt: at,
       source: 'Import', foundAt, confidence, callList: false, touches: 0, notes: '', createdAt: at, updatedAt: at,
+      ...(rating != null ? { rating } : {}), ...(reviews != null ? { reviews } : {}),
       history: [{ at, from: '', to: 'New lead', by: 'import' }], ...enrollPatch(null, cid, today, hold),
     } });
   }
