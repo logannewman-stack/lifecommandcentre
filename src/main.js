@@ -2415,11 +2415,11 @@ function emHotCard() {
 function emHotRow(r) {
   const l = (S.data.leads || {})[r.lead] || {}, tel = String(l.phone || '').replace(/[^\d+]/g, '');
   return `<article class="hot">
-    <div class="hot-h"><button class="linkish" data-act="lead-open" data-id="${esc(r.lead)}">${esc(r.business || l.name || r.email || 'Someone')}</button>${emLabelPill(r.label)}<span class="meta">${esc(emAgo(r.at))}${r.forwarded ? ' · forwarded' : ''}</span></div>
+    <div class="hot-h"><button class="linkish" data-act="lead-open" data-id="${esc(r.lead)}">${esc(r.business || l.name || r.email || 'Someone')}</button>${emLabelPill(r.label)}<span class="meta">${esc(emAgo(r.at))}${r.forwarded ? ' · forwarded' : ''}</span><button class="btn sm ghost hot-done" data-act="em-done" data-id="${esc(r.id)}" title="Answered: take it off this list">Done</button></div>
     ${r.summary ? `<div class="sum">${esc(r.summary)}</div>` : ''}
     <div class="quote">${esc(r.text || r.snippet || '')}</div>
     ${r.next ? `<div class="meta"><b>Next:</b> ${esc(r.next)}</div>` : ''}
-    <div class="btnrow">${r.threadId ? `<a class="btn sm primary" href="${esc(gmailThread(r.threadId))}" target="_blank" rel="noopener">Reply in Gmail</a>` : ''}${tel ? `<a class="btn sm" href="tel:${esc(tel)}">Call</a>` : ''}<button class="btn sm" data-act="lead-open" data-id="${esc(r.lead)}">Open the lead</button><button class="btn sm ghost" data-act="em-done" data-id="${esc(r.id)}">Done</button></div>
+    <div class="btnrow">${r.threadId ? `<a class="btn sm primary" href="${esc(gmailThread(r.threadId))}" target="_blank" rel="noopener">Reply in Gmail</a>` : ''}${tel ? `<a class="btn sm" href="tel:${esc(tel)}">Call</a>` : ''}<button class="btn sm" data-act="lead-open" data-id="${esc(r.lead)}">Open the lead</button></div>
   </article>`;
 }
 function emRow(l, showCamp) {
