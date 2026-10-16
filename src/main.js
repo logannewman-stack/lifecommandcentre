@@ -563,21 +563,29 @@ function viewToday() {
     wk ? `<div class="week-banner ord-1"><div class="eyebrow">This week</div><b>${esc(wk.focus)}</b>${wk.musts ? `<details><summary>Must-dos this week</summary><div class="meta" style="margin-top:4px;color:var(--ink-2)">${esc(wk.musts)}</div></details>` : ''}</div>` : '',
     rest && day.off ? `<div class="rest-banner ord-2"><div class="eyebrow">Day off</div><b>Today doesn't count.</b><div class="meta">Nothing is late and nothing turns into a make-up.${profile().startDate === addDays(t, 1) ? ' Everything starts fresh tomorrow.' : ''} Check off anything you did anyway.</div><div class="btnrow" style="margin-top:8px"><button class="btn sm ghost" data-act="day-off" data-on="0">It's not a day off</button></div></div>`
     : rest ? `<div class="rest-banner ord-2"><div class="eyebrow">Rest day</div><b>Church, rest and pickleball.</b><div class="meta">Nothing counts as late today.${carried.length ? ` ${plural(carried.length,'to-do')} will be waiting for you tomorrow.` : ''}</div></div>` : '',
-    `<div class="progress ord-3 ${pct === 100 ? 'good' : ''}"><div class="bar"><i style="width:${pct}%"></i></div><span class="meta mono">${doneN}/${checkable.length} blocks</span>${behind ? `<button class="pill warn tap" data-act="catchup" title="Sort out what you missed">${behind} behind · Catch up</button>` : ''}${carried.length && !rest ? `<span class="pill bad">${carried.length} carried over</span>` : ''}</div>`,
+    `<div class="progress ord-3 ${pct === 100 ? 'good' : ''}"><div class="bar"><i style="width:${pct}%"></i></div><span class="meta mono">${doneN}/${checkable.length} blocks</span>${behind ? `<button class="pill warn tap" data-act="catchup" title="Sort out what you missed">${behind} behind · Catch up</button>` : ''}</div>`,
     nowCard(items.filter(i => !(isCheckable(i) && isSkipped(i, t))), t),
-    `<section class="card ord-7"><div class="card-h"><h2>Today's plan</h2><div class="btnrow"><button class="btn sm" data-act="sched-open" data-date="${t}">Edit</button><button class="btn sm" data-act="quick-open">+ Add</button></div></div>${buildBar(t)}${planList(items, t, day)}</section>`,
+    `<section class="card ord-6" id="plan-card"><div class="card-h"><h2>Today's plan</h2><div class="btnrow"><button class="btn sm" data-act="sched-open" data-date="${t}">Edit</button><button class="btn sm" data-act="quick-open">+ Add</button></div></div>${buildBar(t)}${planList(items, t, day)}</section>`,
   ];
+  // Carried-over and due to-dos are one list, most important first. A long day shows the top five;
+  // the rest are a tap away, with an offer to spread them over the week.
+  // Your fix and top 3 first, then everything due today (what you just added included), then the oldest carried over.
+  const tier = x => taskRank(x) < 2 ? 0 : x.due === t ? 1 : 2;
+  const todo = [...(rest ? [] : carried), ...due].sort((a, b) => tier(a) - tier(b) || taskPriority(a, b));
+  const keep = Math.max(5, todo.filter(x => tier(x) < 2).length), many = todo.length > keep + 1, showAll = S.allTasks || !many;
   const side = [
+    hotStrip(),
     amCard(t, day),
-    carried.length && !rest ? `<section class="card ord-6"><div class="card-h"><h2>Carried over</h2><span class="meta">Not done yet, so they moved to today</span></div>${taskList(carried, t)}</section>` : '',
-    `<section class="card ord-8"><div class="card-h"><h2>To-dos due today</h2><span class="meta">${due.length ? plural(due.length,'item') : 'All clear'}</span></div>
-      ${due.length + carried.length > 6 && !rest ? `<div class="overload"><span>${due.length + carried.length} to-dos today${carried.length ? ', counting the carried-over ones. That' : ''} is a lot.</span><button class="btn sm" data-act="spread">Spread over the week</button></div>` : ''}
-      ${taskList(due, t) || '<div class="meta">Nothing else due today.</div>'}
+    pmCard(t, day, items),
+    `<section class="card ord-7" id="todo-card"><div class="card-h"><h2>To-dos</h2><span class="meta">${!todo.length ? 'All clear' : [carried.length && !rest ? `${carried.length} from earlier days` : '', due.length ? `${due.length} due today` : ''].filter(Boolean).join(' · ')}</span></div>
+      ${todo.length > 6 && !rest ? `<div class="overload"><span>${todo.length} to-dos is a lot for one day. Keep your top five and spread the rest over the week.</span><button class="btn sm" data-act="spread">Spread over the week</button></div>` : ''}
+      ${showAll ? taskList(todo, t) : todo.slice(0, keep).map(x => taskRow(x, t)).join('')}
+      ${many ? `<button class="btn sm ghost showall" data-act="tasks-all">${showAll ? 'Show fewer' : `Show all ${todo.length}`}</button>` : ''}
+      ${todo.length ? '' : '<div class="meta">Nothing due today.</div>'}
       ${addTaskForm('qt', t)}
       ${doneTasks.length ? `<details style="margin-top:8px"><summary>Done today (${doneTasks.length})</summary>${doneTasks.map(x => taskRow(x, t)).join('')}</details>` : ''}
     </section>`,
     pipeTodayCard(t),
-    pmCard(t, day)
   ];
   return dayStrip(t) + installBanner() + tipBanner() + `<div class="two"><div class="main">${main.join('')}</div><div class="side">${side.join('')}</div></div>`;
 }
@@ -606,12 +614,12 @@ function viewDay(d) {
     `<div class="dayhead ord-1"><div class="min0"><div class="eyebrow">${d === addDays(t, 1) ? 'Tomorrow' : 'Planning ahead'}</div><h2>${esc(fmtDayLong(d))}</h2><div class="meta">${plural(blocks.length - canceled, 'block')}${oneoffs ? ` · ${plural(oneoffs, 'one-off')}` : ''}${canceled ? ` · ${canceled} canceled` : ''} · ${due.length ? plural(due.length, 'to-do') : 'no to-dos'}</div></div><button class="btn sm ghost" data-act="day-go" data-date="${t}">Back to today</button></div>`,
     day.off ? `<div class="rest-banner ord-2"><div class="eyebrow">Day off</div><b>This day doesn't count.</b><div class="meta">Nothing is late and nothing turns into a make-up.</div><div class="btnrow" style="margin-top:8px"><button class="btn sm ghost" data-act="day-off" data-on="0" data-date="${d}">It's not a day off</button></div></div>`
       : rest ? `<div class="rest-banner ord-2"><div class="eyebrow">Rest day</div><b>Church, rest and pickleball.</b><div class="meta">Nothing counts as late that day.</div></div>` : '',
-    `<section class="card ord-7"><div class="card-h"><h2>${esc(name)}'s plan</h2><div class="btnrow"><button class="btn sm" data-act="sched-open" data-date="${d}">Edit</button><button class="btn sm" data-act="quick-open" data-date="${d}">+ Add</button></div></div>${buildBar(d)}
+    `<section class="card ord-7" id="plan-card"><div class="card-h"><h2>${esc(name)}'s plan</h2><div class="btnrow"><button class="btn sm" data-act="sched-open" data-date="${d}">Edit</button><button class="btn sm" data-act="quick-open" data-date="${d}">+ Add</button></div></div>${buildBar(d)}
       ${items.length ? planList(items, d, day) : '<div class="meta">Nothing planned.</div>'}
       ${day.off ? '' : `<div class="planfoot"><button class="btn sm ghost" data-act="day-off" data-on="1" data-date="${d}">Take this day off</button></div>`}</section>`,
   ];
   const side = [
-    `<section class="card ord-8"><div class="card-h"><h2>To-dos due ${esc(d === addDays(t, 1) ? 'tomorrow' : fmtDay(d))}</h2><span class="meta">${due.length ? plural(due.length, 'item') : 'None yet'}</span></div>
+    `<section class="card ord-8" id="todo-card"><div class="card-h"><h2>To-dos due ${esc(d === addDays(t, 1) ? 'tomorrow' : fmtDay(d))}</h2><span class="meta">${due.length ? plural(due.length, 'item') : 'None yet'}</span></div>
       ${taskList(due, d)}${addTaskForm('qd', d)}</section>`,
   ];
   return dayStrip(d) + `<div class="two"><div class="main">${main.join('')}</div><div class="side">${side.join('')}</div></div>`;
@@ -695,17 +703,17 @@ function planRow(i, t, day) {
     ${canDone ? `<div class="swipe-done" aria-hidden="true">${done ? 'Undo' : 'Done'}</div>` : ''}<div class="swipe-acts" ${open ? '' : 'aria-hidden="true"'}>${acts.join('')}</div>
     <div class="row ${!isCheckable(i) ? 'marker' : ''} ${done ? 'done' : ''} ${isNow ? 'is-now' : ''} ${late ? 'late' : ''} ${flash}">
     <div class="time" data-act="block" data-key="${k}"${dd}>${fmtT(i.start)}</div>${box}
-    <div class="txt" data-act="block" data-key="${k}"${dd} role="button" tabindex="0">${i.tag ? `<span class="tag ${i.eventId ? 'ev' : ''}">${esc(i.tag)}</span>` : ''}${esc(i.text)}${subs.map(s => `<div class="sub">${s}</div>`).join('')}</div>
+    <div class="txt" data-act="block" data-key="${k}"${dd} role="button" tabindex="0"><div class="ln">${i.tag ? `<span class="tag ${i.eventId ? 'ev' : ''}">${esc(i.tag)}</span>` : ''}${esc(i.text)}</div>${subs.map(s => `<div class="sub">${s}</div>`).join('')}</div>
     <button class="more" data-act="item-menu" data-key="${k}" aria-label="Reschedule or cancel ${esc(itemName(i))}">⋯</button>
     ${qa}${menu}</div></div>`;
 }
-function taskRow(x, t, grouped) {
+function taskRow(x, t, grouped, noDate) {
   const late = !x.done && x.due && x.due < t && !isRestDay(t) ? daysBetween(x.due, t) : 0;
   const bits = [];
   if (late) bits.push(`<span class="pill bad">${late === 1 ? '1 day late' : late + ' days late'}</span>`);
   if (x.kind === 'makeup') bits.push('<span class="pill warn">Make-up</span>');
   if (x.area && !grouped) bits.push(`<span class="pill">${esc(x.area)}</span>`);
-  if (!x.done && x.due && x.due > t) bits.push(`<span class="pill">${esc(fmtDay(x.due))}</span>`);
+  if (!x.done && x.due && x.due > t && !noDate) bits.push(`<span class="pill">${esc(fmtDay(x.due))}</span>`);
   if (x.notes) bits.push(esc(x.notes));
   const k = esc(x.id), key = 't:' + x.id, open = S.swipeKey === key, ti = open ? '0' : '-1';
   const nextLabel = x.due && x.due > todayISO() ? 'Next day' : 'Tomorrow';
@@ -755,8 +763,17 @@ function addTaskForm(p, defDate) {
     <button class="btn primary" type="submit">Add</button></div>
     <div class="qprev" id="${p}-title-prev" aria-live="polite">${txt.trim() ? quickPreview(quickPlan(txt, date), p + '-title') : ''}</div></form>`;
 }
+// Replies waiting for an answer sit right under the NOW card: they are the money on the table.
+function hotStrip() {
+  const hot = emHot().filter(r => (S.data.leads || {})[r.lead]);
+  if (!hot.length) return '';
+  const rows = hot.slice(0, 2).map(r => { const l = S.data.leads[r.lead]; return `<button class="erow" data-act="lead-open" data-id="${esc(r.lead)}"><div class="min0"><b>${esc(l.name || l.email)}</b><div class="meta clamp1">${esc(r.summary || r.snippet || 'Replied to your email')}</div></div><div class="erow-r">${heatChip(l)}</div></button>`; }).join('');
+  return `<section class="card hotstrip ord-5"><div class="card-h"><h2>Answer first</h2><button class="btn sm" data-act="view" data-v="email">${hot.length === 1 ? '1 hot reply' : `${hot.length} hot replies`}</button></div><div class="elist">${rows}</div>${hot.length > 2 ? `<div class="meta">and ${hot.length - 2} more on the Email tab</div>` : ''}</section>`;
+}
 function amCard(t, day) {
   const am = day.am || {};
+  // Not done yet: one line and a button, so the plan isn't pushed down a screen. Saved: the numbers and your top 3.
+  if (!am.savedAt && !S.editAM) return `<section class="card prompt ord-5" id="am-card"><div class="min0"><b>Morning check-in</b><div class="meta">Weight, sleep, energy and your top 3 · 2 minutes</div></div><button class="btn primary" data-act="am-edit">Check in</button></section>`;
   if (am.savedAt && !S.editAM) {
     const top = (am.top3 || []).map((x,n) => ({...x, n})).filter(x => x.t);
     return `<section class="card ord-5" id="am-card"><div class="card-h"><h2>Morning check-in</h2><button class="btn sm ghost" data-act="am-edit">Edit</button></div>
@@ -790,20 +807,25 @@ function dayAuto(t) {
     top: top.filter(x => x.done).length, topN: top.length
   };
 }
-function pmCard(t, day) {
+function pmCard(t, day, items) {
   const pm = day.pm || {}, a = dayAuto(t);
+  // The check-out shows up an hour before its block (6 pm without one) as one line and a button.
+  if (!pm.savedAt && !S.editPM) {
+    const co = (items || []).find(i => i.kind === 'checkout'), from = co ? toMin(co.start) - 60 : 18 * 60;
+    return nowMin() < from ? '' : `<section class="card prompt ord-5" id="pm-card"><div class="min0"><b>Evening check-out</b><div class="meta">Your numbers fill in by themselves. Add your win and tomorrow's fix · 5 minutes</div></div><button class="btn primary" data-act="pm-edit">Check out</button></section>`;
+  }
   const autoGrid = `<div class="auto">
     <div><b>${a.dials}</b><span>dials</span></div><div><b>${a.convos}</b><span>owner talks</span></div><div><b>${a.demos}</b><span>demos booked</span></div>
     <div><b>${a.drill + a.comp}</b><span>sessions</span></div><div><b>${a.gym ? 'Yes' : 'No'}</b><span>gym</span></div><div><b>${a.top}/${a.topN || 3}</b><span>top 3 done</span></div></div>`;
   if (pm.savedAt && !S.editPM) {
-    return `<section class="card ord-9" id="pm-card"><div class="card-h"><h2>Evening check-out</h2><button class="btn sm ghost" data-act="pm-edit">Edit</button></div>${autoGrid}
+    return `<section class="card ord-5" id="pm-card"><div class="card-h"><h2>Evening check-out</h2><button class="btn sm ghost" data-act="pm-edit">Edit</button></div>${autoGrid}
       <div class="kv"><span>Proposals <b>${num(pm.proposals)||0}</b></span><span>Deals <b>${num(pm.deals)||0}</b></span><span>Cash in <b>${money(num(pm.cash))}</b></span><span>Protein ${pm.protein ? '<b>hit</b>' : '<b>missed</b>'}</span></div>
       ${pm.win ? `<p class="note"><b>Win:</b> ${esc(pm.win)}</p>` : ''}${pm.fix ? `<p class="note"><b>Fix tomorrow:</b> ${esc(pm.fix)} <span class="meta">(on tomorrow's to-dos)</span></p>` : ''}
       ${pm.biz ? `<p class="note"><b>Business:</b> ${esc(pm.biz)}</p>` : ''}${pm.pb ? `<p class="note"><b>Pickleball:</b> ${esc(pm.pb)}</p>` : ''}</section>`;
   }
   const f = (id, label, def, ph, mode) => `<div class="fld"><label for="${id}">${label}</label><input class="in" id="${id}" data-draft ${mode ? `inputmode="${mode}"` : ''} value="${esc(draft(id, def))}" placeholder="${ph || ''}"></div>`;
   const prot = S.drafts['pm-protein'] !== undefined ? S.drafts['pm-protein'] : !!pm.protein;
-  return `<section class="card ord-9" id="pm-card"><div class="card-h"><h2>Evening check-out</h2><span class="meta">5 minutes · counts fill in by themselves</span></div>${autoGrid}
+  return `<section class="card ord-5" id="pm-card"><div class="card-h"><h2>Evening check-out</h2><span class="meta">5 minutes · counts fill in by themselves</span></div>${autoGrid}
     <form class="stack" data-form="pm">
       <div class="grid3">${f('pm-proposals','Proposals sent',pm.proposals,'0','numeric')}${f('pm-deals','Deals won',pm.deals,'0','numeric')}${f('pm-cash','Cash in ($)',pm.cash,'0','decimal')}</div>
       <div class="grid3">${f('pm-mockups','Mockups sent',pm.mockups,'0','numeric')}${f('pm-dms','Extra DMs',pm.dms,'0','numeric')}${f('pm-pro','Extra pro video (min)',pm.proExtra,'0','numeric')}</div>
@@ -823,16 +845,16 @@ function pipeTodayCard(t) {
   const leads = allLeads(); if (!leads.length) return '';
   const s = emSettings(), st = emState(), fin = outDoc('finder') || {}, local = localClock(s.tz).date, mode = sendingState(s, local);
   const hot = emHot().filter(r => (S.data.leads || {})[r.lead]), calls = isRestDay(t) ? 0 : leadsDue(t).length;
-  const follow = leads.filter(l => ['Talking','Demo booked','Proposal sent'].includes(l.stage) && l.nextDate && l.nextDate <= t)
+  // A lead with a hot reply is already on top of Today (Answer first), so it isn't listed twice.
+  const hotIds = new Set(hot.map(r => r.lead));
+  const follow = leads.filter(l => !hotIds.has(l.id) && ['Talking','Demo booked','Proposal sent'].includes(l.stage) && l.nextDate && l.nextDate <= t)
     .sort((a, b) => String(a.nextDate).localeCompare(String(b.nextDate)) || leadHeat(b).score - leadHeat(a).score);
   const sent = st.today && st.today.date === local ? st.today.sent || 0 : 0, found = fin.today && fin.today.date === local ? fin.today.found || 0 : 0;
   const email = mode === 'later' ? `Emails start ${dayWord(s.startOn)}.` : mode === 'on' && emCampaigns().some(liveCampaign) ? `${plural(sent, 'email')} sent today.` : 'Emails are off.';
   const row = (id, l, line) => `<button class="erow" data-act="lead-open" data-id="${esc(id)}"><div class="min0"><b>${esc(l.name || l.email)}</b><div class="meta clamp1">${esc(line)}</div></div><div class="erow-r">${heatChip(l)}</div></button>`;
-  const hotRows = hot.slice(0, 3).map(r => row(r.lead, S.data.leads[r.lead], r.summary || r.snippet || 'Replied to your email')).join('');
   const followRows = follow.slice(0, 4).map(l => row(l.id, l, `${l.stage} · ${l.nextStep || 'Follow up'}${l.nextDate < t ? ' · late' : ''}`)).join('');
   return `<section class="card pipetoday ord-8"><div class="card-h"><h2>Pipeline</h2><button class="btn sm" data-act="view" data-v="calls">Open</button></div>
     <div class="pt-n"><span class="${hot.length ? 'hotnum' : ''}"><b>${hot.length}</b> hot ${hot.length === 1 ? 'reply' : 'replies'}</span><span><b>${follow.length}</b> ${follow.length === 1 ? 'follow-up' : 'follow-ups'}</span><span><b>${calls}</b> calls due</span>${found ? `<span><b>${found}</b> new leads</span>` : ''}</div>
-    ${hotRows ? `<h3>Answer first</h3><div class="elist">${hotRows}</div>` : ''}
     ${followRows ? `<h3>Follow up today</h3><div class="elist">${followRows}</div>${follow.length > 4 ? `<div class="meta">and ${follow.length - 4} more on the board</div>` : ''}` : ''}
     <div class="btnrow pt-f"><span class="meta">${esc(email)}</span>${mode === 'paused' ? '<button class="btn sm ghost" data-act="em-launch">Start sending</button>' : ''}</div>
   </section>`;
@@ -848,7 +870,7 @@ function viewCalls() {
   const quotas = scheduleFor(t).filter(i => i.kind === 'calls');
   const due = leadsDue(t).sort(leadSortDue);
   const all = allLeads(), callers = all.filter(l => l.callList !== false);
-  const q = S.search.trim().toLowerCase(), cap = 60;
+  const q = S.search.trim().toLowerCase(), cap = S.callsShown || 15;
   let list;
   if (q) list = all.filter(l => [l.name,l.business,l.contact,l.phone,l.email].join(' ').toLowerCase().includes(q)).sort((a,b) => String(a.name || '').localeCompare(String(b.name || '')));
   else if (S.callFilter === 'IA' || S.callFilter === 'AZ') list = due.filter(l => l.type === 'Cold' && l.region === S.callFilter);
@@ -871,7 +893,7 @@ function viewCalls() {
       <div class="meta">${stageCounts} · Signed monthly <b>${money(monthly)}</b></div>
     </section>
     ${q ? '' : `<div class="chips">${[['due',`Due now ${due.length}`],['warm',`Warm + clients ${n(l => l.type !== 'Cold')}`],['IA',`Iowa ${n(l => l.type === 'Cold' && l.region === 'IA')}`],['AZ',`Arizona ${n(l => l.type === 'Cold' && l.region === 'AZ')}`],['all',`Call list ${callers.length}`]].map(([k,l]) => `<button class="chip ${S.callFilter === k ? 'on' : ''}" data-act="call-filter" data-f="${k}">${l}</button>`).join('')}</div>`}
-    ${list.length ? `<div class="leads">${list.slice(0, cap).map(l => leadCard(l, t)).join('')}</div>${list.length > cap ? `<div class="meta">Showing ${cap} of ${list.length}. Search to find the rest, or use All leads.</div>` : ''}` : `<div class="card empty">${q ? 'No leads match that search.' : 'No calls due here. Add new leads on Monday, or switch filters.'}</div>`}`;
+    ${list.length ? `<div class="leads">${list.slice(0, cap).map(l => leadCard(l, t)).join('')}</div>${list.length > cap ? `<div class="btnrow more-row"><button class="btn sm" data-act="calls-more">Show ${Math.min(15, list.length - cap)} more</button><span class="meta">${cap} of ${list.length}</span></div>` : ''}` : `<div class="card empty">${q ? 'No leads match that search.' : 'No calls due here. Add new leads on Monday, or switch filters.'}</div>`}`;
 }
 function leadCard(l, t) {
   const id = l.id, step = inCadence(l) ? cadenceStep(l) : null;
@@ -1227,7 +1249,10 @@ function viewPlan() {
   const recent = liveTasks().filter(x => x.done && x.doneOn && x.doneOn >= addDays(t,-14)).sort((a,b) => a.doneOn < b.doneOn ? 1 : -1);
   const cur = roadmapFor(t);
   const rm = roadmap(), curIdx = cur ? rm.findIndex(w => w.start === cur.start) : 0;
-  const past = rm.slice(0, Math.max(0, curIdx)), ahead = rm.slice(Math.max(0, curIdx));
+  const past = rm.slice(0, Math.max(0, curIdx)), ahead = rm.slice(Math.max(0, curIdx), Math.max(0, curIdx) + 4), later = rm.slice(Math.max(0, curIdx) + 4);
+  // Coming up shows the next two weeks; the rest waits behind Show all so the tab stays short.
+  const soon = addDays(t, 14), dates = Object.keys(groups).sort(), shownDates = S.allUpcoming ? dates : dates.filter(d => d <= soon);
+  const hiddenN = dates.filter(d => !shownDates.includes(d)).reduce((n, d) => n + groups[d].tasks.length + groups[d].events.length, 0);
   const roadRow = w => `<div class="road ${cur && w.start === cur.start ? 'cur' : ''}"><div class="d">${esc(fmtShort(w.start))}${w.start.slice(0,4) !== t.slice(0,4) ? '<br>' + w.start.slice(0,4) : ''}</div><div class="min0"><b>${esc(w.focus)}</b>${w.musts ? `<div class="meta">${esc(w.musts)}</div>` : ''}</div></div>`;
   return `
     ${planOverview(t)}
@@ -1237,11 +1262,12 @@ function viewPlan() {
       <div class="daychips" style="margin-top:8px">${WEEK_ORDER.map(x => `<button data-act="sched-open" data-date="${nextDow(t, x)}">${x}</button>`).join('')}</div></section>
     <section class="card"><div class="card-h"><h2>Add a to-do</h2></div>${addTaskForm('pt', t)}</section>
     <section class="card"><div class="card-h"><h2>Coming up</h2><span class="meta">${plural(upcoming.length,'to-do')}</span></div>
-      ${Object.keys(groups).length ? Object.keys(groups).sort().map(d => { const g = groups[d]; return `<h3>${d === t ? 'Today' : esc(fmtDay(d))}</h3>${g.events.map(e => `<div class="trow ev"><span class="evdot" aria-hidden="true"></span><div class="min0"><div class="txt" data-act="event-edit" data-id="${esc(e.id)}" role="button" tabindex="0"><span class="mono">${fmtTap(e.start)}${e.end && e.end !== e.start ? '–' + fmtTap(e.end) : ''}</span> ${esc(e.title)}</div>${e.where ? `<div class="meta">${esc(e.where)}</div>` : ''}</div></div>`).join('')}${g.tasks.map(x => `<div class="trow"><button class="ck" data-act="task-toggle" data-id="${esc(x.id)}" aria-label="Done: ${esc(x.title)}"></button><div class="min0"><div class="txt" data-act="task-open" data-id="${esc(x.id)}" role="button" tabindex="0">${esc(x.title)}</div><div class="btnrow" style="margin-top:6px">${x.area ? `<span class="pill">${esc(x.area)}</span>` : ''}<input class="in" type="date" value="${esc(x.due)}" data-act="task-date" data-id="${esc(x.id)}" aria-label="Move date" style="width:auto;padding:4px 8px;font-size:14px"><button class="btn sm ghost" data-act="task-drop" data-id="${esc(x.id)}">Drop</button></div></div></div>`).join('')}`; }).join('') : '<div class="meta">Nothing scheduled.</div>'}</section></div>
+      ${dates.length ? shownDates.map(d => { const g = groups[d]; return `<h3>${d === t ? 'Today' : esc(fmtDay(d))}</h3>${g.events.map(e => `<div class="trow ev"><span class="evdot" aria-hidden="true"></span><div class="min0"><div class="txt" data-act="event-edit" data-id="${esc(e.id)}" role="button" tabindex="0"><span class="mono">${fmtTap(e.start)}${e.end && e.end !== e.start ? '–' + fmtTap(e.end) : ''}</span> ${esc(e.title)}</div>${e.where ? `<div class="meta">${esc(e.where)}</div>` : ''}</div></div>`).join('')}${g.tasks.map(x => taskRow(x, t, false, true)).join('')}`; }).join('') + (!shownDates.length ? '<div class="meta">Nothing in the next two weeks.</div>' : '') : '<div class="meta">Nothing scheduled.</div>'}
+      ${hiddenN || S.allUpcoming ? `<button class="btn sm ghost showall" data-act="plan-all">${S.allUpcoming ? 'Show the next two weeks' : `Show ${hiddenN} more after ${esc(fmtShort(soon))}`}</button>` : ''}</section></div>
     <section class="card"><div class="card-h"><h2>Roadmap</h2><span class="meta">To the move, then DUPR 5.5</span></div>
-      ${past.length ? `<details><summary>Earlier weeks (${past.length})</summary>${past.map(roadRow).join('')}</details>` : ''}${ahead.map(roadRow).join('')}</section></div>
+      ${past.length ? `<details><summary>Earlier weeks (${past.length})</summary>${past.map(roadRow).join('')}</details>` : ''}${ahead.map(roadRow).join('')}${later.length ? `<details><summary>Later weeks (${later.length})</summary>${later.map(roadRow).join('')}</details>` : ''}</section></div>
     ${recent.length ? `<section class="card"><details><summary>Done in the last 2 weeks (${recent.length})</summary>${recent.map(x => taskRow(x, t)).join('')}</details></section>` : ''}
-    <section class="card"><div class="card-h"><h2>What runs by itself</h2></div><ul class="howto meta" style="margin:0;padding-left:18px;color:var(--ink-2)">
+    <section class="card"><details class="howto-d"><summary>What runs by itself</summary><ul class="howto meta" style="margin:8px 0 0;padding-left:18px;color:var(--ink-2)">
       <li>Unchecked to-dos and top-3 items move to the next day and show how many days late they are.</li>
       <li>Missed key blocks (gym, adding leads, money check-in, DUPR, Sunday review and planning) come back the next day as make-ups. Use ⋯ › Skip when you mean to skip one.</li>
       <li>Short on dials? The difference becomes a make-up to-do tomorrow.</li>
@@ -1249,8 +1275,8 @@ function viewPlan() {
       <li>Booking a demo adds the demo and a same-day proposal to your to-dos.</li>
       <li>Checking off a drill or play block logs the session. Your check-out "fix" becomes tomorrow's first to-do.</li>
       <li>Your Sunday fix shows on every drill block the next week.</li>
-      <li>Rest days (Sundays): nothing counts as late, no carried-over list, and no make-ups are created for them.</li>
-      <li>Fresh start, in This device below, moves older to-dos to a day you choose and drops make-ups. Use it after a break.</li></ul>
+      <li>Rest days (Sundays): nothing counts as late, to-dos from earlier days stay out of sight, and no make-ups are created for them.</li>
+      <li>Fresh start, in This device below, moves older to-dos to a day you choose and drops make-ups. Use it after a break.</li></ul></details>
       <div class="btnrow" style="margin-top:10px">${p.links && p.links.playbook ? `<a class="btn sm" href="${esc(p.links.playbook)}" target="_blank" rel="noopener">Playbook (scripts, workouts)</a>` : ''}${p.links && p.links.sheet ? `<a class="btn sm ghost" href="${esc(p.links.sheet)}" target="_blank" rel="noopener">Old Google Sheet</a>` : ''}</div></section>
     ${settingsCard()}`;
 }
@@ -2300,8 +2326,9 @@ function emPreviewHtml() {
 function viewEmail() {
   if (!S.outEng && !emCheckStarted && outreachUrl()) { emCheckStarted = true; setTimeout(() => outreachCheck(true), 0); }
   const s = emSettings(), st = emState(), camps = emCampaigns(), list = emLeads();
-  const main = [emHero(s, st, camps, list), emChecklist(s, camps, list), emHotCard(), emContactsCard(list, camps), emRepliesCard()];
-  const side = [emFinderCard(s), emResults(list), ...camps.map(c => emCampaignCard(c, list, st, s)), emUpNext(s, st, camps)];
+  // Phone order: status, setup, hot replies, today's sends, leads, campaigns, results, up next, everyone, every reply.
+  const main = [emHero(s, st, camps, list), emChecklist(s, camps, list), emHotCard(), emTodayCard(s, list), emContactsCard(list, camps), emRepliesCard()];
+  const side = [emLeadsCard(s, camps), emCampsCard(camps, list, st, s), emResults(list), emUpNext(s, st, camps)];
   return `<div class="two"><div class="main">${main.join('')}</div><div class="side">${side.join('')}</div></div>`;
 }
 function emHero(s, st, camps, list) {
@@ -2335,7 +2362,8 @@ function emHero(s, st, camps, list) {
     outdated ? '<div class="warnbox">Supabase is running an older copy of the engine. Open Engine setup, copy the new code and deploy it.</div>' : '',
     mode === 'on' && engineOk && ranMin !== null && ranMin > 25 ? `<div class="warnbox">The engine last ran ${esc(emAgo(st.lastRun))}. Check that its schedule is on (Engine setup, step 6).</div>` : '',
   ].join('');
-  const facts = [gmail ? `From <b>${esc(gmail)}</b>` : '', st.lastRun ? `Checked ${esc(emAgo(st.lastRun))}` : '', engineOk ? (s.startedOn && cap < (Number(s.capMax) || 50) ? `Warming up: ${cap} a day now, up to ${s.capMax}` : `${cap} a day`) : ''].filter(Boolean);
+  const last = emSentToday(s, list)[0];
+  const facts = [gmail ? `From <b>${esc(gmail)}</b>` : '', last ? `Last: <b>${esc(last.l.name || last.l.email)}</b> at ${esc(last.time)}` : '', st.lastRun ? `Checked ${esc(emAgo(st.lastRun))}` : '', engineOk ? (s.startedOn && cap < (Number(s.capMax) || 50) ? `Warming up: ${cap} a day now, up to ${s.capMax}` : `${cap} a day`) : ''].filter(Boolean);
   return `<section class="card emhero ord-1">
     <div class="emhero-top"><div class="min0"><div class="eyebrow">Email command center</div><div class="emst"><i class="emdot ${dot}" aria-hidden="true"></i><b>${esc(title)}</b></div><div class="meta">${esc(sub)}</div></div>
       ${mode !== 'paused' ? '<button class="btn" data-act="em-pause">Pause</button>' : '<button class="btn primary" data-act="em-start">Start sending</button>'}</div>
@@ -2364,7 +2392,7 @@ function emChecklist(s, camps, list) {
 function emHotCard() {
   const hot = emHot(), any = Object.keys(S.data.replies || {}).length;
   return `<section class="card hotcard ord-3"><div class="card-h"><h2>Hot replies</h2><span class="meta">${hot.length ? `${hot.length} to answer` : 'All caught up'}</span></div>
-    ${hot.length ? hot.map(emHotRow).join('') : `<div class="meta">${any ? 'Every hot reply is handled. New ones show up here, move to Talking in your pipeline, get starred in Gmail and ping your phone.' : 'When someone says yes, asks a question or points you to the right person, it shows up here, moves to Talking in your pipeline, gets starred in Gmail and pings your phone.'}</div>`}
+    ${hot.length ? hot.map(emHotRow).join('') : `<div class="meta">${any ? 'All answered. New ones land here and on your phone.' : 'When a business says yes or asks a question, it lands here and on your phone.'}</div>`}
   </section>`;
 }
 function emHotRow(r) {
@@ -2389,12 +2417,12 @@ function emContactsCard(list, camps) {
   let shown = inCamp.filter(EM_FILTERS.find(x => x[0] === f)[2]);
   if (q) shown = shown.filter(l => [l.name, l.email, l.city, l.state, l.kind, l.business, l.firstName].join(' ').toLowerCase().includes(q));
   shown.sort((a, b) => (EM_SEQ_RANK[a.seq.status] ?? 9) - (EM_SEQ_RANK[b.seq.status] ?? 9) || String((b.reply || {}).at || '').localeCompare(String((a.reply || {}).at || '')) || String(a.seq.nextOn || '').localeCompare(String(b.seq.nextOn || '')) || (a.createdAt || 0) - (b.createdAt || 0) || String(a.name || '').localeCompare(String(b.name || '')));
-  const lim = S.emLimit || 40, n = shown.length;
+  const lim = S.emLimit || 20, n = shown.length;
   const bulk = f === 'hold' && n ? `<button class="btn sm primary" data-act="em-bulk" data-op="queue">Queue all ${n}</button>`
     : f === 'queued' && n ? `<button class="btn sm" data-act="em-bulk" data-op="pause">Pause all ${n}</button>`
     : f === 'paused' && n ? `<button class="btn sm" data-act="em-bulk" data-op="resume">Resume all ${n}</button>` : '';
   const used = camps.filter(c => list.some(l => l.seq.campaign === c.id));
-  return `<section class="card ord-8" id="em-contacts"><div class="card-h"><h2>In your campaigns</h2><div class="btnrow"><span class="meta">${list.length}</span><button class="btn sm" data-act="em-import">Add</button></div></div>
+  return `<section class="card ord-9" id="em-contacts"><div class="card-h"><h2>In your campaigns</h2><div class="btnrow"><span class="meta">${list.length}</span><button class="btn sm" data-act="em-import">Add</button></div></div>
     ${list.length ? `
     ${used.length > 1 ? `<div class="seg scope emcamps">${[['all','All'], ...used.map(c => [c.id, c.name])].map(([k, l]) => `<button type="button" class="${cf === k ? 'on' : ''}" data-act="em-camp-filter" data-id="${esc(k)}">${esc(l)}</button>`).join('')}</div>` : ''}
     <input class="in" id="em-search" placeholder="Search businesses, emails, cities" value="${esc(S.emSearch)}" autocomplete="off">
@@ -2404,7 +2432,7 @@ function emContactsCard(list, camps) {
     ${f === 'stopped' ? '<div class="meta">Their emails stopped when they moved past Contacted in your pipeline.</div>' : ''}
     ${bulk ? `<div class="btnrow">${bulk}</div>` : ''}
     <div class="elist">${shown.slice(0, lim).map(l => emRow(l, cf === 'all' && used.length > 1)).join('') || `<div class="meta" style="padding:10px 0">${q ? 'No leads match that search.' : 'Nobody here.'}</div>`}</div>
-    ${n > lim ? `<button class="btn sm ghost" data-act="em-more">Show ${Math.min(60, n - lim)} more of ${n - lim}</button>` : ''}`
+    ${n > lim ? `<button class="btn sm ghost" data-act="em-more">Show ${Math.min(40, n - lim)} more of ${n - lim}</button>` : ''}`
     : '<div class="meta">Nobody is in a campaign yet. Turn on the finder, or add outreach-list.csv or any spreadsheet with business names and emails.</div><div class="btnrow" style="margin-top:8px"><button class="btn primary" data-act="em-import">Add leads</button><button class="btn" data-act="em-finder">Set up the finder</button></div>'}
   </section>`;
 }
@@ -2413,7 +2441,7 @@ function emRepliesCard() {
   if (!all.length) return '';
   const f = EM_REPLY_GROUPS.some(g => g[0] === S.emReplies) ? S.emReplies : 'all', grp = EM_REPLY_GROUPS.find(g => g[0] === f);
   const list = grp[2] ? all.filter(r => grp[2].includes(r.label)) : all, lim = S.emRLimit || 25;
-  return `<section class="card ord-9"><div class="card-h"><h2>Every reply</h2><span class="meta">${emReplyWord(all.length)}</span></div>
+  return `<section class="card ord-10"><div class="card-h"><h2>Every reply</h2><span class="meta">${emReplyWord(all.length)}</span></div>
     <div class="chips">${EM_REPLY_GROUPS.map(([k, l, labels]) => { const n = labels ? all.filter(r => labels.includes(r.label)).length : all.length; return n || k === 'all' ? `<button class="chip ${f === k ? 'on' : ''}" data-act="em-rfilter" data-f="${k}">${l} ${n}</button>` : ''; }).join('')}</div>
     <div class="elist">${list.slice(0, lim).map(r => `<button class="erow" data-act="lead-open" data-id="${esc(r.lead)}"><div class="min0"><b>${esc(r.business || r.email || r.from || '')}</b><div class="meta clamp1">${esc(r.summary || r.snippet || r.text || '')}</div></div><div class="erow-r">${emLabelPill(r.label)}<span class="meta">${esc(emAgo(r.at))}</span></div></button>`).join('') || '<div class="meta" style="padding:10px 0">None of these.</div>'}</div>
     ${list.length > lim ? `<button class="btn sm ghost" data-act="em-rmore">Show more</button>` : ''}
@@ -2425,7 +2453,7 @@ function emResults(list) {
   list.forEach(l => (l.sentLog || []).forEach(x => { const d = x && x.at ? iso(new Date(x.at)) : ''; if (d) sentBy[d] = (sentBy[d] || 0) + 1; }));
   emReplies().forEach(r => { if (r.label === 'auto' || r.label === 'bounce') return; const d = iso(new Date(r.at)); repBy[d] = (repBy[d] || 0) + 1; });
   const max = Math.max(1, ...days.map(d => sentBy[d] || 0)), any = days.some(d => sentBy[d] || repBy[d]);
-  return `<section class="card ord-5"><div class="card-h"><h2>Results</h2><span class="meta">All campaigns</span></div>
+  return `<section class="card ord-7"><div class="card-h"><h2>Results</h2><span class="meta">All campaigns</span></div>
     <div class="auto">
       <div><b>${k.emailed}</b><span>businesses emailed</span></div>
       <div><b>${k.sent}</b><span>emails sent</span></div>
@@ -2438,59 +2466,98 @@ function emResults(list) {
     <div class="meta">Emails sent each day, the last two weeks. Green numbers are replies.</div>` : ''}
   </section>`;
 }
-const finderSearches = f => Object.values(f.targets || {}).filter(t => t && t.on).reduce((a, t) => a + String(t.niches || '').split(/[,;\n]+/).filter(x => x.trim()).length * String(t.areas || '').split(/[;\n]+/).filter(x => x.trim()).length, 0);
-function emFinderCard(s) {
-  const f = s.finder, st = outDoc('finder') || {}, today = localClock(s.tz).date;
-  const td = st.today && st.today.date === today ? st.today : {found:0, spent:0, runs:0, checked:0, noEmail:0};
-  const mo = st.month && st.month.month === today.slice(0, 7) ? st.month : {found:0, spent:0};
-  const per = Number(f.perDay) || 100, cap = Number(f.budget) || 5, keep = Number(f.keep) || 300;
-  // Each campaign it searches for: leads waiting for their first email against the number to keep waiting.
-  const waiting = inLine(S.data.leads), totals = {};
-  for (const l of Object.values(S.data.leads || {})) if (l && l.seq && l.seq.campaign) totals[l.seq.campaign] = (totals[l.seq.campaign] || 0) + 1;
-  const onIds = Object.entries(f.targets || {}).filter(([, t]) => t && t.on).map(([cid]) => cid);
-  const allFull = onIds.length > 0 && onIds.every(cid => (waiting[cid] || 0) >= keep);
-  const state = !f.enabled ? ['Off', ''] : allFull ? ['Enough waiting', 'good'] : td.found >= per ? ['Done for today', 'good'] : td.spent >= cap ? ['Spending limit reached', 'warn'] : ['Searching', 'good'];
-  const campRows = onIds.map(cid => { const n = waiting[cid] || 0, name = ((S.data.campaigns || {})[cid] || DEFAULT_CAMPAIGNS[cid] || {}).name || cid;
-    return `<div class="fcamp"><div class="fcamp-h"><b>${esc(name)}</b><span class="meta">${n} of ${keep} waiting · ${totals[cid] || 0} in the campaign</span></div><div class="bar ${n >= keep ? 'good' : ''}"><i style="width:${Math.min(100, Math.round(n / keep * 100))}%"></i></div></div>`; }).join('');
-  const ran = st.lastRun ? (Date.now() - Date.parse(st.lastRun)) / 60000 : null;
-  const camps = Object.entries(f.targets || {}).filter(([, t]) => t && t.on).map(([cid]) => ((S.data.campaigns || {})[cid] || {}).name || cid);
-  const costEach = mo.found ? mo.spent / mo.found : td.found ? td.spent / td.found : 0;
-  return `<section class="card finder ord-4"><div class="card-h"><h2>Finding new leads</h2><span class="pill ${state[1]}">${state[0]}</span></div>
-    <div class="meta" style="color:var(--ink-2)">${f.enabled ? `Every 15 minutes Claude searches the web for local businesses for ${esc(camps.join(' and ') || 'your campaigns')} and reads each website for an email. It keeps ${keep} leads waiting for each campaign and adds more as emails go out: up to ${per} a day, ${dollars(cap)} a day at most.` : `Turn it on and Claude searches the web every 15 minutes for local businesses, reads each website for an email, and adds them to your pipeline and campaign until each campaign has ${keep} leads waiting.`}</div>
-    ${campRows ? `<div class="fcamps">${campRows}</div>` : ''}
-    ${f.enabled || td.found || mo.found ? `<div class="progress"><div class="bar ${td.found >= per ? 'good' : ''}"><i style="width:${Math.min(100, Math.round(td.found / Math.max(1, per) * 100))}%"></i></div><span class="meta mono">${td.found}/${per} today</span></div>
-    <div class="emc-n"><span><b>${dollars(td.spent)}</b> today</span><span><b>${mo.found}</b> this month</span><span><b>${dollars(mo.spent)}</b> this month</span>${costEach ? `<span><b>${Math.round(costEach * 100)}¢</b> a lead</span>` : ''}</div>` : ''}
-    ${st.lastError ? `<div class="err">${esc(st.lastError)}</div>` : ''}
-    ${f.enabled && S.outEng && S.outEng.fn === 'ok' && !S.outEng.hasKey ? '<div class="warnbox">The finder needs your Anthropic key in Supabase (ANTHROPIC_API_KEY). Engine setup, step 4.</div>' : ''}
-    ${f.enabled && ran !== null && ran > 40 ? `<div class="warnbox">The finder last ran ${esc(emAgo(st.lastRun))}. Check its schedule (Engine setup, step 6).</div>` : f.enabled && ran === null ? '<div class="meta">Waiting for its first run. It needs the engine and its 15-minute schedule (Engine setup, step 6).</div>' : ''}
-    ${(st.recent || []).length ? `<details><summary>Last searches</summary><div class="elist">${st.recent.slice(0, 6).map(x => `<div class="erow static"><div class="min0"><b>${esc(x.search)}</b><div class="meta clamp1">${x.found ? esc((x.names || []).join(', ')) : 'No new businesses with an email'}</div></div><div class="erow-r"><span class="pill ${x.found ? 'good' : ''}">${x.found} new</span><span class="meta">${esc(emAgo(x.at))}</span></div></div>`).join('')}</div></details>` : ''}
-    <div class="btnrow"><button class="btn sm ${f.enabled ? '' : 'primary'}" data-act="em-finder-toggle">${f.enabled ? 'Pause' : 'Turn on'}</button>${f.enabled && emEngineOk() ? `<button class="btn sm" data-act="em-find-now" ${S.emFindBusy ? 'disabled' : ''}>${S.emFindBusy ? 'Searching… up to 2 min' : 'Search now'}</button>` : ''}<button class="btn sm" data-act="em-finder">Settings</button><span class="meta">${finderSearches(f)} searches in your list</span></div>
+// Emails sent today, newest first, each with its local time on your clock.
+function emSentToday(s, list) {
+  const today = localClock(s.tz).date, out = [];
+  for (const l of list) for (const x of (l.sentLog || [])) {
+    if (!x || !x.at) continue;
+    const at = new Date(x.at), c = localClock(s.tz, at);
+    if (c.date !== today) continue;
+    out.push({at:+at, l, step:x.step, campaign:x.campaign, time:fmtTap(`${Math.floor(c.minutes / 60)}:${pad(c.minutes % 60)}`)});
+  }
+  return out.sort((a, b) => b.at - a.at);
+}
+// The day at a glance: every email that went out and every answer that came in, newest first.
+function emTodayCard(s, list) {
+  const sent = emSentToday(s, list), today = localClock(s.tz).date;
+  const replies = emReplies().filter(r => localClock(s.tz, new Date(r.at)).date === today);
+  if (!sent.length && !replies.length) return '';
+  const rows = [
+    ...sent.map(x => { const c = (S.data.campaigns || {})[x.campaign] || {}; return {at:x.at, id:x.l.id, name:x.l.name || x.l.email, line:`${emStepName(x.step, (c.steps || []).length)} · ${c.name || ''}`, right:`<span class="meta">${esc(x.time)}</span>`}; }),
+    ...replies.map(r => { const c = localClock(s.tz, new Date(r.at)); return {at:Date.parse(r.at), id:r.lead, name:r.business || r.email || r.from || '', line:r.summary || r.snippet || 'Replied', right:`${emLabelPill(r.label)}<span class="meta">${esc(fmtTap(`${Math.floor(c.minutes / 60)}:${pad(c.minutes % 60)}`))}</span>`}; }),
+  ].sort((a, b) => b.at - a.at);
+  const lim = S.emTodayAll ? rows.length : 6;
+  return `<section class="card ord-4"><div class="card-h"><h2>Today</h2><span class="meta">${plural(sent.length, 'email')} sent${replies.length ? ` · ${emReplyWord(replies.length)}` : ''}</span></div>
+    <div class="elist">${rows.slice(0, lim).map(x => `<button class="erow" data-act="lead-open" data-id="${esc(x.id)}"><div class="min0"><b>${esc(x.name)}</b><div class="meta clamp1">${esc(x.line)}</div></div><div class="erow-r">${x.right}</div></button>`).join('')}</div>
+    ${rows.length > 6 ? `<button class="btn sm ghost" data-act="em-today-all">${S.emTodayAll ? 'Show fewer' : `Show all ${rows.length}`}</button>` : ''}
   </section>`;
 }
-function emCampaignCard(c, list, st, s) {
-  const k = campaignStats(Object.fromEntries(list.map(l => [l.id, l])), c.id);
-  const today = st.today && st.today.date === localClock(s.tz).date ? ((st.today.by || {})[c.id] || 0) : 0;
-  const pct = k.total ? Math.round(k.emailed / k.total * 100) : 0;
-  const state = liveCampaign(c) ? ['On', 'good'] : c.reviewed ? ['Paused', 'warn'] : ['Needs your OK', 'warn'];
-  const trig = c.trigger ? `Starts by itself for leads in <b>${esc(c.trigger.stage)}</b> after ${plural(Number(c.trigger.days) || 0, 'day')}.` : '';
-  return `<section class="card emc ord-6"><div class="card-h"><h2>${esc(c.name)}</h2><span class="pill ${state[1]}">${state[0]}</span></div>
-    ${c.offer ? `<div class="meta emc-offer">${esc(c.offer)}</div>` : ''}
-    ${trig ? `<div class="meta trig">${trig}</div>` : ''}
-    <div class="emc-n"><span><b>${k.total}</b> leads</span><span><b>${k.emailed}</b> emailed</span><span><b>${k.answered}</b> replied</span><span class="${k.hot ? 'hotnum' : ''}"><b>${k.hot}</b> hot</span></div>
-    ${k.total ? `<div class="progress"><div class="bar"><i style="width:${pct}%"></i></div><span class="meta mono">${today}/${c.cap || 30} today</span></div>` : ''}
-    <div class="btnrow">
-      <button class="btn sm ${c.reviewed ? '' : 'primary'}" data-act="em-campaign" data-id="${esc(c.id)}">${c.reviewed ? 'Edit the emails' : 'Read and approve'}</button>
-      ${c.reviewed ? `<button class="btn sm" data-act="em-camp-toggle" data-id="${esc(c.id)}">${liveCampaign(c) ? 'Pause' : 'Turn on'}</button>` : ''}
-      ${c.trigger ? '' : `<button class="btn sm ghost" data-act="em-import" data-campaign="${esc(c.id)}">Add leads</button>`}
-      ${k.total ? `<button class="btn sm ghost" data-act="em-camp-filter" data-id="${esc(c.id)}" data-go="1">Leads</button>` : ''}
-    </div></section>`;
+// What Claude is asked to do when you find leads with it from the app: your campaign's kinds of
+// business in a few of its cities (a different few each day), checked on each business's own website.
+function claudeLeadPrompt(cid) {
+  const s = emSettings(), c = (S.data.campaigns || {})[cid] || DEFAULT_CAMPAIGNS[cid] || {}, t = (s.finder.targets || {})[cid] || {};
+  const niches = String(t.niches || '').split(/[,;\n]+/).map(x => x.trim()).filter(Boolean).slice(0, 8);
+  const areas = String(t.areas || '').split(/[;\n]+/).map(x => x.trim()).filter(Boolean);
+  const from = areas.length ? (Math.floor(Date.now() / 86400000) * 3) % areas.length : 0;
+  const cities = [...new Set([0, 1, 2].map(i => areas[(from + i) % areas.length]).filter(Boolean))];
+  return `Find 25 new leads for my ${c.name || cid} email campaign and add them to my Life Command Center.\n\n` +
+    `Look for ${niches.join(', ') || 'local businesses'} in ${cities.join('; ') || 'my area'}. Start from Google Maps listings with 4.5+ stars and 100+ reviews and skip chains and franchises. Open each business's own website and keep only the ones that show an email address there. Never guess an email.\n\n` +
+    `Add them with add_leads (campaign "${cid}") with the page you found each email on as source_url, then tell me how many you added.`;
+}
+const finderState = (f, td, allFull) => !f.enabled ? ['Off', ''] : allFull ? ['Enough waiting', 'good'] : td.found >= (Number(f.perDay) || 100) ? ['Done for today', 'good'] : td.spent >= (Number(f.budget) || 5) ? ['Spending limit reached', 'warn'] : ['Searching', 'good'];
+// Leads waiting for a first email in each campaign and how long they last, then the ways to get more:
+// your scraper's CSV files (cheapest), Claude on your own plan (no extra cost), and the paid finder.
+function emLeadsCard(s, camps) {
+  const f = s.finder, st = outDoc('finder') || {}, today = localClock(s.tz).date;
+  const td = st.today && st.today.date === today ? st.today : {found:0, spent:0, runs:0};
+  const mo = st.month && st.month.month === today.slice(0, 7) ? st.month : {found:0, spent:0};
+  const keep = Number(f.keep) || 300, waiting = inLine(S.data.leads), cap = dailyCap(s, today);
+  const cold = camps.filter(c => !c.trigger), share = cold.reduce((a, c) => a + (Number(c.cap) || 30), 0) || 1;
+  const rows = cold.map(c => {
+    const n = waiting[c.id] || 0, on = liveCampaign(c);
+    const perDay = Math.max(1, Math.min(Number(c.cap) || 30, Math.round(cap * (Number(c.cap) || 30) / share))), days = Math.floor(n / perDay), low = on && days < 3;
+    const lasts = !on ? '' : !n ? ' · none left' : days < 1 ? ' · runs out today' : days === 1 ? ' · about a day left' : ` · about ${days} sending days`;
+    return `<div class="fcamp"><div class="fcamp-h"><b>${esc(c.name)}</b><span class="meta ${low ? 'warntext' : ''}">${n} waiting${lasts}</span></div><div class="bar ${low ? 'warn' : n >= keep ? 'good' : ''}"><i style="width:${Math.min(100, Math.round(n / keep * 100))}%"></i></div>
+      <div class="btnrow fcamp-a"><button class="btn sm" data-act="em-import" data-campaign="${esc(c.id)}">Add a CSV</button><button class="btn sm" data-act="em-claude-find" data-id="${esc(c.id)}">Find with Claude</button></div></div>`;
+  }).join('');
+  const onIds = Object.entries(f.targets || {}).filter(([, t]) => t && t.on).map(([cid]) => cid);
+  const state = finderState(f, td, onIds.length > 0 && onIds.every(cid => (waiting[cid] || 0) >= keep));
+  const costEach = mo.found ? mo.spent / mo.found : td.found ? td.spent / td.found : 0, ran = st.lastRun ? (Date.now() - Date.parse(st.lastRun)) / 60000 : null;
+  return `<section class="card leadscard ord-5"><div class="card-h"><h2>Leads</h2><button class="btn sm" data-act="em-import">Add leads</button></div>
+    <div class="fcamps">${rows || '<div class="meta">Approve a campaign and its leads show up here.</div>'}</div>
+    <div class="meta">Your scraper's CSV files are the cheapest. Find with Claude runs on your own Claude plan, at no extra cost.</div>
+    <div class="finder sub"><div class="sub-h"><b>Lead finder</b><span class="pill ${state[1]}">${state[0]}</span></div>
+      <div class="meta">${f.enabled && !st.lastRun ? 'Waiting for its first run. It runs every 15 minutes.' : f.enabled || td.found || mo.found ? [`${td.found} found today`, `${dollars(td.spent)} of ${dollars(Number(f.budget) || 5)} today`, mo.found ? `${mo.found} this month for ${dollars(mo.spent)}` : '', costEach ? `${Math.round(costEach * 100)}¢ a lead` : ''].filter(Boolean).join(' · ') : 'Claude searches the web every 15 minutes, about 70¢ a lead. Your scraper is cheaper.'}</div>
+      ${f.enabled ? `<div class="meta">It keeps ${keep} leads waiting for each campaign and adds more as emails go out.</div>` : ''}
+      ${st.lastError && f.enabled ? `<div class="err">${esc(st.lastError)}</div>` : ''}
+      ${f.enabled && S.outEng && S.outEng.fn === 'ok' && !S.outEng.hasKey ? '<div class="warnbox">The finder needs your Anthropic key in Supabase (ANTHROPIC_API_KEY). Engine setup, step 4.</div>' : ''}
+      ${f.enabled && ran !== null && ran > 40 ? `<div class="warnbox">The finder last ran ${esc(emAgo(st.lastRun))}. Check its schedule (Engine setup, step 6).</div>` : ''}
+      ${(st.recent || []).length ? `<details><summary>Last searches</summary><div class="elist">${st.recent.slice(0, 6).map(x => `<div class="erow static"><div class="min0"><b>${esc(x.search)}</b><div class="meta clamp1">${x.found ? esc((x.names || []).join(', ')) : 'No new businesses with an email'}</div></div><div class="erow-r"><span class="pill ${x.found ? 'good' : ''}">${x.found} new</span><span class="meta">${esc(emAgo(x.at))}</span></div></div>`).join('')}</div></details>` : ''}
+      <div class="btnrow"><button class="btn sm" data-act="em-finder-toggle">${f.enabled ? 'Pause' : 'Turn on'}</button>${f.enabled && emEngineOk() ? `<button class="btn sm" data-act="em-find-now" ${S.emFindBusy ? 'disabled' : ''}>${S.emFindBusy ? 'Searching… up to 2 min' : 'Search now'}</button>` : ''}<button class="btn sm ghost" data-act="em-finder">Settings</button></div>
+    </div>
+  </section>`;
+}
+// Every campaign in one card: the two cold ones, then the automatic follow-ups (off until you turn them on).
+function emCampsCard(camps, list, st, s) {
+  const byId = Object.fromEntries(list.map(l => [l.id, l])), todayBy = st.today && st.today.date === localClock(s.tz).date ? (st.today.by || {}) : {};
+  const row = c => {
+    const k = campaignStats(byId, c.id), on = liveCampaign(c);
+    const state = on ? ['On', 'good'] : c.reviewed ? ['Paused', 'warn'] : c.trigger ? ['Off', ''] : ['Needs your OK', 'warn'];
+    const what = c.trigger ? `Emails leads ${plural(Number(c.trigger.days) || 0, 'day')} after they move to ${c.trigger.stage}.${k.total ? ` ${k.emailed} emailed, ${k.answered} replied.` : ''}`
+      : `${k.total} leads · ${k.emailed} emailed · ${k.answered} replied${k.hot ? ` · ${k.hot} hot` : ''}`;
+    return `<div class="camprow emc"><div class="camprow-h"><b>${esc(c.name)}</b><span class="pill ${state[1]}">${state[0]}</span>${on && !c.trigger ? `<span class="meta mono">${todayBy[c.id] || 0}/${c.cap || 30} today</span>` : ''}</div>
+      <div class="meta">${esc(what)}</div>
+      <div class="btnrow"><button class="btn sm ${!c.reviewed && !c.trigger ? 'primary' : ''}" data-act="em-campaign" data-id="${esc(c.id)}">${c.reviewed ? 'Edit the emails' : c.trigger ? 'Read and turn on' : 'Read and approve'}</button>${c.reviewed ? `<button class="btn sm" data-act="em-camp-toggle" data-id="${esc(c.id)}">${on ? 'Pause' : 'Turn on'}</button>` : ''}${k.total ? `<button class="btn sm ghost" data-act="em-camp-filter" data-id="${esc(c.id)}" data-go="1">Leads</button>` : ''}</div></div>`;
+  };
+  const cold = camps.filter(c => !c.trigger), auto = camps.filter(c => c.trigger);
+  return `<section class="card ord-6"><div class="card-h"><h2>Campaigns</h2></div>${cold.map(row).join('')}${auto.length ? `<h3>Automatic follow-ups</h3>${auto.map(row).join('')}` : ''}</section>`;
 }
 function emUpNext(s, st, camps) {
   const list = upNext(S.data.leads, S.data.campaigns, s, new Date(), emSuppressed());
   const ready = list.filter(x => x.ready).length;
   const mode = emMode(s);
   const why = mode === 'paused' ? 'Sending is paused, so this is what goes out once you start.' : mode === 'later' ? `Sending starts ${fmtDay(s.startOn)}, so this is what goes out first.` : EM_WHY[st.lastWhy] || '';
-  return `<section class="card ord-7"><div class="card-h"><h2>Up next</h2><span class="meta">${ready} ready</span></div>
+  return `<section class="card ord-8"><div class="card-h"><h2>Up next</h2><span class="meta">${ready} ready</span></div>
     ${why && list.length ? `<div class="meta" style="margin-bottom:4px">${esc(why)}</div>` : ''}
     ${list.length ? `<div class="elist">${list.slice(0, 6).map(x => { const c = (S.data.campaigns || {})[x.campaign] || {}; return `<button class="erow" data-act="lead-open" data-id="${esc(x.id)}"><div class="min0"><b>${esc(x.l.name || x.l.email)}</b><div class="meta">${esc(emStepName(x.step, (c.steps || []).length))} · ${esc(c.name || '')}</div></div><span class="meta">${x.ready ? (x.step ? 'due now' : 'in line') : esc(fmtDay(x.due))}</span></button>`; }).join('')}</div>${list.length > 6 ? `<div class="meta" style="margin-top:6px">and ${list.length - 6} more</div>` : ''}`
       : `<div class="meta">${camps.some(liveCampaign) ? 'Nobody is waiting. Add leads or turn on the finder to keep it going.' : 'Approve a campaign and its leads line up here.'}</div>`}
@@ -3088,7 +3155,13 @@ function handle(act, el, ev) {
   const t = todayISO(), d = el.dataset;
   switch (act) {
     case 'view': if (d.v === 'today' && S.view === 'today') S.day = null; if (d.sub) setPipeView(d.sub); setView(d.v); break;
-    case 'goto': { if (S.modal) { S.modal = null; render(); } const tgt = document.getElementById(d.id); if (tgt) { tgt.scrollIntoView({behavior:'smooth', block:'start'}); const f = tgt.querySelector('input'); if (f) setTimeout(() => f.focus({preventScroll:true}), 350); } break; }
+    case 'goto': {
+      // The check-in and check-out wait as one line until you start them; going to one opens its form.
+      const today = dayOf(todayISO());
+      if (d.id === 'am-card' && !(today.am || {}).savedAt && !S.editAM) { S.editAM = true; clearDrafts('am-'); }
+      if (d.id === 'pm-card' && !(today.pm || {}).savedAt && !S.editPM) { S.editPM = true; clearDrafts('pm-'); }
+      S.modal = null; render();
+      const tgt = document.getElementById(d.id); if (tgt) { tgt.scrollIntoView({behavior:'smooth', block:'start'}); const f = tgt.querySelector('input'); if (f) setTimeout(() => f.focus({preventScroll:true}), 350); } break; }
     case 'check': toggleCheck(d.key); break;
     case 'item-menu': S.openItem = S.openItem === d.key ? null : d.key; render(); break;
     case 'skip': {
@@ -3117,12 +3190,29 @@ function handle(act, el, ev) {
     case 'task-drop': { const x = S.data.tasks[d.id]; if (!x) break; S.lastUndo = {type:'task', id:d.id, prev:clone(x)}; patchDoc('tasks', d.id, {dropped:true, droppedOn:t}); if (S.modal && S.modal.type === 'task') S.modal = null; toast(`Dropped "${x.title.slice(0, 40)}".`, true); break; }
     case 'top3': { const am = clone(dayOf(t).am || {}); const arr = am.top3 || []; const n = +d.i; if (!arr[n]) break; arr[n].done = !arr[n].done; patchDay(t, {am:{top3:arr}}); break; }
     case 'energy': S.drafts['am-energy'] = d.n; render(); break;
+    case 'tasks-all': S.allTasks = !S.allTasks; render(); break;
+    case 'plan-all': S.allUpcoming = !S.allUpcoming; render(); break;
+    case 'calls-more': S.callsShown = (S.callsShown || 15) + 15; render(); break;
+    case 'em-today-all': S.emTodayAll = !S.emTodayAll; render(); break;
+    // Find leads with Claude on Logan's own plan: copy a ready prompt for the campaign that needs leads most
+    // and open Claude, where the connector's add_leads files them. Without a connector, set it up first.
+    case 'em-claude-find': {
+      if (!connDoc()) { S.modal = {type:'claude'}; render(); toast('Connect Claude first. Then Find with Claude hands it the search.'); break; }
+      const waiting = inLine(S.data.leads), cold = emCampaigns().filter(c => !c.trigger), live = cold.filter(liveCampaign);
+      const cid = d.id || (live.length ? live : cold).slice().sort((a, b) => (waiting[a.id] || 0) - (waiting[b.id] || 0))[0]?.id;
+      if (!cid) break;
+      const text = claudeLeadPrompt(cid), name = ((S.data.campaigns || {})[cid] || {}).name || 'your campaign';
+      const open = () => window.open('https://claude.ai/new?q=' + encodeURIComponent(text), '_blank', 'noopener');
+      const done = ok => { open(); toast(ok ? `Search for ${name} copied. If Claude opens empty, paste it and send.` : 'Claude is opening with the search. If the box is empty, come back and tap again.'); };
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(() => done(true), () => done(false)); else done(false);
+      break;
+    }
     case 'am-edit': S.editAM = true; clearDrafts('am-'); render(); break;
     case 'am-cancel': S.editAM = false; clearDrafts('am-'); render(); break;
     case 'pm-edit': S.editPM = true; clearDrafts('pm-'); render(); break;
     case 'pm-cancel': S.editPM = false; clearDrafts('pm-'); render(); break;
     case 'protein': { const cur = S.drafts['pm-protein'] !== undefined ? S.drafts['pm-protein'] : !!(dayOf(t).pm || {}).protein; S.drafts['pm-protein'] = !cur; render(); break; }
-    case 'call-filter': S.callFilter = d.f; S.leadForm = null; render(); break;
+    case 'call-filter': S.callFilter = d.f; S.leadForm = null; S.callsShown = 0; render(); break;
     case 'outcome':
       if (d.k === 'talked' || d.k === 'demo') { clearDrafts('lf-'); S.leadForm = {id:d.id, type:d.k}; render(); }
       else outcome(d.id, d.k, {});
@@ -3430,9 +3520,9 @@ function handle(act, el, ev) {
       S.lastUndo = {type:'restore', ops:[{patch:['campaigns', d.id, {status:c.status || 'paused'}]}]};
       toast(on ? `${c.name} is on.${emMode() === 'on' ? '' : emMode() === 'later' ? ` Sending starts ${fmtDay(emSettings().startOn)}.` : ' Sending is still paused overall.'}` : `${c.name} is paused. Follow-ups wait too.`, true); render(); break;
     }
-    case 'em-camp-filter': S.emCamp = d.id || 'all'; S.emFilter = 'all'; S.emLimit = 40; render(); if (d.go) setTimeout(() => { const x = document.getElementById('em-contacts'); if (x) x.scrollIntoView({behavior:'smooth', block:'start'}); }, 30); break;
-    case 'em-filter': S.emFilter = d.f; S.emLimit = 40; render(); break;
-    case 'em-more': S.emLimit = (S.emLimit || 40) + 60; render(); break;
+    case 'em-camp-filter': S.emCamp = d.id || 'all'; S.emFilter = 'all'; S.emLimit = 20; render(); if (d.go) setTimeout(() => { const x = document.getElementById('em-contacts'); if (x) x.scrollIntoView({behavior:'smooth', block:'start'}); }, 30); break;
+    case 'em-filter': S.emFilter = d.f; S.emLimit = 20; render(); break;
+    case 'em-more': S.emLimit = (S.emLimit || 20) + 40; render(); break;
     case 'em-rfilter': S.emReplies = d.f; S.emRLimit = 25; render(); break;
     case 'em-rmore': S.emRLimit = (S.emRLimit || 25) + 50; render(); break;
     case 'em-bulk': {
@@ -3835,8 +3925,8 @@ document.addEventListener('pointercancel', endSwipe);
 document.addEventListener('submit', ev => { const f = ev.target.closest('form[data-form]'); if (!f) return; ev.preventDefault(); submit(f); });
 document.addEventListener('input', ev => {
   const el = ev.target;
-  if (el.id === 'lead-search') { S.search = el.value; const pos = el.selectionStart; render(); const n = document.getElementById('lead-search'); if (n) { n.focus(); try { n.setSelectionRange(pos, pos); } catch(e) {} } return; }
-  if (el.id === 'em-search') { S.emSearch = el.value; S.emLimit = 40; const pos = el.selectionStart; render(); const n = document.getElementById('em-search'); if (n) { n.focus(); try { n.setSelectionRange(pos, pos); } catch(e) {} } return; }
+  if (el.id === 'lead-search') { S.search = el.value; S.callsShown = 0; const pos = el.selectionStart; render(); const n = document.getElementById('lead-search'); if (n) { n.focus(); try { n.setSelectionRange(pos, pos); } catch(e) {} } return; }
+  if (el.id === 'em-search') { S.emSearch = el.value; S.emLimit = 20; const pos = el.selectionStart; render(); const n = document.getElementById('em-search'); if (n) { n.focus(); try { n.setSelectionRange(pos, pos); } catch(e) {} } return; }
   if (el.hasAttribute && el.hasAttribute('data-draft') && el.id) S.drafts[el.id] = el.value;
   if (el.hasAttribute && el.hasAttribute('data-emprev')) { const out = document.getElementById('em-preview'); if (out) out.innerHTML = emPreviewHtml(); }
   if (el.hasAttribute && el.hasAttribute('data-build')) {
