@@ -2387,7 +2387,7 @@ function emHero(s, st, camps, list) {
     ${engineOk ? `<div class="progress"><div class="bar ${sent >= cap ? 'good' : ''}"><i style="width:${Math.min(100, Math.round(sent / Math.max(1, cap) * 100))}%"></i></div><span class="meta mono">${sent}/${cap} today</span></div>` : ''}
     ${facts.length ? `<div class="meta">${facts.slice(0, 2).join(' · ')}</div>${facts.length > 2 ? `<div class="meta">${facts.slice(2).join(' · ')}</div>` : ''}` : ''}
     ${alerts}
-    <div class="btnrow">${mode === 'later' ? '<button class="btn sm" data-act="em-launch">Change the start day</button>' : ''}<button class="btn sm" data-act="em-import">Add leads</button><button class="btn sm" data-act="em-senders">Send more</button><button class="btn sm" data-act="em-settings">Settings</button><button class="btn sm ghost" data-act="em-setup">Engine setup</button></div>
+    <div class="btnrow">${mode === 'later' ? '<button class="btn sm" data-act="em-launch">Change the start day</button>' : ''}<button class="btn sm" data-act="em-import">Add leads</button><button class="btn sm" data-act="em-senders">Send more</button><button class="btn sm" data-act="em-settings">Settings</button>${!engineOk || outdated || st.lastError || alerts ? '<button class="btn sm ghost" data-act="em-setup">Engine setup</button>' : ''}</div>
   </section>`;
 }
 function emChecklist(s, camps, list) {
@@ -2867,7 +2867,7 @@ function emSettingsSheet() {
     <div class="btnrow"><button class="btn sm" type="button" data-act="em-senders">Send more: add an address</button><span class="meta">${emSenders().length ? plural(emSenders().length, 'extra address', 'extra addresses') : 'One address sends about 50 a day at most.'}</span></div>
     <div class="grid2"><div class="fld"><label for="es-gap">Minutes between emails, at least</label><input class="in" type="number" min="3" max="120" inputmode="numeric" id="es-gap" data-draft value="${esc(v('gap', s.gap))}"></div>
       <div class="fld"><label for="es-tz">Your time zone</label><select class="in" id="es-tz" data-draft>${EM_TZS.map(([z, l]) => `<option value="${z}" ${v('tz', s.tz) === z ? 'selected' : ''}>${l}</option>`).join('')}</select><span class="meta">When the day's count starts over.</span></div></div>
-    <div class="btnrow"><button class="btn primary" type="submit">Save</button><button class="btn ghost" type="button" data-act="modal-close">Cancel</button></div>
+    <div class="btnrow"><button class="btn primary" type="submit">Save</button><button class="btn ghost" type="button" data-act="modal-close">Cancel</button><button class="btn ghost" type="button" data-act="em-setup">Engine setup</button></div>
   </form>`;
 }
 // Send more emails: one address tops out at about 50 a day, so more volume means more addresses. Each extra
