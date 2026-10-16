@@ -2103,6 +2103,8 @@ const emCapToday = (s, st, today) => { const t = emToday(st, today); return t &&
 const emCampCap = (c, st, today) => { const t = emToday(st, today), a = t && Array.isArray(t.addrs) ? t.addrs.filter(x => !x.campaign || x.campaign === c.id).length : 1; return (Number(c.cap) || 30) * Math.max(1, a); };
 // The engine Supabase runs is older than the copy in this app (from its status check or its last run).
 const emOutdated = () => { const e = S.outEng || {}, st = emState(); return (e.fn === 'ok' && (e.version || 1) < OUTREACH_V) || (!!st.version && st.version < OUTREACH_V); };
+// Both cron jobs already run when the finder ran in the last two days, so an update only needs the code.
+const emFinderRan = () => { const f = outDoc('finder'); return !!(f && f.lastRun && Date.now() - Date.parse(f.lastRun) < 2 * 86400000); };
 const emEngineOk = () => !!((S.outEng && S.outEng.fn === 'ok' && S.outEng.gmail && S.outEng.gmail.ok) || emState().gmail);
 const gmailThread = id => `https://mail.google.com/mail/${emGmail() ? '?authuser=' + encodeURIComponent(emGmail()) : 'u/0/'}#all/${encodeURIComponent(id)}`;
 const gmailCompose = to => `https://mail.google.com/mail/?${emGmail() ? 'authuser=' + encodeURIComponent(emGmail()) + '&' : ''}view=cm&fs=1&to=${encodeURIComponent(to)}`;
@@ -2383,14 +2385,14 @@ function emHero(s, st, camps, list) {
     <div class="emhero-top"><div class="min0"><div class="eyebrow">Email command center</div><div class="emst"><i class="emdot ${dot}" aria-hidden="true"></i><b>${esc(title)}</b></div><div class="meta">${esc(sub)}</div></div>
       ${mode !== 'paused' ? '<button class="btn" data-act="em-pause">Pause</button>' : '<button class="btn primary" data-act="em-start">Start sending</button>'}</div>
     ${engineOk ? `<div class="progress"><div class="bar ${sent >= cap ? 'good' : ''}"><i style="width:${Math.min(100, Math.round(sent / Math.max(1, cap) * 100))}%"></i></div><span class="meta mono">${sent}/${cap} today</span></div>` : ''}
-    ${facts.length ? `<div class="meta">${facts.join(' · ')}</div>` : ''}
+    ${facts.length ? `<div class="meta">${facts.slice(0, 2).join(' · ')}</div>${facts.length > 2 ? `<div class="meta">${facts.slice(2).join(' · ')}</div>` : ''}` : ''}
     ${alerts}
     <div class="btnrow">${mode === 'later' ? '<button class="btn sm" data-act="em-launch">Change the start day</button>' : ''}<button class="btn sm" data-act="em-import">Add leads</button><button class="btn sm" data-act="em-senders">Send more</button><button class="btn sm" data-act="em-settings">Settings</button><button class="btn sm ghost" data-act="em-setup">Engine setup</button></div>
   </section>`;
 }
 function emChecklist(s, camps, list) {
   const items = [
-    emEngineOk() && emOutdated() ? [false, 'Update the engine', 'Supabase runs an older copy. Copy the new code, deploy it and run the SQL again (Engine setup, steps 5 and 6).', 'em-setup', 'Update']
+    emEngineOk() && emOutdated() ? [false, 'Update the engine', emFinderRan() ? 'Supabase runs an older copy. Copy the new code and deploy it over the old one (Engine setup, step 5). About 3 minutes; the schedule stays as it is.' : 'Supabase runs an older copy. Copy the new code, deploy it and run the SQL again (Engine setup, steps 5 and 6).', 'em-setup', 'Update']
       : [emEngineOk(), 'Connect your Gmail', 'The engine runs in your Supabase project and sends from your own inbox.', 'em-setup', 'Set it up'],
     [!!String(s.address || '').trim(), 'Add a mailing address', 'The law requires one at the bottom of every sales email. A PO box or virtual mailbox works.', 'em-settings', 'Add it'],
     [list.length > 0 || s.finder.enabled, 'Add leads', 'Turn on the finder, or add outreach-list.csv or any spreadsheet with emails.', 'em-finder', 'Set up the finder'],
