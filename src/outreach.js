@@ -286,7 +286,7 @@ export const campaignFor = segment => (['dental', 'services'].includes(segment) 
 export const liveCampaign = c => !!(c && c.status === 'running' && c.reviewed && (c.steps || []).length);
 
 export const leadIdFor = email => 'e-' + String(email || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-export const domainOf = u => { try { return new URL(/^https?:\/\//i.test(String(u)) ? String(u) : 'https://' + String(u)).hostname.replace(/^www\./i, '').toLowerCase(); } catch (e) { return ''; } };
+export const domainOf = u => { if (!u || !String(u).trim()) return ''; try { return new URL(/^https?:\/\//i.test(String(u)) ? String(u) : 'https://' + String(u).trim()).hostname.replace(/^www\./i, '').toLowerCase(); } catch (e) { return ''; } };
 // Shared mail services: an address there says nothing about which business it belongs to.
 const FREE_DOMAINS = new Set(['gmail.com', 'googlemail.com', 'yahoo.com', 'ymail.com', 'hotmail.com', 'outlook.com', 'live.com', 'msn.com', 'aol.com', 'icloud.com', 'me.com', 'mac.com',
   'comcast.net', 'att.net', 'sbcglobal.net', 'bellsouth.net', 'cox.net', 'charter.net', 'verizon.net', 'mchsi.com', 'q.com', 'centurylink.net', 'frontier.com', 'protonmail.com', 'proton.me', 'mail.com', 'gmx.com', 'zoho.com']);

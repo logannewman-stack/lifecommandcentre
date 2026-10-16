@@ -10,7 +10,7 @@ import { supabase, config as sbConfig, configSource, saveConfig, clearConfig } f
 import { createDb } from './db.js';
 import { parseQuick } from './quickadd.js';
 import { parseDayText, buildDay } from './planday.js';
-import { SEQ_STATUS, DEFAULT_CAMPAIGNS, wordingUpdates, withDefaults as outSettings, sendingState, inLine, launchWrites, composeEmail, segmentOf, parseCSV, importLeads, campaignStats, tzFor, localClock, dailyCap, nextSendDay, upNext, isEmail, SUPPRESS, HOT, LIVE_SEQ, stagePatch, replyPatch, enrollPatch, heatOf, liveCampaign, leadIdFor } from './outreach.js';
+import { SEQ_STATUS, DEFAULT_CAMPAIGNS, wordingUpdates, withDefaults as outSettings, sendingState, inLine, launchWrites, composeEmail, segmentOf, parseCSV, importLeads, campaignStats, tzFor, localClock, dailyCap, nextSendDay, upNext, isEmail, SUPPRESS, HOT, LIVE_SEQ, stagePatch, replyPatch, enrollPatch, campaignFor, heatOf, liveCampaign, leadIdFor } from './outreach.js';
 import REMINDERS_FN from '../supabase/functions/reminders/index.ts?raw';
 import CRON_SQL from '../supabase/functions/reminders/cron.sql?raw';
 import ASSISTANT_FN from '../supabase/functions/assistant/index.ts?raw';
@@ -2095,6 +2095,9 @@ const emGmail = () => (S.outEng && S.outEng.gmail && S.outEng.gmail.email) || em
 const emSenders = () => (Array.isArray(emSettings().senders) ? emSettings().senders : []).filter(x => x && x.email);
 const emToday = (st, today) => st.today && st.today.date === today ? st.today : null;
 // Today's limit for every address together, and one campaign's (its own limit for each address that sends it).
+// Businesses with an email that never got a campaign, early in the pipeline: mostly your call list, whose
+// emails the engine's lookup reads off their websites (outreach/lookup).
+const emNoCampaign = () => { const sup = emSuppressed(); return allLeads().filter(l => isEmail(l.email) && !(l.seq && l.seq.campaign) && !l.dnc && !l.emailBad && !sup.has(String(l.email).toLowerCase()) && !['Partner','Client'].includes(l.type) && ['New lead','Contacted'].includes(l.stage || 'New lead')); };
 const emCapToday = (s, st, today) => { const t = emToday(st, today); return t && Number(t.cap) > 0 ? Number(t.cap) : dailyCap(s, today); };
 const emCampCap = (c, st, today) => { const t = emToday(st, today), a = t && Array.isArray(t.addrs) ? t.addrs.filter(x => !x.campaign || x.campaign === c.id).length : 1; return (Number(c.cap) || 30) * Math.max(1, a); };
 // The engine Supabase runs is older than the copy in this app (from its status check or its last run).
@@ -2537,6 +2540,7 @@ function emLeadsCard(s, camps) {
   return `<section class="card leadscard ord-5"><div class="card-h"><h2>Leads</h2><button class="btn sm" data-act="em-import">Add leads</button></div>
     <div class="fcamps">${rows || '<div class="meta">Approve a campaign and its leads show up here.</div>'}</div>
     <div class="meta">Your scraper's CSV files are the cheapest. Find with Claude runs on your own Claude plan, at no extra cost.</div>
+    ${emCallListBlock()}
     <div class="finder sub"><div class="sub-h"><b>Lead finder</b><span class="pill ${state[1]}">${state[0]}</span></div>
       <div class="meta">${f.enabled && !st.lastRun ? 'Waiting for its first run. It runs every 15 minutes.' : f.enabled || td.found || mo.found ? [`${td.found} found today`, `${dollars(td.spent)} of ${dollars(Number(f.budget) || 5)} today`, mo.found ? `${mo.found} this month for ${dollars(mo.spent)}` : '', costEach ? `${Math.round(costEach * 100)}¢ a lead` : ''].filter(Boolean).join(' · ') : 'Claude searches the web every 15 minutes, about 70¢ a lead. Your scraper is cheaper.'}</div>
       ${f.enabled ? `<div class="meta">It keeps ${keep} leads waiting for each campaign and adds more as emails go out.</div>` : ''}
@@ -2547,6 +2551,19 @@ function emLeadsCard(s, camps) {
       <div class="btnrow"><button class="btn sm" data-act="em-finder-toggle">${f.enabled ? 'Pause' : 'Turn on'}</button>${f.enabled && emEngineOk() ? `<button class="btn sm" data-act="em-find-now" ${S.emFindBusy ? 'disabled' : ''}>${S.emFindBusy ? 'Searching… up to 2 min' : 'Search now'}</button>` : ''}<button class="btn sm ghost" data-act="em-finder">Settings</button></div>
     </div>
   </section>`;
+}
+// Your call list: the engine reads the emails off the websites of leads you already have (free), and
+// one tap starts each business on the campaign for its type. They stay on your call list too.
+function emCallListBlock() {
+  const lk = outDoc('lookup') || {}, ready = emNoCampaign(), left = Number(lk.left) || 0, total = lk.total || {};
+  if (!ready.length && !left && !total.found) return '';
+  const by = {}; ready.forEach(l => { const cid = campaignFor(l.segment || segmentOf(l.kind || l.business)); by[cid] = (by[cid] || 0) + 1; });
+  const split = Object.entries(by).map(([cid, n]) => `${n} in ${((S.data.campaigns || {})[cid] || {}).name || cid}`).join(' and ');
+  return `<div class="sub calllist"><div class="sub-h"><b>Your call list</b>${ready.length ? `<span class="pill good">${plural(ready.length, 'email')} ready</span>` : ''}</div>
+    <div class="meta">${left ? `Reading your leads' websites for their emails, free: ${total.checked || 0} checked, ${total.found || 0} found, ${left} to go.` : `Emails read off your leads' websites: ${total.found || 0} found${total.checked ? ` of ${total.checked} checked` : ''}.`}</div>
+    ${ready.length ? `<div class="meta">${esc(ready.slice(0, 4).map(l => l.name || l.email).join(', '))}${ready.length > 4 ? ` and ${ready.length - 4} more` : ''} ${ready.length === 1 ? 'has' : 'have'} an email and no campaign yet. An email before you call warms the call up, and they stay on your call list.</div>
+    <div class="btnrow">${S.confirm === 'calls-go' ? `<button class="btn sm primary" data-act="em-calls-go">Start ${esc(split)}</button><button class="btn sm ghost" data-act="confirm" data-c="">Not now</button>` : `<button class="btn sm primary" data-act="confirm" data-c="calls-go">Start their emails</button>`}</div>` : ''}
+  </div>`;
 }
 // Every campaign in one card: the two cold ones, then the automatic follow-ups (off until you turn them on).
 function emCampsCard(camps, list, st, s) {
@@ -2954,9 +2971,10 @@ function emLaunchSheet() {
   const firstDay = s.days.includes(dowOf(t)) && nowMin() < toMin(s.end) ? t : nextSendDay(addDays(t, 1), s.days);
   const startOn = draft('lx-date', s.startOn && s.startOn >= t ? s.startOn : firstDay);
   const addr = draft('lx-address', s.address || ''), preview = {...s, address:addr};
-  const outdated = eng.fn === 'ok' && (eng.version || 1) < OUTREACH_V, gm = eng.gmail || {};
+  // Before version 3 the engine didn't wait for a start day; a newer one than that is safe to start with.
+  const old = eng.fn === 'ok' && (eng.version || 1) < OUTREACH_V, outdated = old && (eng.version || 1) < 3, gm = eng.gmail || {};
   const engineOk = eng.fn === 'ok' && !outdated && !!gm.ok;
-  const engLine = engineOk ? `Up to date, sending from <b>${esc(gm.email)}</b>.`
+  const engLine = engineOk ? (old ? `Sending from <b>${esc(gm.email)}</b>. A newer engine is ready: Engine setup, step 5, when you have 3 minutes.` : `Up to date, sending from <b>${esc(gm.email)}</b>.`)
     : eng.checking || !eng.fn ? 'Checking the engine…'
     : outdated ? 'Supabase runs an older engine that won\'t wait for your start day. On a laptop: Engine setup, step 5 (copy the code, deploy), then step 6 (run the SQL). About 5 minutes.'
     : eng.fn === 'ok' ? 'The engine is there, but Gmail isn\'t connected yet. Engine setup, steps 1 to 4, on a laptop.'
@@ -3024,9 +3042,9 @@ function emSetStatus(ids, op) {
 }
 // Starts a campaign for some leads: anyone with an email who isn't on the do-not-contact list, isn't
 // in a campaign already and, for a cold campaign, isn't already talking to you, closed or lost.
-function enrollLeads(ids, cid) {
+function enrollLeads(ids, cid, acc) {
   const c = (S.data.campaigns || {})[cid]; if (!c) return {n:0, skipped:ids.length};
-  const sup = emSuppressed(), ops = [], t = todayISO(); let n = 0;
+  const sup = emSuppressed(), ops = acc || [], t = todayISO(); let n = 0;
   ids.forEach(id => {
     const l = (S.data.leads || {})[id];
     if (!l || !isEmail(l.email) || l.dnc || l.emailBad || sup.has(String(l.email).toLowerCase())) return;
@@ -3036,7 +3054,7 @@ function enrollLeads(ids, cid) {
     ops.push({patch:['leads', id, backOf(l, patch)]});
     patchDoc('leads', id, {...patch, updatedAt:Date.now()}); n++;
   });
-  if (n) S.lastUndo = {type:'restore', ops};
+  if (n && !acc) S.lastUndo = {type:'restore', ops};
   return {n, skipped:ids.length - n};
 }
 // A reply Claude (or the rules) sorted wrong: the lead and the do-not-contact list follow your call.
@@ -3252,6 +3270,14 @@ function handle(act, el, ev) {
     case 'plan-all': S.allUpcoming = !S.allUpcoming; render(); break;
     case 'calls-more': S.callsShown = (S.callsShown || 15) + 15; render(); break;
     case 'em-today-all': S.emTodayAll = !S.emTodayAll; render(); break;
+    case 'em-calls-go': {
+      const by = {}; emNoCampaign().forEach(l => { const cid = campaignFor(l.segment || segmentOf(l.kind || l.business)); (by[cid] = by[cid] || []).push(l.id); });
+      const ops = []; let n = 0;
+      Object.entries(by).forEach(([cid, ids]) => { const r = enrollLeads(ids, cid, ops); n += r.n; });
+      S.confirm = null;
+      if (n) S.lastUndo = {type:'restore', ops};
+      toast(n ? `${plural(n, 'business', 'businesses')} from your call list ${n === 1 ? 'is' : 'are'} in line for a first email.` : 'Nobody to start right now.', !!n); render(); break;
+    }
     case 'em-senders': clearDrafts('sa-'); S.confirm = null; S.modal = {type:'em-senders'}; render(); outreachCheck(true); break;
     case 'em-sender-pause': case 'em-sender-remove': {
       const prev = emSenders(), x = prev[+d.i]; if (!x) break;

@@ -11,12 +11,14 @@
 //   stage's campaign (Check back for Not now, Proposal follow-up for Proposal sent) once you approve it.
 // - Every 15 minutes the finder adds new leads until it reaches the day's target: Claude searches the
 //   web for local businesses by type and city, and the function reads each business's own website
-//   for a contact email. It stays under a daily dollar limit and never adds a business twice.
+//   for a contact email. It stays under a daily dollar limit and never adds a business twice. The same
+//   job first looks up emails, for free, for leads you already have with a website and no email (your
+//   call list): it only fills the address in, and you start a campaign for them in the app.
 // Deploy it as "outreach" with "Verify JWT" turned off; the app's Email tab walks you through it.
 //
 //   GET  ?status=1             → {ok, version, gmail, sendAs, hasKey, lastRun, lastError} for the app's setup check
 //   POST                       → the send job: replies, pipeline, one email per address (the 10-minute cron job)
-//   POST ?job=find             → the finder (the 15-minute cron job; a {"job":"find"} body works too)
+//   POST ?job=find             → the email lookup, then the finder (the 15-minute cron job; a {"job":"find"} body works too)
 //   POST ?test=1&campaign=<id> → signed in: sends you a sample of a campaign's first email (&from=<address> sends it from that one)
 //   GET/POST ?u=<token>        → the unsubscribe link in each email's headers
 //
@@ -29,7 +31,7 @@ import * as webpush from "jsr:@negrel/webpush@0.5.0";
 import Anthropic from "npm:@anthropic-ai/sdk@0.131.0";
 
 // ---- pure logic (plain JavaScript; the tests import this section) ----
-export const FN_VERSION = 8;
+export const FN_VERSION = 9;
 export const MODEL = "claude-opus-5-5";
 export const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 export const SEND_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -437,7 +439,7 @@ export function extractEmails(html: any) {
   for (const m of text.matchAll(/([a-z0-9._%+-]{1,64})\s*[\[(]\s*at\s*[\])]\s*([a-z0-9-]+(?:\s*(?:[\[(]\s*dot\s*[\])]|\.)\s*[a-z0-9-]+)+)/gi)) add(`${m[1]}@${m[2].replace(/\s*[\[(]\s*dot\s*[\])]\s*/gi, ".").replace(/\s+/g, "")}`, "text");
   return [...out.entries()].map(([email, how]) => ({ email, how }));
 }
-export const domainOf = (u: any) => { try { return new URL(/^https?:\/\//i.test(String(u)) ? String(u) : "https://" + String(u)).hostname.replace(/^www\./i, "").toLowerCase(); } catch (_e) { return ""; } };
+export const domainOf = (u: any) => { if (!u || !String(u).trim()) return ""; try { return new URL(/^https?:\/\//i.test(String(u)) ? String(u) : "https://" + String(u).trim()).hostname.replace(/^www\./i, "").toLowerCase(); } catch (_e) { return ""; } };
 // The pages worth reading for an email, besides the homepage: contact first.
 export function contactLinks(html: any, base: string) {
   const out: string[] = [], host = domainOf(base);
@@ -531,6 +533,14 @@ export function knownFor(leads: any, job: any, max = 40) {
   return out;
 }
 export const leadIdFor = (email: any) => "e-" + String(email || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+// A lead whose email the lookup can find: a business (not a partner or client) early in the pipeline, with
+// its own website and no email yet, not looked up in the last 90 days.
+export function needsEmail(l: any, at: number) {
+  if (!l || l.email || l.dnc || l.emailBad || ["Partner", "Client"].includes(l.type) || !["New lead", "Contacted", "Not now"].includes(l.stage || "New lead")) return false;
+  const dm = domainOf(l.website);
+  if (!dm || BLOCKED_SITES.test(dm)) return false;
+  return !l.emailCheckedAt || at - Number(l.emailCheckedAt) > 90 * 86400000;
+}
 // A found business as a new lead, already in its campaign (or waiting for you when "Check each one" is on).
 export function finderLead(b: any, found: any, job: any, now: any, today: string, hold = false) {
   const at = msOf(now), parts = String(job.area || "").split(","), state = (b.state || String(parts[1] || "").trim()).toUpperCase().slice(0, 2), city = b.city || parts[0].trim();
@@ -977,6 +987,41 @@ async function hasMx(domain: string) {
     return Array.isArray(j.Answer) && j.Answer.some((a: any) => a.type === 15);
   } catch (_e) { return true; }
 }
+// Emails for leads you already have, for free (no Claude): up to 8 a run, each business's own pages read
+// the way the finder reads them. A found address is only filled in (never one another lead or your
+// do-not-contact list has); nothing is enrolled. Progress goes to outreach/lookup for the app.
+export async function runLookup(admin: any, owner: string, d: any, now: Date, deadline = Date.now() + 40000, crawl: any = crawlSite, mx: any = hasMx) {
+  const at = now.getTime(), today = localClock(withDefaults(d.outreach && d.outreach.settings).tz, now).date;
+  const todo = (Object.entries(d.leads || {}) as any).filter(([, l]: any) => needsEmail(l, at));
+  const st: any = { ...((d.outreach && d.outreach.lookup) || {}) };
+  if (!st.today || st.today.date !== today) st.today = { date: today, checked: 0, found: 0 };
+  if (!todo.length) {
+    if (st.left) { st.left = 0; st.lastRun = now.toISOString(); st.version = FN_VERSION; await put(admin, owner, "outreach", "lookup", st); }
+    return { checked: 0, found: 0, left: 0 };
+  }
+  todo.sort(([a, x]: any, [b, y]: any) => (Number(x.emailCheckedAt) || 0) - (Number(y.emailCheckedAt) || 0) || (Number(x.createdAt) || 0) - (Number(y.createdAt) || 0) || (a < b ? -1 : 1));
+  const batch = todo.slice(0, 8), index = leadIndex(d.leads), suppressed = new Set(Object.keys(d.suppress || {}).map((e) => e.toLowerCase()));
+  const found: any[] = [];
+  let checked = 0;
+  await Promise.all(batch.map(async ([id, l]: any) => {
+    if (Date.now() > deadline - 4000) return;
+    checked++;
+    const got: any = pickEmail(await crawl(l.website, deadline - 3000, null), domainOf(l.website));
+    let email = got && !index.emails.has(got.email) && !suppressed.has(got.email) ? got.email : "";
+    if (email) index.emails.add(email);
+    if (email && !(await mx(email.split("@")[1]))) email = "";
+    const updated = await casUpdate(admin, owner, "leads", id, (x) => (!x || x.email) ? null : email
+      ? { ...x, email, emailFound: { at, page: got.page || "", how: got.how || "" }, emailCheckedAt: at, updatedAt: at }
+      : { ...x, emailCheckedAt: at });
+    if (updated) { d.leads[id] = updated; if (email) found.push({ at: now.toISOString(), id, name: bizName(updated), email }); }
+  }));
+  st.today.checked += checked; st.today.found += found.length;
+  st.total = { checked: (Number(st.total && st.total.checked) || 0) + checked, found: (Number(st.total && st.total.found) || 0) + found.length };
+  st.left = Math.max(0, todo.length - checked); st.recent = [...found, ...(st.recent || [])].slice(0, 12);
+  st.lastRun = now.toISOString(); st.version = FN_VERSION;
+  await put(admin, owner, "outreach", "lookup", st);
+  return { checked, found: found.length, left: st.left };
+}
 export async function runFinder(admin: any, owner: string, d: any, apiKey: string, now: Date, deadline = Date.now() + 100000, search: any = claudeFind, crawl: any = crawlSite, mx: any = hasMx) {
   const s = withDefaults(d.outreach.settings), f = s.finder, st: any = { ...(d.outreach.finder || {}) };
   const today = localClock(s.tz, now).date, month = today.slice(0, 7);
@@ -1086,16 +1131,20 @@ Deno.serve(async (req: Request) => {
       return json({ ok: true, to: me, from: sender.email, missing: mail.missing });
     }
 
-    // The finder: every account that turned it on.
+    // The email lookup for every account with email settings (free, about 25 seconds at most), then the
+    // finder for every account that turned it on.
     if (url.searchParams.get("job") === "find" || body.job === "find") {
       const owners = await loadOwners(admin, ["outreach", "leads", "suppress"]);
-      const results: any = {};
+      const results: any = {}, lookups: any = {};
       for (const [owner, d] of Object.entries(owners) as any) {
-        if (!d.outreach || !d.outreach.settings || !withDefaults(d.outreach.settings).finder.enabled) continue;
+        if (!d.outreach || !d.outreach.settings) continue;
+        try { lookups[owner] = await runLookup(admin, owner, d, new Date(), Math.min(started + 110000, Date.now() + 25000)); }
+        catch (e) { console.error("lookup", e); lookups[owner] = { error: msgOf(e) }; }
+        if (!withDefaults(d.outreach.settings).finder.enabled) continue;
         try { results[owner] = await runFinder(admin, owner, d, apiKey, new Date(), started + 110000); }
         catch (e) { console.error(e); results[owner] = { error: msgOf(e) }; }
       }
-      return json({ ok: true, results });
+      return json({ ok: true, results, lookups });
     }
 
     // The send job: every account that saved email settings.
