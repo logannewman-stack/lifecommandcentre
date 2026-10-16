@@ -4,18 +4,20 @@
 // - Every 10 minutes it reads new replies and sends the next email. Replies move their lead through the
 //   pipeline (interested to Talking, not now to Not now, no to Lost), stop its emails, and the hot ones
 //   are starred, labeled LCC/Hot, pushed to your phone and forwarded if you set an address. Emails go
-//   from your own Gmail one at a time, on your sending days and hours in each business's time zone,
-//   under a daily limit that grows while the mailbox warms up. Leads parked in a stage get that stage's
-//   campaign (Check back for Not now, Proposal follow-up for Proposal sent) once you approve it.
+//   from your own Gmail, on your sending days and hours in each business's time zone, under a daily
+//   limit that grows while the address warms up. Extra addresses you add in Settings (Gmail's "Send
+//   mail as" aliases) each send too, one email per address per run, each with its own warm-up, and a
+//   lead's follow-ups go from the address that sent its first email. Leads parked in a stage get that
+//   stage's campaign (Check back for Not now, Proposal follow-up for Proposal sent) once you approve it.
 // - Every 15 minutes the finder adds new leads until it reaches the day's target: Claude searches the
 //   web for local businesses by type and city, and the function reads each business's own website
 //   for a contact email. It stays under a daily dollar limit and never adds a business twice.
 // Deploy it as "outreach" with "Verify JWT" turned off; the app's Email tab walks you through it.
 //
-//   GET  ?status=1             → {ok, version, gmail, hasKey, lastRun, lastError} for the app's setup check
-//   POST                       → the send job: replies, pipeline, one email (the 10-minute cron job)
+//   GET  ?status=1             → {ok, version, gmail, sendAs, hasKey, lastRun, lastError} for the app's setup check
+//   POST                       → the send job: replies, pipeline, one email per address (the 10-minute cron job)
 //   POST ?job=find             → the finder (the 15-minute cron job; a {"job":"find"} body works too)
-//   POST ?test=1&campaign=<id> → signed in: sends you a sample of a campaign's first email
+//   POST ?test=1&campaign=<id> → signed in: sends you a sample of a campaign's first email (&from=<address> sends it from that one)
 //   GET/POST ?u=<token>        → the unsubscribe link in each email's headers
 //
 // Secrets (Edge Functions › Secrets): GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET and GMAIL_REFRESH_TOKEN, plus
@@ -27,7 +29,7 @@ import * as webpush from "jsr:@negrel/webpush@0.5.0";
 import Anthropic from "npm:@anthropic-ai/sdk@0.131.0";
 
 // ---- pure logic (plain JavaScript; the tests import this section) ----
-export const FN_VERSION = 7;
+export const FN_VERSION = 8;
 export const MODEL = "claude-opus-5-5";
 export const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 export const SEND_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -229,29 +231,67 @@ export function enrollPatch(l: any, cid: string, today: string, hold: boolean) {
 }
 export const liveCampaign = (c: any) => !!(c && c.status === "running" && c.reviewed && (c.steps || []).length);
 
+// The addresses emails go out from: your Gmail address first, then the extra ones in Settings
+// (settings.senders: [{email, name, campaign, paused}]) that Gmail lists as ready "Send mail as" aliases
+// (`verified`, lowercased; null skips that check). `campaign` limits an address to one campaign.
+export function senderList(settings: any, me: string, verified: any = null) {
+  const s = withDefaults(settings), main = String(me || "").trim().toLowerCase(), seen = new Set([main]);
+  const out: any[] = [{ email: main, name: s.fromName, primary: true, campaign: "" }];
+  for (const x of Array.isArray(s.senders) ? s.senders : []) {
+    const email = String((x && x.email) || "").trim().toLowerCase();
+    if (!isEmail(email) || seen.has(email) || (x && x.paused)) continue;
+    seen.add(email);
+    if (verified && !verified.has(email)) continue;
+    out.push({ email, name: String((x && x.name) || "").trim() || s.fromName, primary: false, campaign: String((x && x.campaign) || "") });
+  }
+  return out;
+}
+// One address's day: its warm-up limit (your main address counts from settings.startedOn, an extra one
+// from state.senders[email].startedOn), what it sent today, per campaign, and when it last sent.
+// The main address is everything no extra address sent, so a count from before version 8 still adds up.
+export function senderDay(settings: any, state: any, sender: any, today: string) {
+  const s = withDefaults(settings), st = state || {}, t = st.today && st.today.date === today ? st.today : { sent: 0, by: {} };
+  const ss = ((st.senders || {})[sender.email]) || {}, from = t.from || {}, fromBy = t.fromBy || {};
+  const cap = dailyCap({ ...s, startedOn: sender.primary ? s.startedOn : ss.startedOn }, today);
+  if (!sender.primary) return { cap, sent: Number(from[sender.email]) || 0, by: fromBy[sender.email] || {}, last: ss.lastSendAt || null };
+  const others = Object.keys(from).filter((e) => e !== sender.email), by: any = {};
+  for (const [cid, n] of Object.entries(t.by || {}) as any) by[cid] = Math.max(0, (Number(n) || 0) - others.reduce((a, e) => a + (Number((fromBy[e] || {})[cid]) || 0), 0));
+  return { cap, sent: Math.max(0, (Number(t.sent) || 0) - others.reduce((a, e) => a + (Number(from[e]) || 0), 0)), by, last: ss.lastSendAt || st.lastSendAt || null };
+}
 // What to send now: follow-ups that are due first, then new contacts, campaigns taking turns,
-// each campaign under its own daily limit and the inbox under its warm-up limit.
+// each campaign under its own daily limit and the address under its warm-up limit.
+// With a `sender` (one of `senders`), only what that address sends: a follow-up from the address that
+// sent the first email (your main one when that address is gone), a first email from any address that
+// sends its campaign; each campaign's limit then counts per address. `taken` skips leads picked already.
 // Returns {id, step, campaign} or {why}: paused | address | start | cap | gap | no-campaign | nothing-due.
-export function pickNext({ leads, campaigns, settings, state, suppressed, now }: any) {
+export function pickNext({ leads, campaigns, settings, state, suppressed, now, sender = null, senders = null, taken = null }: any) {
   const s = withDefaults(settings);
   const today = localClock(s.tz, now).date, on = sendingState(s, today);
   if (on === "paused") return { why: "paused" };
   if (!String(s.address || "").trim()) return { why: "address" };
   if (on === "later") return { why: "start", startOn: s.startOn };
   const counts = state && state.today && state.today.date === today ? state.today : { date: today, sent: 0, by: {} };
-  const cap = dailyCap(s, today);
-  if ((counts.sent || 0) >= cap) return { why: "cap", cap };
-  if (state && state.lastSendAt && now.getTime() - Date.parse(state.lastSendAt) < num(s.gap, 6) * 60000) return { why: "gap" };
+  const day = sender ? senderDay(s, state, sender, today) : null;
+  const cap = day ? day.cap : dailyCap(s, today);
+  if ((day ? day.sent : counts.sent || 0) >= cap) return { why: "cap", cap };
+  const last = day ? day.last : state && state.lastSendAt;
+  if (last && now.getTime() - Date.parse(last) < num(s.gap, 6) * 60000) return { why: "gap" };
   if (!Object.values(campaigns || {}).some(liveCampaign)) return { why: "no-campaign" };
+  const known = new Set((senders || (sender ? [sender] : [])).map((x: any) => x.email)), main = ((senders || []).find((x: any) => x.primary) || {}).email;
   let best: any = null;
   for (const [id, l] of Object.entries(leads || {}) as any) {
+    if (taken && taken.has(id)) continue;
     const q = l && l.seq;
     if (!q || !["queued", "active"].includes(q.status) || q.sendingStep != null || l.dnc || l.emailBad) continue;
     const c = (campaigns || {})[q.campaign]; if (!liveCampaign(c)) continue;
     const email = String(l.email || "").trim().toLowerCase();
     if (!isEmail(email) || (suppressed && suppressed.has(email))) continue;
     const step = Number(q.step) || 0; if (step >= c.steps.length) continue;
-    const done = (counts.by || {})[q.campaign] || 0; if (done >= num(c.cap, 30)) continue;
+    if (sender) {
+      const from = String(q.from || "").toLowerCase();
+      if (step > 0 ? (known.has(from) ? from : main || sender.email) !== sender.email : sender.campaign && sender.campaign !== q.campaign) continue;
+    }
+    const done = (day ? day.by : counts.by || {})[q.campaign] || 0; if (done >= num(c.cap, 30)) continue;
     const clock = localClock(tzFor(l, s), now);
     if (!s.days.includes(clock.dow) || clock.minutes < toMin(s.start) || clock.minutes >= toMin(s.end)) continue;
     if (step > 0 && (!q.nextOn || q.nextOn > clock.date)) continue;
@@ -262,15 +302,17 @@ export function pickNext({ leads, campaigns, settings, state, suppressed, now }:
 }
 function cmpRank(a: any[], b: any[]) { for (let i = 0; i < a.length; i++) { if (a[i] < b[i]) return -1; if (a[i] > b[i]) return 1; } return 0; }
 // The lead after a step went out: the next step's day or the end, and the first email moves a new lead to Contacted.
-export function afterSend(l: any, c: any, settings: any, step: number, sent: any, now: any) {
+export function afterSend(l: any, c: any, settings: any, step: number, sent: any, now: any, from = "") {
   const s = withDefaults(settings), steps = c.steps || [], localDate = localClock(tzFor(l, s), now).date, more = step + 1 < steps.length;
   const q = l.seq || {};
   // Stopped, paused or replied while the email was going out: the email is logged, the status stays.
   const kept = !!q.status && !["queued", "active"].includes(q.status);
   const seq = { ...q, step: step + 1, status: kept ? q.status : more ? "active" : "done", lastAt: now.toISOString(), sendingStep: null, sendingAt: null, lastError: null, failCount: 0,
     nextOn: !kept && more ? addSendDays(localDate, Math.max(1, num(steps[step + 1].wait, 3)), s.days) : null,
-    threadId: q.threadId || sent.threadId, rfcId: q.rfcId || sent.rfcId || "" };
-  const out = { ...l, seq, sentLog: [...(Array.isArray(l.sentLog) ? l.sentLog : []), { at: now.toISOString(), campaign: q.campaign, step, id: sent.id }].slice(-30),
+    threadId: q.threadId || sent.threadId, rfcId: q.rfcId || sent.rfcId || "",
+    // The address the thread started from, so the follow-ups come from it too.
+    from: step === 0 ? from || q.from || "" : q.from || from || "" };
+  const out = { ...l, seq, sentLog: [...(Array.isArray(l.sentLog) ? l.sentLog : []), { at: now.toISOString(), campaign: q.campaign, step, id: sent.id, ...(from ? { from } : {}) }].slice(-30),
     threads: [...new Set([...(l.threads || []), seq.threadId].filter(Boolean))].slice(-10) };
   if ((l.stage || "New lead") === "New lead") Object.assign(out, stagePatch(l, "Contacted", "email", now));
   return out;
@@ -554,6 +596,14 @@ async function sendMail(token: string, raw: string, threadId?: string) {
   } catch (_e) { /* threading still works through threadId */ }
   return { id: sent.id, threadId: sent.threadId, rfcId };
 }
+// Gmail's "Send mail as" addresses as {email, name, primary, ok}. An extra address is ready once Gmail
+// accepted it (Gmail › Settings › Accounts › Send mail as).
+async function sendAsList(token: string) {
+  const j = await gm(token, "settings/sendAs");
+  return (j.sendAs || []).map((x: any) => ({ email: String(x.sendAsEmail || "").toLowerCase(), name: x.displayName || "", primary: !!x.isPrimary,
+    ok: !!x.isPrimary || x.verificationStatus === "accepted", status: x.isPrimary ? "primary" : x.verificationStatus || "" }));
+}
+const sendAsReady = async (token: string) => new Set((await sendAsList(token)).filter((x: any) => x.ok).map((x: any) => x.email));
 // New messages since the last run, from Gmail's history (or the last 4 days on the first run).
 async function newMessages(token: string, state: any) {
   const out: any[] = [];
@@ -777,48 +827,74 @@ export async function runOwner(admin: any, owner: string, d: any, token: string,
       if (updated) { d.leads[e.id] = updated; report.enrolled++; }
     }
 
-    // 3. Sending: at most one email per run, so the day's emails are spread out.
+    // 3. Sending: at most one email per address per run, so the day's emails are spread out. Extra
+    // addresses send only once Gmail lists them as ready "Send mail as" aliases.
     if (!state.today || state.today.date !== today) state.today = { date: today, sent: 0, by: {} };
-    const pick: any = pickNext({ leads: d.leads, campaigns: d.campaigns, settings, state, suppressed, now });
-    report.why = pick.why || "";
-    if (pick.id && Date.now() < deadline - 20000) {
+    let verified: any = new Set();
+    if ((Array.isArray(settings.senders) ? settings.senders : []).some((x: any) => x && isEmail(x.email) && !x.paused)) {
+      try { verified = await sendAsReady(token); state.sendAsError = null; }
+      catch (e) { console.error("sendAs", msgOf(e)); state.sendAsError = msgOf(e); }
+    } else state.sendAsError = null;
+    const senders = senderList(settings, me, verified), taken = new Set<string>(), whys: string[] = [];
+    state.senders = { ...(state.senders || {}) };
+    // Today's addresses and limits, for the app: {email, campaign, cap} each, and the total.
+    state.today.addrs = senders.map((x: any) => ({ email: x.email, campaign: x.campaign, cap: senderDay(settings, state, x, today).cap }));
+    state.today.cap = state.today.addrs.reduce((a: number, x: any) => a + x.cap, 0);
+    const mine = (email: string) => (state.senders[email] = { ...(state.senders[email] || {}) });
+    for (const sender of senders) {
+      if (Date.now() > deadline - 20000) break;
+      if (!sender.primary && mine(sender.email).offOn === today) { whys.push("sender"); continue; }
+      const pick: any = pickNext({ leads: d.leads, campaigns: d.campaigns, settings, state, suppressed, now, sender, senders, taken });
+      if (!pick.id) { whys.push(pick.why || ""); continue; }
+      taken.add(pick.id);
       const c = d.campaigns[pick.campaign], l = d.leads[pick.id];
       const mail = composeEmail(l, c, settings, pick.step);
       if (!mail || mail.missing.length) {
-        report.why = "template"; state.lastError = `${c.name || pick.campaign}: fill in ${mail ? mail.missing.join(", ") : "the email"} before it can send.`;
-      } else {
-        // Claim the slot and mark the lead before sending: if saving fails after Gmail accepted the email,
-        // the marker keeps it from going out twice (the app shows it under Needs a look).
-        state.lastSendAt = now.toISOString();
-        await put(admin, owner, "outreach", "state", state);
-        const claimed = await casUpdate(admin, owner, "leads", pick.id, (x) => (x && x.seq && x.seq.campaign === pick.campaign && ["queued", "active"].includes(x.seq.status) &&
-          x.seq.sendingStep == null && (Number(x.seq.step) || 0) === pick.step && !x.dnc) ? { ...x, seq: { ...x.seq, sendingStep: pick.step, sendingAt: now.toISOString() } } : null);
-        if (claimed) {
-          const raw = buildMime({ from: `${settings.fromName} <${me}>`, to: String(claimed.email).trim(), subject: mail.subject, text: mail.text,
-            inReplyTo: pick.step > 0 ? claimed.seq.rfcId : "", unsubUrl: await unsubUrl(owner, pick.id), unsubMail: me });
-          let sent: any;
-          try { sent = await sendMail(token, raw, pick.step > 0 ? claimed.seq.threadId || undefined : undefined); }
-          catch (e: any) {
-            // Gmail refused this one message (a bad address, say): after two tries the lead is paused so
-            // it can't hold up everyone else. Limits and outages don't count against it.
-            await casUpdate(admin, owner, "leads", pick.id, (x) => {
-              if (!x || !x.seq) return null;
-              const fails = e && e.status === 400 ? (Number(x.seq.failCount) || 0) + 1 : Number(x.seq.failCount) || 0;
-              return { ...x, seq: { ...x.seq, sendingStep: null, sendingAt: null, lastError: msgOf(e), failCount: fails, ...(fails >= 2 ? { status: "paused", pausedWhy: "failed" } : {}) } };
-            });
-            throw e;
-          }
-          state.today.sent = (state.today.sent || 0) + 1;
-          state.today.by = { ...(state.today.by || {}), [pick.campaign]: ((state.today.by || {})[pick.campaign] || 0) + 1 };
-          report.sent = 1;
-          try { await gm(token, `messages/${sent.id}/modify`, { method: "POST", body: JSON.stringify({ addLabelIds: [state.labels.outreach] }) }); } catch (e) { console.error("label", msgOf(e)); }
-          const after = await casUpdate(admin, owner, "leads", pick.id, (x) => afterSend(x || claimed, c, settings, pick.step, sent, now));
-          if (after) d.leads[pick.id] = after;
-          if (!settings.startedOn) await casUpdate(admin, owner, "outreach", "settings", (x) => ({ ...(x || {}), startedOn: (x && x.startedOn) || today }));
-          state.lastError = null;
-        }
+        whys.push("template"); state.lastError = `${c.name || pick.campaign}: fill in ${mail ? mail.missing.join(", ") : "the email"} before it can send.`;
+        continue;
       }
+      // Claim the slot and mark the lead before sending: if saving fails after Gmail accepted the email,
+      // the marker keeps it from going out twice (the app shows it under Needs a look).
+      state.lastSendAt = now.toISOString(); mine(sender.email).lastSendAt = now.toISOString();
+      await put(admin, owner, "outreach", "state", state);
+      const claimed = await casUpdate(admin, owner, "leads", pick.id, (x) => (x && x.seq && x.seq.campaign === pick.campaign && ["queued", "active"].includes(x.seq.status) &&
+        x.seq.sendingStep == null && (Number(x.seq.step) || 0) === pick.step && !x.dnc) ? { ...x, seq: { ...x.seq, sendingStep: pick.step, sendingAt: now.toISOString() } } : null);
+      if (!claimed) continue;
+      const raw = buildMime({ from: `${sender.name} <${sender.email}>`, to: String(claimed.email).trim(), subject: mail.subject, text: mail.text,
+        inReplyTo: pick.step > 0 ? claimed.seq.rfcId : "", unsubUrl: await unsubUrl(owner, pick.id), unsubMail: sender.email });
+      let sent: any;
+      try { sent = await sendMail(token, raw, pick.step > 0 ? claimed.seq.threadId || undefined : undefined); }
+      catch (e: any) {
+        // Gmail refused this one message (a bad address, say): after two tries the lead is paused so
+        // it can't hold up everyone else. Limits and outages don't count against it.
+        await casUpdate(admin, owner, "leads", pick.id, (x) => {
+          if (!x || !x.seq) return null;
+          const fails = e && e.status === 400 ? (Number(x.seq.failCount) || 0) + 1 : Number(x.seq.failCount) || 0;
+          return { ...x, seq: { ...x.seq, sendingStep: null, sendingAt: null, lastError: msgOf(e), failCount: fails, ...(fails >= 2 ? { status: "paused", pausedWhy: "failed" } : {}) } };
+        });
+        if (sender.primary) throw e;
+        // An extra address that keeps failing sits out the rest of the day; the problem shows in the app.
+        const m = mine(sender.email); m.lastError = msgOf(e); m.failStreak = (Number(m.failStreak) || 0) + 1;
+        if (m.failStreak >= 3) m.offOn = today;
+        whys.push("sender"); continue;
+      }
+      const t = state.today, fromBy = { ...(t.fromBy || {}) };
+      t.sent = (t.sent || 0) + 1;
+      t.by = { ...(t.by || {}), [pick.campaign]: ((t.by || {})[pick.campaign] || 0) + 1 };
+      t.from = { ...(t.from || {}), [sender.email]: ((t.from || {})[sender.email] || 0) + 1 };
+      fromBy[sender.email] = { ...(fromBy[sender.email] || {}), [pick.campaign]: ((fromBy[sender.email] || {})[pick.campaign] || 0) + 1 };
+      t.fromBy = fromBy;
+      report.sent++;
+      try { await gm(token, `messages/${sent.id}/modify`, { method: "POST", body: JSON.stringify({ addLabelIds: [state.labels.outreach] }) }); } catch (e) { console.error("label", msgOf(e)); }
+      const after = await casUpdate(admin, owner, "leads", pick.id, (x) => afterSend(x || claimed, c, settings, pick.step, sent, now, sender.email));
+      if (after) d.leads[pick.id] = after;
+      if (sender.primary && !settings.startedOn) { await casUpdate(admin, owner, "outreach", "settings", (x) => ({ ...(x || {}), startedOn: (x && x.startedOn) || today })); settings.startedOn = today; }
+      const m = mine(sender.email);
+      if (!sender.primary && !m.startedOn) m.startedOn = today;
+      m.failStreak = 0; m.lastError = null;
+      if (sender.primary) state.lastError = null;
     }
+    report.why = report.sent ? "" : whys.includes("gap") ? "gap" : whys[0] || "";
   } catch (e: any) {
     state.lastRun = now.toISOString(); state.version = FN_VERSION; state.gmail = me; state.lastError = msgOf(e);
     await put(admin, owner, "outreach", "state", state).catch(() => {});
@@ -974,11 +1050,14 @@ Deno.serve(async (req: Request) => {
       return new Response(page, { status: ok ? 200 : 400, headers: { "Content-Type": "text/html; charset=utf-8" } });
     }
     if (url.searchParams.has("status")) {
-      let gmail: any = { ok: false, email: "", error: "" };
-      try { const t = await gmailToken(); const prof = await gm(t, "profile"); gmail = { ok: true, email: prof.emailAddress, error: "" }; } catch (e) { gmail.error = msgOf(e); }
+      let gmail: any = { ok: false, email: "", error: "" }, sendAs: any = null, sendAsError = "";
+      try {
+        const t = await gmailToken(); const prof = await gm(t, "profile"); gmail = { ok: true, email: prof.emailAddress, error: "" };
+        try { sendAs = await sendAsList(t); } catch (e) { sendAsError = msgOf(e); }
+      } catch (e) { gmail.error = msgOf(e); }
       const { data } = await admin.from("docs").select("data").eq("collection", "outreach").eq("id", "state").limit(1);
       const st = (data && data[0] && data[0].data) || {};
-      return json({ ok: true, version: FN_VERSION, gmail, hasKey: !!apiKey, lastRun: st.lastRun || null, lastError: st.lastError || null });
+      return json({ ok: true, version: FN_VERSION, gmail, sendAs, sendAsError, hasKey: !!apiKey, lastRun: st.lastRun || null, lastError: st.lastError || null });
     }
     if (req.method !== "POST") return json({ ok: true, hint: "POST to run" });
     const body: any = await req.json().catch(() => ({}));
@@ -995,8 +1074,16 @@ Deno.serve(async (req: Request) => {
       const t = await gmailToken(), me = (await gm(t, "profile")).emailAddress;
       const mail = composeEmail(sample, c, d.outreach.settings, 0);
       if (!mail) return json({ ok: false, error: "That campaign has no first email." }, 400);
-      await sendMail(t, buildMime({ from: `${withDefaults(d.outreach.settings).fromName} <${me}>`, to: me, subject: "[Test] " + mail.subject, text: `This is how ${bizName(sample)} would see it.\n\n----------\n\n${mail.text}` }));
-      return json({ ok: true, to: me, missing: mail.missing });
+      // From one of your extra addresses: only once Gmail lists it as a ready "Send mail as" address.
+      const want = String(url.searchParams.get("from") || "").trim().toLowerCase();
+      let sender = senderList(d.outreach.settings, me)[0];
+      if (want && want !== sender.email) {
+        if (!(await sendAsReady(t)).has(want)) return json({ ok: false, error: `Gmail doesn't list ${want} as a ready "Send mail as" address yet. Add it in Gmail › Settings › Accounts › Send mail as.` }, 400);
+        const x = (Array.isArray(d.outreach.settings.senders) ? d.outreach.settings.senders : []).find((y: any) => y && String(y.email || "").trim().toLowerCase() === want);
+        sender = { email: want, name: String((x && x.name) || "").trim() || withDefaults(d.outreach.settings).fromName, primary: false, campaign: "" };
+      }
+      await sendMail(t, buildMime({ from: `${sender.name} <${sender.email}>`, to: me, subject: "[Test] " + mail.subject, text: `This is how ${bizName(sample)} would see it.\n\n----------\n\n${mail.text}` }));
+      return json({ ok: true, to: me, from: sender.email, missing: mail.missing });
     }
 
     // The finder: every account that turned it on.
