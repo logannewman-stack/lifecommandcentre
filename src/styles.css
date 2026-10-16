@@ -320,7 +320,10 @@ body.dropping::after{content:"Drop a backup (.json) or contacts (.csv) file";pos
 .fab{position:fixed;right:max(16px,env(safe-area-inset-right));bottom:calc(74px + env(safe-area-inset-bottom,0px));z-index:9;display:inline-flex;align-items:center;gap:7px;padding:11px 16px 11px 13px;border:0;border-radius:99px;background:var(--accent);color:var(--accent-ink);font:700 14px var(--f-display);letter-spacing:.08em;text-transform:uppercase;box-shadow:0 8px 24px color-mix(in srgb,var(--accent) 35%,transparent);cursor:pointer}
 .fab svg{width:20px;height:20px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .fab:hover{background:var(--accent-2)}
-@media (min-width:980px){.fab{bottom:24px;right:24px}}
+.fab{transition:transform .22s ease,opacity .22s ease}
+.fab.away{transform:translateY(24px) scale(.9);opacity:0;pointer-events:none}
+@media (min-width:980px){.fab{bottom:24px;right:24px}.fab.away{transform:none;opacity:1;pointer-events:auto}}
+@media (prefers-reduced-motion:reduce){.fab{transition:none}}
 .chat{display:flex;flex-direction:column;gap:8px;max-height:52vh;overflow:auto;padding:2px}
 .msg{display:flex;flex-direction:column;gap:4px;max-width:92%}
 .msg.user{align-self:flex-end;align-items:flex-end}

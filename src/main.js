@@ -541,7 +541,8 @@ function renderTabs() {
   if (S.dbState !== 'ok') { document.getElementById('tabs').innerHTML = ''; return; }
   const due = allLoaded() && !isRestDay(todayISO()) ? leadsDue(todayISO()).length : 0;
   const hot = allLoaded() ? emHot().length : 0;
-  const badge = k => k === 'calls' && due ? `<span class="badge">${due}</span>` : k === 'email' && hot ? `<span class="badge hot" title="Hot replies">${hot}</span>` : '';
+  const big = n => n > 99 ? '99+' : n;
+  const badge = k => k === 'calls' && due ? `<span class="badge" title="${due} calls due">${big(due)}</span>` : k === 'email' && hot ? `<span class="badge hot" title="Hot replies">${big(hot)}</span>` : '';
   document.getElementById('tabs').innerHTML = VIEWS.map(([k,l]) =>
     `<button data-act="view" data-v="${k}" class="${S.view === k ? 'on' : ''}" aria-current="${S.view === k ? 'page' : 'false'}">${ICONS[k]}<span>${l}</span>${badge(k)}</button>`).join('');
 }
@@ -2721,7 +2722,8 @@ function leadSheet() {
   if (!l) return closeOnly('Lead');
   const stage = l.stage || 'New lead', q = l.seq || null, c = q ? (S.data.campaigns || {})[q.campaign] || {} : null, steps = (c && c.steps) || [];
   const tel = String(l.phone || '').replace(/[^\d+]/g, ''), h = leadHeat(l), t = todayISO();
-  const live = q && LIVE_SEQ.includes(q.status), camps = emCampaigns();
+  // Cold campaigns only start for a lead early in the pipeline; a stage campaign (Check back…) any time.
+  const live = q && LIVE_SEQ.includes(q.status), camps = emCampaigns().filter(c => c.trigger || ['New lead','Contacted'].includes(l.stage || 'New lead'));
   const sup = l.email ? (S.data.suppress || {})[String(l.email).toLowerCase()] : null;
   const optedOut = (l.reply && l.reply.label === 'unsubscribe') || !!(sup && /asked not to be emailed/i.test(sup.reason || ''));
   const tl = leadTimeline(id);
@@ -2740,7 +2742,7 @@ function leadSheet() {
         ${q && q.status === 'hold' ? `<button class="btn sm primary" data-act="em-status" data-id="${esc(id)}" data-op="queue">Queue it</button>` : ''}
         ${q && ['queued','active'].includes(q.status) ? `<button class="btn sm" data-act="em-status" data-id="${esc(id)}" data-op="pause">Pause emails</button>` : ''}
         ${q && q.status === 'paused' ? `<button class="btn sm primary" data-act="em-status" data-id="${esc(id)}" data-op="resume">Resume emails</button>` : ''}
-        ${!live && !l.emailBad ? `<select class="in sel" id="ls-camp" data-draft aria-label="Campaign">${camps.map(x => `<option value="${esc(x.id)}" ${draft('ls-camp', l.segment && ['services','dental'].includes(l.segment) ? 'front-desk' : 'home-screen') === x.id ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select><button class="btn sm" data-act="lead-enroll" data-id="${esc(id)}">Start this campaign</button>` : ''}
+        ${!live && !l.emailBad && camps.length ? `<select class="in sel" id="ls-camp" data-draft aria-label="Campaign">${camps.map(x => `<option value="${esc(x.id)}" ${draft('ls-camp', l.segment && ['services','dental'].includes(l.segment) ? 'front-desk' : 'home-screen') === x.id ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select><button class="btn sm" data-act="lead-enroll" data-id="${esc(id)}">Start this campaign</button>` : ''}
         ${q && q.threadId ? `<a class="btn sm ghost" href="${esc(gmailThread(q.threadId))}" target="_blank" rel="noopener">Open in Gmail</a>` : ''}
         <button class="btn sm ghost" data-act="em-status" data-id="${esc(id)}" data-op="block">Do not contact</button>
       </div>`;
@@ -4165,6 +4167,14 @@ if ('serviceWorker' in navigator) navigator.serviceWorker.addEventListener('mess
   window.__lcc.pushes.push(d);
   toast(d.title + (d.body ? ' · ' + d.body : ''), false, /#email/.test(d.url || '') && S.view !== 'email' ? {act:'goto-email', label:'Open'} : null);
 });
+// On a phone the Ask button steps aside while you scroll down, so it never sits on what you're reading,
+// and comes back as soon as you scroll up (or reach the top).
+let fabY = 0;
+window.addEventListener('scroll', () => {
+  const y = window.scrollY || 0, fab = document.getElementById('fab');
+  if (!fab || Math.abs(y - fabY) < 10) return;
+  fab.classList.toggle('away', y > fabY && y > 160); fabY = y;
+}, {passive:true});
 window.addEventListener('hashchange', () => { const v = location.hash.slice(1); if (S.dbState === 'ok' && VIEWS.some(x => x[0] === v)) setView(v); });
 window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); S.installEvt = e; if (S.dbState === 'ok') scheduleRender(); });
 window.addEventListener('appinstalled', () => { S.installEvt = null; toast('Installed. Open Command from your home screen or dock.'); scheduleRender(); });
