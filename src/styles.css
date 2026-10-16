@@ -606,6 +606,12 @@ textarea.mailin{font-size:15px;line-height:1.5;min-height:180px}
 .ps span{font-size:12px;color:var(--ink-3);white-space:nowrap}
 .ps.hot b{color:var(--bad)}
 .ps.good b{color:var(--good)}
+/* Phones: every tile in view, four to a row, instead of a strip that hides the last ones off the edge. */
+@media (max-width:560px){
+  .pipesum{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));overflow:visible}
+  .ps{min-width:0;padding:6px 8px}
+  .ps span{white-space:normal;line-height:1.25}
+}
 .pipebar{display:flex;gap:8px;align-items:center}
 .pipebar .in{flex:1 1 auto;min-width:0;width:auto}
 .pipebar .btn{flex:none}
