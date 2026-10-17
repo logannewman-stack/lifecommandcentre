@@ -11,7 +11,8 @@
 // Plan → This device → Assistant. After an update, paste the new code over the old one.
 //
 //   GET  ?status=1  → {ok, hasKey, model, version}
-//   POST            → {message, history, tz, today, now} → {reply, actions}
+//   POST            → {message, history, tz, today, now} → {reply, actions}. What each answer costs is added to
+//                     outreach/ask; at the monthly cap (settings.spendCap, $100) Ask says so instead of answering.
 //   POST /mcp/<key> → the Claude connector: Claude (on Logan's own Claude plan) reads and changes the app
 //                     through MCP. No Anthropic key needed. The key is made in the app; only its SHA-256
 //                     is kept, in meta/connector.
@@ -20,7 +21,7 @@ import Anthropic from "npm:@anthropic-ai/sdk@0.131.0";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
 // ---- pure logic (no imports; the Deno test imports this section) ----
-export const FN_VERSION = 9;
+export const FN_VERSION = 10;
 export const MODEL = "claude-opus-5-5";
 const AREAS = ["Sales", "Build", "Pickleball", "Body", "Money", "Move", "DoD", "Fix", "Other"];
 const SESSION_TYPES = ["Drill", "Competitive", "Rec play", "Tournament", "Lesson"];
@@ -50,6 +51,26 @@ const isObj = (v: any) => v && typeof v === "object" && !Array.isArray(v);
 // Same rule as the app and patch_doc: objects merge, everything else (arrays too) replaces.
 export function merge(a: any, b: any): any { const out: any = isObj(a) ? { ...a } : {}; for (const [k, v] of Object.entries(b || {})) out[k] = isObj(v) ? merge(out[k], v) : v; return out; }
 export function byCol(rows: any[]) { const o: any = {}; for (const r of rows) ((o[r.collection] ||= {})[r.id] = r.data); return o; }
+// What Ask costs: Opus 5.5 at $4 in, $20 out, $5 to write the cache and 20¢ to read it, per million tokens.
+export function askCost(u: any) {
+  const n = (v: any) => Number(v) || 0;
+  return (n(u && u.input_tokens) * 4 + n(u && u.output_tokens) * 20 + n(u && u.cache_creation_input_tokens) * 5 + n(u && u.cache_read_input_tokens) * 0.2) / 1e6;
+}
+// The same rules as src/outreach.js: this month's Claude spending by what spent it, and the monthly cap.
+export function monthSpend(outreach: any, month: string) {
+  const o = outreach || {}, f = o.finder || {}, st = o.state || {}, a = o.ask || {};
+  const finder = f.month && f.month.month === month ? Number(f.month.spent) || 0 : 0;
+  const replies = st.spend && st.spend.month === month ? Number(st.spend.replies) || 0 : 0;
+  const ask = a.month === month ? Number(a.spent) || 0 : 0;
+  return { finder, replies, ask, total: finder + replies + ask };
+}
+export const spendCapOf = (s: any) => { const n = Number(s && s.spendCap); return Number.isFinite(n) && n > 0 ? n : 100; };
+// One answer's cost added to outreach/ask (only Ask writes it): this month, today, and how many answers.
+export function addAsk(cur: any, cost: number, today: string) {
+  const month = today.slice(0, 7), c = cur && cur.month === month ? cur : { month, spent: 0, n: 0 };
+  const day = c.today && c.today.date === today ? c.today : { date: today, spent: 0 };
+  return { ...c, spent: (Number(c.spent) || 0) + cost, n: (Number(c.n) || 0) + 1, today: { date: today, spent: (Number(day.spent) || 0) + cost } };
+}
 const weekdays = (v: any) => (Array.isArray(v) ? v : [v]).map((x: any) => String(x || "").slice(0, 3)).map((x: string) => x.charAt(0).toUpperCase() + x.slice(1).toLowerCase()).filter((x: string) => WEEK.includes(x)).filter((x: string, i: number, a: string[]) => a.indexOf(x) === i);
 function daysLabel(days: string[]) {
   const set = WEEK.filter((x) => days.includes(x));
@@ -177,7 +198,8 @@ export function buildContext(d: any, today: string, now: string, tz: string) {
   const waitLine = Object.entries(wait).map(([cid, n]) => `${((d.campaigns || {})[cid] || {}).name || cid} ${n}`).join(", ") || "none";
   // The engine's rule (sendingState): on, or set to start on a day, or paused.
   const sending = !(os.enabled || os.autoStart) ? "paused" : os.startOn && today < os.startOn ? `set to start ${dowOf(os.startOn)} ${os.startOn}` : "on";
-  if (os.createdAt || hot.length || inSeq) lines.push(`EMAIL OUTREACH: sending ${sending}, ${sentToday} sent today, ${inSeq} leads in campaigns; waiting for a first email: ${waitLine}; lead finder ${os.finder && os.finder.enabled ? `on (keeps ${Number(os.finder.keep) || 300} waiting for each campaign)` : "off"}, ${foundToday} found today. Hot replies to answer (${hot.length}):\n${hot.slice(0, 10).map((r: any) => { const l = leads[r.lead || r.prospect] || {}; return `- [${r.lead || r.prospect}] ${l.name || r.business || r.email}: ${clip(r.summary || r.snippet || r.text || "", 120)}${l.phone ? " | " + l.phone : ""}`; }).join("\n") || "- none"}`);
+  const spent = monthSpend(d.outreach, today.slice(0, 7)), usd = (n: number) => "$" + n.toFixed(2);
+  if (os.createdAt || hot.length || inSeq) lines.push(`EMAIL OUTREACH: sending ${sending}, ${sentToday} sent today, ${inSeq} leads in campaigns; waiting for a first email: ${waitLine}; lead finder ${os.finder && os.finder.enabled ? `on (keeps ${Number(os.finder.keep) || 300} waiting for each campaign)` : "off"}, ${foundToday} found today. Spent on Claude this month: ${usd(spent.total)} of the ${usd(spendCapOf(os))} monthly limit (finder ${usd(spent.finder)}, sorting replies ${usd(spent.replies)}, Ask ${usd(spent.ask)}). Hot replies to answer (${hot.length}):\n${hot.slice(0, 10).map((r: any) => { const l = leads[r.lead || r.prospect] || {}; return `- [${r.lead || r.prospect}] ${l.name || r.business || r.email}: ${clip(r.summary || r.snippet || r.text || "", 120)}${l.phone ? " | " + l.phone : ""}`; }).join("\n") || "- none"}`);
   const ws = weekStartOf(today);
   const st: any = { dials: 0, convos: 0, demos: 0, dms: 0, proposals: 0, deals: 0, mockups: 0, cash: 0, gym: 0, mobility: 0, drill: 0, competitive: 0, checkins: 0 };
   for (let i = 0; i < 7; i++) {
@@ -707,6 +729,9 @@ Deno.serve(async (req: Request) => {
 
     const admin = createClient(supaUrl, service, { auth: { persistSession: false } });
     const { d, store } = await ownerData(admin, uid);
+    // At this month's spending cap, Ask says so instead of calling Claude.
+    const out = d.outreach || {}, cap = spendCapOf(out.settings), spentNow = monthSpend(out, today.slice(0, 7)).total;
+    if (spentNow >= cap) return json({ reply: `You've reached this month's $${cap} limit on Claude ($${spentNow.toFixed(2)} so far), so Ask is off until the 1st. Raise the limit in Email › Settings, or ask in the Claude app, which runs on your plan at no extra cost.`, actions: [], model: MODEL, version: FN_VERSION });
 
     const history: any[] = (Array.isArray(body.history) ? body.history : [])
       .filter((m: any) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string" && m.content.trim())
@@ -720,6 +745,8 @@ Deno.serve(async (req: Request) => {
     // Built once per question: the system prompt must stay byte-identical across the tool rounds,
     // or the thinking blocks passed back between rounds stop being valid.
     const context = buildContext(d, today, now, tz);
+    let cost = 0;
+    try {
     for (let round = 0; round < 8; round++) {
       const resp: any = await client.beta.messages.create({
         model: MODEL,
@@ -734,6 +761,7 @@ Deno.serve(async (req: Request) => {
         tools: TOOLS,
         messages,
       });
+      cost += askCost(resp.usage);
       if (resp.stop_reason === "refusal") { reply = reply || "I can't help with that one."; break; }
       const text = (resp.content || []).filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n").trim();
       if (text) reply = text;
@@ -749,6 +777,10 @@ Deno.serve(async (req: Request) => {
         results.push({ type: "tool_result", tool_use_id: u.id, content: r.result, is_error: r.result.startsWith("error") });
       }
       messages.push({ role: "user", content: results });
+    }
+    } finally {
+      // What this answer cost, even when it failed partway, for the app's spending card and the cap.
+      if (cost > 0) { try { await store.put("outreach", "ask", addAsk(await store.get("outreach", "ask"), cost, today)); } catch (e) { console.error("ask cost", e); } }
     }
     return json({ reply: reply || (actions.length ? "Done." : "I didn't get an answer back. Try again."), actions, model: MODEL, version: FN_VERSION });
   } catch (e: any) {

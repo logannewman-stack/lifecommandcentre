@@ -10,7 +10,7 @@ import { supabase, config as sbConfig, configSource, saveConfig, clearConfig } f
 import { createDb } from './db.js';
 import { parseQuick } from './quickadd.js';
 import { parseDayText, buildDay } from './planday.js';
-import { SEQ_STATUS, DEFAULT_CAMPAIGNS, wordingUpdates, withDefaults as outSettings, sendingState, inLine, launchWrites, composeEmail, segmentOf, parseCSV, importLeads, campaignStats, tzFor, localClock, dailyCap, nextSendDay, upNext, isEmail, SUPPRESS, HOT, LIVE_SEQ, stagePatch, replyPatch, enrollPatch, campaignFor, heatOf, liveCampaign, leadIdFor } from './outreach.js';
+import { SEQ_STATUS, DEFAULT_CAMPAIGNS, wordingUpdates, withDefaults as outSettings, sendingState, inLine, launchWrites, composeEmail, segmentOf, parseCSV, importLeads, campaignStats, tzFor, localClock, dailyCap, nextSendDay, upNext, isEmail, SUPPRESS, HOT, LIVE_SEQ, stagePatch, replyPatch, enrollPatch, campaignFor, heatOf, liveCampaign, leadIdFor, autoOk, monthSpend, daySpend, spendCapOf } from './outreach.js';
 import REMINDERS_FN from '../supabase/functions/reminders/index.ts?raw';
 import CRON_SQL from '../supabase/functions/reminders/cron.sql?raw';
 import ASSISTANT_FN from '../supabase/functions/assistant/index.ts?raw';
@@ -113,7 +113,7 @@ function applyTheme() {
   });
 }
 try { const v = localStorage.getItem('lcc-view'); if (v && VIEWS.some(x => x[0] === v)) S.view = v; } catch(e) {}
-try { const v = localStorage.getItem('lcc-pipe-view'); if (['board','calls','all'].includes(v)) S.pipeView = v; } catch(e) {}
+try { const v = localStorage.getItem('lcc-pipe-view'); if (['board','follow','calls','all'].includes(v)) S.pipeView = v; } catch(e) {}
 if (location.hash && VIEWS.some(x => '#' + x[0] === location.hash)) S.view = location.hash.slice(1);
 
 /* ---------- utils ---------- */
@@ -126,6 +126,7 @@ const todayISO = () => iso(new Date());
 const dowOf = s => DOW[parseISO(s).getDay()];
 const weekStartOf = s => { const d = parseISO(s); d.setDate(d.getDate() - ((d.getDay()+6)%7)); return iso(d); };
 const daysBetween = (a,b) => Math.round((parseISO(b) - parseISO(a)) / 86400000);
+const big = n => n > 99 ? '99+' : n;
 const fmtDay = s => s ? parseISO(s).toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'}) : '';
 const fmtShort = s => s ? parseISO(s).toLocaleDateString('en-US',{month:'short',day:'numeric'}) : '';
 const fmtLong = s => parseISO(s).toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric'});
@@ -518,7 +519,12 @@ document.addEventListener('focusout', () => setTimeout(() => { if (pendingRender
 
 function render() {
   renderHeader();
-  const app = document.getElementById('app');
+  const app = document.getElementById('app'), a = document.activeElement;
+  // What had the keyboard in the view keeps it when the view is drawn again (a sync, a flash ending), as in
+  // the sheets: a field by its id, or a card, row or button by what it does and for whom.
+  const keep = !a || a === app || !app.contains(a) ? null
+    : a.id && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) ? {sel:'#' + CSS.escape(a.id), s:a.selectionStart, e:a.selectionEnd}
+    : a.dataset && a.dataset.act && a.dataset.id ? {sel:`[data-act="${CSS.escape(a.dataset.act)}"][data-id="${CSS.escape(a.dataset.id)}"]`} : null;
   let html;
   if (S.dbState === 'config') html = connectView();
   else if (S.dbState === 'auth') html = loginView();
@@ -527,6 +533,7 @@ function render() {
   else if (!cfg().schedule) html = importView();
   else html = ({today:viewToday, calls:viewPipeline, email:viewEmail, week:viewWeek, log:viewLog, plan:viewPlan})[S.view]();
   app.innerHTML = html;
+  if (keep) { const n = app.querySelector(keep.sel); if (n) { n.focus({preventScroll:true}); try { if (keep.s != null) n.setSelectionRange(keep.s, keep.e); } catch(e) {} } }
   renderTabs(); renderModal(); renderToast();
 }
 function renderHeader() {
@@ -541,7 +548,6 @@ function renderTabs() {
   if (S.dbState !== 'ok') { document.getElementById('tabs').innerHTML = ''; return; }
   const due = allLoaded() && !isRestDay(todayISO()) ? leadsDue(todayISO()).length : 0;
   const hot = allLoaded() ? emHot().length : 0;
-  const big = n => n > 99 ? '99+' : n;
   const badge = k => k === 'calls' && due ? `<span class="badge" title="${due} calls due">${big(due)}</span>` : k === 'email' && hot ? `<span class="badge hot" title="Hot replies">${big(hot)}</span>` : '';
   document.getElementById('tabs').innerHTML = VIEWS.map(([k,l]) =>
     `<button data-act="view" data-v="${k}" class="${S.view === k ? 'on' : ''}" aria-current="${S.view === k ? 'page' : 'false'}">${ICONS[k]}<span>${l}</span>${badge(k)}</button>`).join('');
@@ -846,18 +852,21 @@ function pipeTodayCard(t) {
   const leads = allLeads(); if (!leads.length) return '';
   const s = emSettings(), st = emState(), fin = outDoc('finder') || {}, local = localClock(s.tz).date, mode = sendingState(s, local);
   const hot = emHot().filter(r => (S.data.leads || {})[r.lead]), calls = isRestDay(t) ? 0 : leadsDue(t).length;
-  // A lead with a hot reply is already on top of Today (Answer first), so it isn't listed twice.
-  const hotIds = new Set(hot.map(r => r.lead));
-  const follow = leads.filter(l => !hotIds.has(l.id) && ['Talking','Demo booked','Proposal sent'].includes(l.stage) && l.nextDate && l.nextDate <= t)
-    .sort((a, b) => String(a.nextDate).localeCompare(String(b.nextDate)) || leadHeat(b).score - leadHeat(a).score);
+  // A lead with a hot reply is already on top of Today (Answer first), so it isn't listed twice. On a rest
+  // day only today's follow-ups show, and nothing reads late.
+  const hotIds = new Set(hot.map(r => r.lead)), rest = isRestDay(t);
+  const fu = followUps(t), follow = fu.filter(x => !hotIds.has(x.l.id) && (x.g === 'today' || (x.g === 'late' && !rest))).map(x => x.l);
+  const sp = emSpend();
   const sent = st.today && st.today.date === local ? st.today.sent || 0 : 0, found = fin.today && fin.today.date === local ? fin.today.found || 0 : 0;
   const email = mode === 'later' ? `Emails start ${dayWord(s.startOn)}.` : mode === 'on' && emCampaigns().some(liveCampaign) ? `${plural(sent, 'email')} sent today.` : 'Emails are off.';
   const row = (id, l, line) => `<button class="erow" data-act="lead-open" data-id="${esc(id)}"><div class="min0"><b>${esc(l.name || l.email)}</b><div class="meta clamp1">${esc(line)}</div></div><div class="erow-r">${heatChip(l)}</div></button>`;
-  const followRows = follow.slice(0, 4).map(l => row(l.id, l, `${l.stage} · ${l.nextStep || 'Follow up'}${l.nextDate < t ? ' · late' : ''}`)).join('');
+  const followRows = follow.slice(0, 4).map(l => row(l.id, l, `${l.nextStep || 'Follow up'} · ${l.stage || 'New lead'}${l.nextDate < t && !rest ? ' · late' : ''}`)).join('');
   return `<section class="card pipetoday ord-8"><div class="card-h"><h2>Pipeline</h2><button class="btn sm" data-act="view" data-v="calls">Open</button></div>
     <div class="pt-n"><span class="${hot.length ? 'hotnum' : ''}"><b>${hot.length}</b> hot ${hot.length === 1 ? 'reply' : 'replies'}</span><span><b>${follow.length}</b> ${follow.length === 1 ? 'follow-up' : 'follow-ups'}</span><span><b>${calls}</b> calls due</span>${found ? `<span><b>${found}</b> new leads</span>` : ''}</div>
-    ${followRows ? `<h3>Follow up today</h3><div class="elist">${followRows}</div>${follow.length > 4 ? `<div class="meta">and ${follow.length - 4} more on the board</div>` : ''}` : ''}
+    ${followRows ? `<h3>Follow up today</h3><div class="elist">${followRows}</div>` : ''}
+    ${fu.length ? `<div class="btnrow"><button class="btn sm ghost" data-act="view" data-v="calls" data-sub="follow">${follow.length > 4 ? `All follow-ups (${follow.length - 4} more today)` : 'All follow-ups'}</button></div>` : ''}
     <div class="btnrow pt-f"><span class="meta">${esc(email)}</span>${mode === 'paused' ? '<button class="btn sm ghost" data-act="em-launch">Start sending</button>' : ''}</div>
+    <button class="linkish meta pt-spend ${sp.over ? 'warntext' : ''}" data-act="view" data-v="email">Claude this month: <b>${dollars(sp.total)}</b> of ${dollars(sp.cap)}${sp.day.total ? ` · ${dollars(sp.day.total)} today` : ''}</button>
   </section>`;
 }
 
@@ -2097,8 +2106,9 @@ const emSenders = () => (Array.isArray(emSettings().senders) ? emSettings().send
 const emToday = (st, today) => st.today && st.today.date === today ? st.today : null;
 // Today's limit for every address together, and one campaign's (its own limit for each address that sends it).
 // Businesses with an email that never got a campaign, early in the pipeline: mostly your call list, whose
-// emails the engine's lookup reads off their websites (outreach/lookup).
-const emNoCampaign = () => { const sup = emSuppressed(); return allLeads().filter(l => isEmail(l.email) && !(l.seq && l.seq.campaign) && !l.dnc && !l.emailBad && !sup.has(String(l.email).toLowerCase()) && !['Partner','Client'].includes(l.type) && ['New lead','Contacted'].includes(l.stage || 'New lead')); };
+// emails the engine's lookup reads off their websites (outreach/lookup). Never your warm contacts, clients,
+// partners or anyone you switched off (autoOk).
+const emNoCampaign = () => { const sup = emSuppressed(); return allLeads().filter(l => autoOk(l) && isEmail(l.email) && !(l.seq && l.seq.campaign) && !l.dnc && !l.emailBad && !sup.has(String(l.email).toLowerCase()) && ['New lead','Contacted'].includes(l.stage || 'New lead')); };
 const emCapToday = (s, st, today) => { const t = emToday(st, today); return t && Number(t.cap) > 0 ? Number(t.cap) : dailyCap(s, today); };
 const emCampCap = (c, st, today) => { const t = emToday(st, today), a = t && Array.isArray(t.addrs) ? t.addrs.filter(x => !x.campaign || x.campaign === c.id).length : 1; return (Number(c.cap) || 30) * Math.max(1, a); };
 // The engine Supabase runs is older than the copy in this app (from its status check or its last run).
@@ -2107,7 +2117,9 @@ const emOutdated = () => { const e = S.outEng || {}, st = emState(); return (e.f
 const emFinderRan = () => { const f = outDoc('finder'); return !!(f && f.lastRun && Date.now() - Date.parse(f.lastRun) < 2 * 86400000); };
 const emEngineOk = () => !!((S.outEng && S.outEng.fn === 'ok' && S.outEng.gmail && S.outEng.gmail.ok) || emState().gmail);
 const gmailThread = id => `https://mail.google.com/mail/${emGmail() ? '?authuser=' + encodeURIComponent(emGmail()) : 'u/0/'}#all/${encodeURIComponent(id)}`;
-const gmailCompose = to => `https://mail.google.com/mail/?${emGmail() ? 'authuser=' + encodeURIComponent(emGmail()) + '&' : ''}view=cm&fs=1&to=${encodeURIComponent(to)}`;
+const gmailCompose = (to, su, body) => `https://mail.google.com/mail/?${emGmail() ? 'authuser=' + encodeURIComponent(emGmail()) + '&' : ''}view=cm&fs=1&to=${encodeURIComponent(to)}${su ? '&su=' + encodeURIComponent(su) : ''}${body ? '&body=' + encodeURIComponent(body) : ''}`;
+// Emails you write in the app go out through the engine (version 10 and later), from your Gmail.
+const emCanSend = () => { const e = S.outEng || {}; return emEngineOk() && (e.fn === 'ok' ? (e.version || 1) >= 10 : (emState().version || 0) >= 10); };
 const emHref = u => /^https?:\/\//i.test(String(u || '')) ? String(u) : 'https://' + String(u || '');
 const emShortUrl = u => String(u || '').replace(/^https?:\/\/(www\.)?/i, '').replace(/\/$/, '');
 const leadWhere = l => [l.city || String(l.business || '').split(',').slice(1).join(',').trim(), l.state || l.region].filter(Boolean).join(', ');
@@ -2118,7 +2130,8 @@ const emSeqPill = l => l.dnc ? '<span class="pill bad">Do not contact</span>' : 
 const emSegLabel = (cid, k) => ((((S.data.campaigns || {})[cid] || {}).segments || {})[k] || {}).label || k;
 const emReplyWord = n => `${n} ${n === 1 ? 'reply' : 'replies'}`;
 const emWhen = ts => { const d = new Date(ts); return isNaN(d) ? '' : d.toLocaleString('en-US', {weekday:'short', month:'short', day:'numeric', hour:'numeric', minute:'2-digit'}); };
-const dollars = n => '$' + (Number(n) || 0).toFixed(2);
+// $8.41, or $100 for whole dollars.
+const dollars = n => { const x = Math.round((Number(n) || 0) * 100) / 100; return '$' + (Number.isInteger(x) ? String(x) : x.toFixed(2)); };
 function emAgo(ts) {
   const at = typeof ts === 'number' ? ts : Date.parse(ts || '');
   if (!Number.isFinite(at)) return '';
@@ -2168,7 +2181,7 @@ function leadLast(l) {
   return best ? `${best[1]} ${emAgo(best[0])}` : '';
 }
 const leadSourceName = l => l.source === 'Finder' ? 'Found by the finder' : l.source === 'Import' ? 'Imported' : l.source === 'Manual' ? 'Added by you' : 'Call list';
-let emSeeded = false, emCheckStarted = false, emMigrated = false;
+let emSeeded = false, emCheckStarted = false, emMigrated = false, askCheckStarted = false;
 // The four campaigns and the settings document, written once when they are missing. The engine only
 // works for an account that has settings, and it never sends while they say paused.
 function maybeSeedOutreach() {
@@ -2251,7 +2264,7 @@ async function emTestBoth() {
   if (done.length) toast(`${done.length === 1 ? 'A test is' : 'Both tests are'} in ${done[0].to}. They show exactly what businesses get, with [Test] in the subject.`);
 }
 // Runs the finder once now instead of waiting for its schedule, to see it work.
-const FIND_WHY = {off:'The finder is off. Turn it on first.', key:'The finder needs your Anthropic key in Supabase (ANTHROPIC_API_KEY).', target:"Today's number of new leads is reached. It starts again tomorrow.", budget:"Today's spending limit is reached. It starts again tomorrow.", done:'Every search in your list ran in the last 90 days. Add types of business or cities in its Settings.', full:'Each campaign already has its leads waiting. The finder adds more as emails go out, or raise the number in its Settings.', error:'The search didn\'t finish. It tries again on the next run.'};
+const FIND_WHY = {off:'The finder is off. Turn it on first.', key:'The finder needs your Anthropic key in Supabase (ANTHROPIC_API_KEY).', target:"Today's number of new leads is reached. It starts again tomorrow.", budget:"Today's spending limit is reached. It starts again tomorrow.", done:'Every search in your list ran in the last 90 days. Add types of business or cities in its Settings.', full:'Each campaign already has its leads waiting. The finder adds more as emails go out, or raise the number in its Settings.', cap:"This month's spending on Claude reached your limit. The finder starts again on the 1st, or raise the limit in Email settings.", error:'The search didn\'t finish. It tries again on the next run.'};
 async function emFindNow() {
   if (S.emFindBusy) return;
   S.emFindBusy = true; render();
@@ -2341,10 +2354,11 @@ function emPreviewHtml() {
 /* ----- the Email tab ----- */
 function viewEmail() {
   if (!S.outEng && !emCheckStarted && outreachUrl()) { emCheckStarted = true; setTimeout(() => outreachCheck(true), 0); }
+  if (!S.assist && !askCheckStarted && assistantUrl()) { askCheckStarted = true; setTimeout(() => assistantCheck(true), 0); }
   const s = emSettings(), st = emState(), camps = emCampaigns(), list = emLeads();
-  // Phone order: status, setup, hot replies, today's sends, leads, campaigns, results, up next, everyone, every reply.
+  // Phone order: status, setup, hot replies, today's sends, spending, leads, campaigns, results, up next, everyone, every reply.
   const main = [emHero(s, st, camps, list), emChecklist(s, camps, list), emHotCard(), emTodayCard(s, list), emContactsCard(list, camps), emRepliesCard()];
-  const side = [emLeadsCard(s, camps), emCampsCard(camps, list, st, s), emResults(list), emUpNext(s, st, camps)];
+  const side = [emSpendCard(), emLeadsCard(s, camps), emCampsCard(camps, list, st, s), emResults(list), emUpNext(s, st, camps)];
   return `<div class="two"><div class="main">${main.join('')}</div><div class="side">${side.join('')}</div></div>`;
 }
 function emHero(s, st, camps, list) {
@@ -2380,7 +2394,9 @@ function emHero(s, st, camps, list) {
     mode === 'on' && engineOk && ranMin !== null && ranMin > 25 ? `<div class="warnbox">The engine last ran ${esc(emAgo(st.lastRun))}. Check that its schedule is on (Engine setup, step 6).</div>` : '',
   ].join('');
   const last = emSentToday(s, list)[0];
-  const facts = [gmail ? `From <b>${esc(gmail)}</b>${more > 0 ? ` and ${plural(more, 'more address', 'more addresses')}` : ''}` : '', last ? `Last: <b>${esc(last.l.name || last.l.email)}</b> at ${esc(last.time)}` : '', st.lastRun ? `Checked ${esc(emAgo(st.lastRun))}` : '', engineOk ? (more > 0 ? `${cap} a day from ${more + 1} addresses` : s.startedOn && cap < (Number(s.capMax) || 50) ? `Warming up: ${cap} a day now, up to ${s.capMax}` : `${cap} a day`) : ''].filter(Boolean);
+  const sp = emSpend();
+  const facts = [gmail ? `From <b>${esc(gmail)}</b>${more > 0 ? ` and ${plural(more, 'more address', 'more addresses')}` : ''}` : '', last ? `Last: <b>${esc(last.l.name || last.l.email)}</b> at ${esc(last.time)}` : '', st.lastRun ? `Checked ${esc(emAgo(st.lastRun))}` : '', engineOk ? (more > 0 ? `${cap} a day from ${more + 1} addresses` : s.startedOn && cap < (Number(s.capMax) || 50) ? `Warming up: ${cap} a day now, up to ${s.capMax}` : `${cap} a day`) : '',
+    engineOk || sp.total ? `<button class="linkish ${sp.over ? 'warntext' : ''}" data-act="spend-show">Claude: ${dollars(sp.total)} of ${dollars(sp.cap)} this month</button>` : ''].filter(Boolean);
   return `<section class="card emhero ord-1">
     <div class="emhero-top"><div class="min0"><div class="eyebrow">Email command center</div><div class="emst"><i class="emdot ${dot}" aria-hidden="true"></i><b>${esc(title)}</b></div><div class="meta">${esc(sub)}</div></div>
       ${mode !== 'paused' ? '<button class="btn" data-act="em-pause">Pause</button>' : '<button class="btn primary" data-act="em-start">Start sending</button>'}</div>
@@ -2419,7 +2435,7 @@ function emHotRow(r) {
     ${r.summary ? `<div class="sum">${esc(r.summary)}</div>` : ''}
     <div class="quote">${esc(r.text || r.snippet || '')}</div>
     ${r.next ? `<div class="meta"><b>Next:</b> ${esc(r.next)}</div>` : ''}
-    <div class="btnrow">${r.threadId ? `<a class="btn sm primary" href="${esc(gmailThread(r.threadId))}" target="_blank" rel="noopener">Reply in Gmail</a>` : ''}${tel ? `<a class="btn sm" href="tel:${esc(tel)}">Call</a>` : ''}<button class="btn sm" data-act="lead-open" data-id="${esc(r.lead)}">Open the lead</button></div>
+    <div class="btnrow">${canEmail(l) ? `<button class="btn sm primary" data-act="em-compose" data-id="${esc(r.lead)}" data-reply="${esc(r.id)}">Reply</button>` : ''}${tel ? `<a class="btn sm" href="tel:${esc(tel)}">Call</a>` : ''}${r.threadId ? `<a class="btn sm ${canEmail(l) ? 'ghost' : 'primary'}" href="${esc(gmailThread(r.threadId))}" target="_blank" rel="noopener">${canEmail(l) ? 'Open in Gmail' : 'Reply in Gmail'}</a>` : ''}<button class="btn sm ghost" data-act="lead-open" data-id="${esc(r.lead)}">Open the lead</button></div>
   </article>`;
 }
 function emRow(l, showCamp) {
@@ -2521,7 +2537,40 @@ function claudeLeadPrompt(cid) {
     `Look for ${niches.join(', ') || 'local businesses'} in ${cities.join('; ') || 'my area'}. Start from Google Maps listings with 4.5+ stars and 100+ reviews and skip chains and franchises. Open each business's own website and keep only the ones that show an email address there. Never guess an email.\n\n` +
     `Add them with add_leads (campaign "${cid}") with the page you found each email on as source_url, then tell me how many you added.`;
 }
-const finderState = (f, td, allFull) => !f.enabled ? ['Off', ''] : allFull ? ['Enough waiting', 'good'] : td.found >= (Number(f.perDay) || 100) ? ['Done for today', 'good'] : td.spent >= (Number(f.budget) || 5) ? ['Spending limit reached', 'warn'] : ['Searching', 'good'];
+const finderState = (f, td, allFull, capHit) => !f.enabled ? ['Off', ''] : capHit ? ['Monthly limit reached', 'warn'] : allFull ? ['Enough waiting', 'good'] : td.found >= (Number(f.perDay) || 100) ? ['Done for today', 'good'] : td.spent >= (Number(f.budget) || 5) ? ['Spending limit reached', 'warn'] : ['Searching', 'good'];
+// What Claude cost this month and today, by the job that spent it, against your monthly limit
+// (settings.spendCap). Each job counts its own: the finder, sorting replies (engine 10) and Ask (assistant 10).
+function emSpend() {
+  const s = emSettings(), today = localClock(s.tz).date, month = today.slice(0, 7), out = S.data.outreach || {};
+  const m = monthSpend(out, month), cap = spendCapOf(s), day = Number(today.slice(8, 10));
+  const days = new Date(Number(today.slice(0, 4)), Number(today.slice(5, 7)), 0).getDate();
+  return {...m, day:daySpend(out, today), cap, month, pace:day >= 3 && m.total > 0 ? m.total / day * days : 0, over:m.total >= cap};
+}
+// A job that runs an older copy than this app's doesn't count what it spends yet.
+const spendGaps = () => {
+  const eng = Math.max((S.outEng && S.outEng.fn === 'ok' && S.outEng.version) || 0, emState().version || 0), ask = S.assist && S.assist.fn === 'ok' ? S.assist.version || 1 : 0;
+  return [eng && eng < 10 ? 'sorting replies (update the engine)' : '', ask && ask < 10 && !outDoc('ask') ? 'Ask (update the assistant)' : ''].filter(Boolean);
+};
+function emSpendCard() {
+  const x = emSpend(), pct = Math.min(100, Math.round(x.total / x.cap * 100)), gaps = spendGaps();
+  const monthName = new Date(x.month + '-15T12:00:00').toLocaleDateString('en-US', {month:'long'});
+  const line = [`Today ${dollars(x.day.total)}`, x.over ? 'Limit reached' : `${dollars(x.cap - x.total)} left`, x.pace && !x.over ? `on pace for about ${dollars(x.pace)}` : ''].filter(Boolean).join(' · ');
+  const rows = [['Lead finder', x.finder, x.day.finder], ['Sorting replies', x.replies, x.day.replies], ['Ask, in this app', x.ask, x.day.ask]];
+  return `<section class="card spendcard ord-4" id="spend-card"><div class="card-h"><h2>Spending</h2><span class="meta">${esc(monthName)}</span></div>
+    <div class="spend-top"><b class="spend-n">${dollars(x.total)}</b> <span class="meta">of your ${dollars(x.cap)} a month on Claude</span></div>
+    <div class="bar ${x.over ? 'bad' : pct >= 80 ? 'warn' : ''}"><i style="width:${pct}%"></i></div>
+    <div class="meta">${esc(line)}</div>
+    ${x.over ? `<div class="warnbox">You reached your ${dollars(x.cap)} for ${esc(monthName)}, so the finder, Claude's reply sorting and Ask rest until the 1st. Emails keep going out and replies still get sorted, by simple rules.</div>` : ''}
+    <div class="spendrows">${rows.map(([k, m, d]) => `<div><span>${k}</span> <span class="meta">${d ? `${dollars(d)} today` : ''}</span> <b>${dollars(m)}</b></div>`).join('')}</div>
+    ${gaps.length ? `<div class="meta warntext">Not counted yet: ${esc(gaps.join(' and '))}. Each counts from the update on.</div>` : ''}
+    <details class="howto-d"><summary>What's free, and what stops at ${dollars(x.cap)}</summary>
+      <p class="meta">Free: every email you send (it goes out from your Gmail), reading websites for emails, and Find with Claude and the Claude connector, which run on your Claude plan.</p>
+      <p class="meta">At ${dollars(x.cap)} the finder, Claude's reply sorting and Ask stop until the 1st. Sending never stops for it.</p>
+      <p class="meta">Counted from what each job used, at Anthropic's prices. Your Anthropic bill has the exact total.</p>
+    </details>
+    <div class="btnrow"><a class="btn sm ghost" href="https://console.anthropic.com/settings/billing" target="_blank" rel="noopener">Your Anthropic bill</a><button class="btn sm ghost" data-act="em-settings">Change the limit</button></div>
+  </section>`;
+}
 // Leads waiting for a first email in each campaign and how long they last, then the ways to get more:
 // your scraper's CSV files (cheapest), Claude on your own plan (no extra cost), and the paid finder.
 function emLeadsCard(s, camps) {
@@ -2538,7 +2587,7 @@ function emLeadsCard(s, camps) {
       <div class="btnrow fcamp-a"><button class="btn sm" data-act="em-import" data-campaign="${esc(c.id)}">Add a CSV</button><button class="btn sm" data-act="em-claude-find" data-id="${esc(c.id)}">Find with Claude</button></div></div>`;
   }).join('');
   const onIds = Object.entries(f.targets || {}).filter(([, t]) => t && t.on).map(([cid]) => cid);
-  const state = finderState(f, td, onIds.length > 0 && onIds.every(cid => (waiting[cid] || 0) >= keep));
+  const capHit = emSpend().over, state = finderState(f, td, onIds.length > 0 && onIds.every(cid => (waiting[cid] || 0) >= keep), capHit);
   const costEach = mo.found ? mo.spent / mo.found : td.found ? td.spent / td.found : 0, ran = st.lastRun ? (Date.now() - Date.parse(st.lastRun)) / 60000 : null;
   return `<section class="card leadscard ord-5"><div class="card-h"><h2>Leads</h2><button class="btn sm" data-act="em-import">Add leads</button></div>
     <div class="fcamps">${rows || '<div class="meta">Approve a campaign and its leads show up here.</div>'}</div>
@@ -2546,7 +2595,7 @@ function emLeadsCard(s, camps) {
     ${emCallListBlock()}
     <div class="finder sub"><div class="sub-h"><b>Lead finder</b><span class="pill ${state[1]}">${state[0]}</span></div>
       <div class="meta">${f.enabled && !st.lastRun ? 'Waiting for its first run. It runs every 15 minutes.' : f.enabled || td.found || mo.found ? [`${td.found} found today`, `${dollars(td.spent)} of ${dollars(Number(f.budget) || 5)} today`, mo.found ? `${mo.found} this month for ${dollars(mo.spent)}` : '', costEach ? `${Math.round(costEach * 100)}¢ a lead` : ''].filter(Boolean).join(' · ') : 'Claude searches the web every 15 minutes, about 70¢ a lead. Your scraper is cheaper.'}</div>
-      ${f.enabled ? `<div class="meta">It keeps ${keep} leads waiting for each campaign and adds more as emails go out.</div>` : ''}
+      ${f.enabled ? `<div class="meta">${capHit ? `This month's spending reached your limit, so it rests until the 1st. Raise the limit in Email settings to keep it going.` : `It keeps ${keep} leads waiting for each campaign and adds more as emails go out.`}</div>` : ''}
       ${st.lastError && f.enabled ? `<div class="err">${esc(st.lastError)}</div>` : ''}
       ${f.enabled && S.outEng && S.outEng.fn === 'ok' && !S.outEng.hasKey ? '<div class="warnbox">The finder needs your Anthropic key in Supabase (ANTHROPIC_API_KEY). Engine setup, step 4.</div>' : ''}
       ${f.enabled && ran !== null && ran > 40 ? `<div class="warnbox">The finder last ran ${esc(emAgo(st.lastRun))}. Check its schedule (Engine setup, step 6).</div>` : ''}
@@ -2625,16 +2674,64 @@ function pipeSorted(list, sort) {
   };
   return list.slice().sort(by[sort] || by.heat);
 }
+const PIPE_VIEWS = ['board','follow','calls','all'];
 function setPipeView(v) {
-  if (!['board','calls','all'].includes(v)) return;
+  if (!PIPE_VIEWS.includes(v)) return;
   S.pipeView = v; try { localStorage.setItem('lcc-pipe-view', v); } catch(e) {}
 }
 function viewPipeline() {
-  const v = ['board','calls','all'].includes(S.pipeView) ? S.pipeView : 'board', t = todayISO();
-  const due = allLoaded() && !isRestDay(t) ? leadsDue(t).length : 0;
-  const tabs = `<div class="seg scope pipetabs">${[['board','Board'], ['calls',`Calls${due ? ` <span class="cnt">${due}</span>` : ''}`], ['all','All leads']].map(([k, l]) => `<button type="button" class="${v === k ? 'on' : ''}" data-act="pipe-view" data-v="${k}">${l}</button>`).join('')}</div>`;
-  const bar = `<div class="pipebar"><input class="in" id="lead-search" type="search" placeholder="${v === 'calls' ? 'Search all leads' : 'Search leads'}" value="${esc(S.search)}" autocomplete="off">${v === 'calls' ? '<button class="btn primary" data-act="call-start">Start calling</button>' : ''}<button class="btn" data-act="lead-add" aria-label="Add a lead">+ Lead</button></div>`;
-  return tabs + (v === 'calls' ? bar + viewCalls() : v === 'board' ? pipeSummary() + bar + pipeFilters(v) + pipeBoard() : bar + pipeFilters(v) + pipeAll());
+  const v = PIPE_VIEWS.includes(S.pipeView) ? S.pipeView : 'board', t = todayISO();
+  const due = allLoaded() && !isRestDay(t) ? leadsDue(t).length : 0, fdue = allLoaded() ? followDue(t).length : 0;
+  const cnt = n => n ? ` <span class="cnt">${big(n)}</span>` : '';
+  const tabs = `<div class="seg scope pipetabs">${[['board','Board'], ['follow',`Follow-ups${cnt(fdue)}`], ['calls',`Calls${cnt(due)}`], ['all','All leads']].map(([k, l]) => `<button type="button" class="${v === k ? 'on' : ''}" data-act="pipe-view" data-v="${k}">${l}</button>`).join('')}</div>`;
+  const bar = `<div class="pipebar"><input class="in" id="lead-search" type="search" placeholder="${v === 'calls' ? 'Search all leads' : v === 'follow' ? 'Search follow-ups' : 'Search leads'}" value="${esc(S.search)}" autocomplete="off">${v === 'calls' ? '<button class="btn primary" data-act="call-start">Start calling</button>' : ''}<button class="btn" data-act="lead-add" aria-label="Add a lead">+ Lead</button></div>`;
+  return tabs + (v === 'calls' ? bar + viewCalls() : v === 'follow' ? bar + pipeFollow() : v === 'board' ? pipeSummary() + bar + pipeFilters(v) + pipeBoard() : bar + pipeFilters(v) + pipeAll());
+}
+/* ----- follow-ups ----- */
+// Who to follow up with and when: deals in play, clients, Not now with a check-back date, and your warm
+// contacts and partners, by the next-step date you set. Cold leads in the call cadence stay on Calls.
+const FOLLOW_STAGES = ['Talking','Demo booked','Proposal sent','Won','Not now'], OPEN_DEALS = ['Talking','Demo booked','Proposal sent'];
+const followable = l => (l.stage || 'New lead') !== 'Lost' && (FOLLOW_STAGES.includes(l.stage) || ['Warm','Client','Partner'].includes(l.type));
+const FOLLOW_GROUPS = [['hot','Answer first'], ['late','Late'], ['today','Today'], ['week','Next 7 days'], ['later','Later'], ['none','No date set']];
+function followGroup(l, t, hot) {
+  if (hot.has(l.id)) return 'hot';
+  if (!l.nextDate) return 'none';
+  return l.nextDate < t ? 'late' : l.nextDate === t ? 'today' : l.nextDate <= addDays(t, 7) ? 'week' : 'later';
+}
+// Everyone to follow up with, each in its group, soonest first. A deal in play without a date is listed
+// too, so none slips through.
+function followUps(t) {
+  const hot = new Set(emHot().map(r => r.lead));
+  return allLeads().filter(l => hot.has(l.id) || (followable(l) && (l.nextDate || OPEN_DEALS.includes(l.stage))))
+    .map(l => ({l, g:followGroup(l, t, hot)}))
+    .sort((a, b) => String(a.l.nextDate || '9999').localeCompare(String(b.l.nextDate || '9999')) || leadHeat(b.l).score - leadHeat(a.l).score || String(a.l.name || '').localeCompare(String(b.l.name || '')));
+}
+// Due now: hot replies and anything dated today or earlier (on a rest day, only today's).
+const followDue = t => { const rest = isRestDay(t); return followUps(t).filter(x => x.g === 'hot' || x.g === 'today' || (x.g === 'late' && !rest)); };
+function pipeFollow() {
+  const t = todayISO(), rest = isRestDay(t), q = S.search.trim().toLowerCase();
+  let list = followUps(t);
+  if (q) list = list.filter(({l}) => [l.name, l.business, l.contact, l.firstName, l.phone, l.email, l.city, l.kind, l.nextStep].join(' ').toLowerCase().includes(q));
+  if (!list.length) return `<div class="card empty">${q ? 'No follow-ups match that search.' : 'Nobody to follow up with yet. Give a lead a next step and a date and it shows up here.'}</div>`;
+  const hot = emHot(), groups = FOLLOW_GROUPS.map(([k, label]) => [k, rest && k === 'late' ? 'From earlier days' : label, list.filter(x => x.g === k)]).filter(x => x[2].length);
+  return `<section class="card followcard"><div class="card-h"><h2>Follow-ups</h2><span class="meta">${plural(list.length, 'lead')}</span></div>
+    ${groups.map(([k, label, xs]) => `<h3 class="fg-h ${k === 'late' && !rest ? 'late' : ''}">${esc(label)} <span class="meta">${xs.length}</span></h3><div class="elist">${xs.map(x => followRow(x.l, t, x.g, rest, hot.find(r => r.lead === x.l.id))).join('')}</div>`).join('')}
+    <div class="meta">Tap a name for everything about them, or to change the next step and its date.</div>
+  </section>`;
+}
+function followRow(l, t, g, rest, reply) {
+  const tel = telOf(l), late = !!l.nextDate && l.nextDate < t;
+  const when = g === 'hot' ? 'Replied ' + emAgo(reply && reply.at) : !l.nextDate ? 'No date' : l.nextDate === t ? 'Today' : late ? (rest ? fmtShort(l.nextDate) : `${plural(daysBetween(l.nextDate, t), 'day')} late`) : dayWord(l.nextDate);
+  const what = g === 'hot' && reply ? reply.summary || reply.snippet || 'They replied' : [l.nextStep || (g === 'none' ? 'No next step yet' : 'Follow up'), l.stage || 'New lead', ['Client','Partner'].includes(l.type) ? l.type : ''].filter(Boolean).join(' · ');
+  // The contact's name only when it adds something (a business's owner, not a person's own name again).
+  const who = l.contact && !String(l.name || '').toLowerCase().includes(String(l.contact).toLowerCase()) ? l.contact : '', last = leadLast(l);
+  return `<div class="frow" data-act="lead-open" data-id="${esc(l.id)}" role="button" tabindex="0">
+    <div class="min0"><div class="lr-h"><b>${esc(l.name || l.email)}</b>${heatChip(l)}</div>
+      <div class="meta fu-what">${esc(what)}</div>
+      ${who || last ? `<div class="meta clamp1">${esc([who, last].filter(Boolean).join(' · '))}</div>` : ''}</div>
+    <div class="frow-r"><span class="meta when ${late && !rest && g !== 'hot' ? 'late' : ''}">${esc(when)}</span>
+      <div class="fu-acts">${tel ? `<a class="btn sm" href="tel:${esc(tel)}">Call</a><a class="btn sm ghost" href="sms:${esc(tel)}">Text</a>` : ''}${canEmail(l) ? `<button class="btn sm ${g === 'hot' ? 'primary' : ''}" data-act="em-compose" data-id="${esc(l.id)}"${reply ? ` data-reply="${esc(reply.id)}"` : ''}>${reply ? 'Reply' : 'Email'}</button>` : ''}${!tel && !l.email ? `<button class="btn sm ghost" data-act="lead-edit" data-id="${esc(l.id)}">Add phone or email</button>` : ''}</div></div>
+  </div>`;
 }
 function pipeSummary() {
   const list = allLeads(), month = todayISO().slice(0, 7);
@@ -2653,9 +2750,18 @@ function pipeFilters(v) {
     <div class="pipesel"><select class="in sel" id="pipe-source" aria-label="Which leads">${PIPE_SOURCES.map(([k, l]) => `<option value="${k}" ${(S.pipeSource || 'all') === k ? 'selected' : ''}>${l}</option>`).join('')}</select>
     ${v === 'all' ? `<select class="in sel" id="pipe-stage" aria-label="Stage"><option value="all">Every stage</option>${STAGES.map(s => `<option ${S.pipeStage === s ? 'selected' : ''}>${s}</option>`).join('')}</select><select class="in sel" id="pipe-sort" aria-label="Sort">${PIPE_SORTS.map(([k, l]) => `<option value="${k}" ${(S.pipeSort || 'heat') === k ? 'selected' : ''}>${l}</option>`).join('')}</select>` : ''}</div></div>`;
 }
+// A lead's phone as a tel: number, and whether an email can go to them from here.
+const telOf = l => String((l && l.phone) || '').replace(/[^\d+]/g, '');
+const canEmail = l => !!l && isEmail(l.email) && !l.dnc && !l.emailBad && !(S.data.suppress || {})[String(l.email).trim().toLowerCase()];
+const IC_PHONE = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.6 3.5h2.6l1.5 4.2-2.1 1.4a11.5 11.5 0 0 0 6.3 6.3l1.4-2.1 4.2 1.5v2.6a2 2 0 0 1-2.2 2A17 17 0 0 1 4.6 5.7a2 2 0 0 1 2-2.2z"/></svg>';
+// Call and Email on a card or a row: the phone dials, the envelope opens an email to write here.
+function leadActs(l) {
+  const tel = telOf(l), nm = esc(l.name || l.email || '');
+  return `${tel ? `<a class="lc-ic" href="tel:${esc(tel)}" draggable="false" title="Call ${nm}" aria-label="Call ${nm}">${IC_PHONE}</a>` : ''}${canEmail(l) ? `<button type="button" class="lc-ic" data-act="em-compose" data-id="${esc(l.id)}" title="Email ${nm}" aria-label="Email ${nm}">${ICONS.email}</button>` : l.email ? `<span class="lc-ic off" title="${l.dnc ? 'Asked not to be emailed' : l.emailBad ? 'The last email bounced' : 'On your do-not-contact list'}">${ICONS.email}</span>` : ''}`;
+}
 function leadCardP(l) {
   const drag = !coarsePointer();
-  const icons = [l.phone ? '<span title="Has a phone number">☎</span>' : '', l.email ? `<span title="${l.dnc ? 'Do not email' : 'Has an email'}" class="${l.dnc || l.emailBad ? 'off' : ''}">✉</span>` : ''].join('');
+  const icons = leadActs(l);
   const seqLine = l.seq && LIVE_SEQ.includes(l.seq.status) ? `<div class="lc-seq">${esc(((S.data.campaigns || {})[l.seq.campaign] || {}).name || 'Email')} · ${esc(emProgress(l))}</div>` : '';
   const flash = S.flash && S.flash.key === 'lead:' + l.id && Date.now() - S.flash.at < 1600 ? 'flash' : '';
   return `<article class="lcard ${flash}" ${drag ? 'draggable="true"' : ''} data-lead="${esc(l.id)}" data-act="lead-open" data-id="${esc(l.id)}" role="button" tabindex="0">
@@ -2682,7 +2788,7 @@ function pipeAll() {
   const lim = S.pipeLimit || 50, n = list.length;
   const camps = emCampaigns();
   return `<section class="card"><div class="card-h"><h2>${n} ${n === 1 ? 'lead' : 'leads'}</h2><span class="meta">${S.pipeStage && S.pipeStage !== 'all' ? esc(S.pipeStage) : 'Every stage'}</span></div>
-    <div class="elist">${list.slice(0, lim).map(l => `<button class="erow lrow" data-act="lead-open" data-id="${esc(l.id)}"><div class="min0"><div class="lr-h"><b>${esc(l.name || l.email)}</b>${heatChip(l)}</div><div class="meta clamp1">${esc([l.stage || 'New lead', leadKind(l), leadWhere(l), leadSourceName(l)].filter(Boolean).join(' · '))}</div></div><div class="erow-r">${l.nextStep && l.nextDate ? `<span class="meta ${l.nextDate < todayISO() ? 'late' : ''}">${esc(l.nextDate <= todayISO() ? (l.nextDate < todayISO() ? 'late' : 'today') : fmtShort(l.nextDate))}</span>` : ''}<span class="meta">${esc(leadLast(l))}</span></div></button>`).join('') || '<div class="meta" style="padding:10px 0">No leads match.</div>'}</div>
+    <div class="elist">${list.slice(0, lim).map(l => `<div class="erow lrow" data-act="lead-open" data-id="${esc(l.id)}" role="button" tabindex="0"><div class="min0"><div class="lr-h"><b>${esc(l.name || l.email)}</b>${heatChip(l)}</div><div class="meta clamp1">${esc([l.stage || 'New lead', leadKind(l), leadWhere(l), leadSourceName(l)].filter(Boolean).join(' · '))}</div></div><div class="erow-r">${l.nextStep && l.nextDate ? `<span class="meta ${l.nextDate < todayISO() ? 'late' : ''}">${esc(l.nextDate <= todayISO() ? (l.nextDate < todayISO() ? 'late' : 'today') : fmtShort(l.nextDate))}</span>` : ''}<span class="meta">${esc(leadLast(l))}</span></div><div class="lr-acts">${leadActs(l)}</div></div>`).join('') || '<div class="meta" style="padding:10px 0">No leads match.</div>'}</div>
     ${n > lim ? `<button class="btn sm ghost" data-act="pipe-more">Show ${Math.min(100, n - lim)} more of ${n - lim}</button>` : ''}
     ${n ? `<div class="bulk"><b>With these ${n}:</b>
       <div class="btnrow"><select class="in sel" id="pb-stage" aria-label="Move to"><option value="">Move to…</option>${STAGES.map(s => `<option>${s}</option>`).join('')}</select><button class="btn sm" data-act="pipe-bulk" data-op="stage">Move</button></div>
@@ -2716,8 +2822,17 @@ function emReplyItem(r) {
     ${r.next ? `<div class="meta"><b>Next:</b> ${esc(r.next)}</div>` : ''}
     <div class="btnrow"><label class="meta relabel">Sorted as <select class="in" id="er-${esc(r.id)}" data-relabel="${esc(r.id)}">${EM_LABEL_ORDER.map(k => `<option value="${k}" ${k === r.label ? 'selected' : ''}>${EM_LABEL[k][0]}</option>`).join('')}</select></label>
       ${HOT.includes(r.label) && !r.handled ? `<button class="btn sm" data-act="em-done" data-id="${esc(r.id)}">Done</button>` : ''}
-      ${r.threadId ? `<a class="btn sm ghost" href="${esc(gmailThread(r.threadId))}" target="_blank" rel="noopener">Reply in Gmail</a>` : ''}</div>
+      ${canEmail((S.data.leads || {})[r.lead]) && !['unsubscribe','bounce','auto'].includes(r.label) ? `<button class="btn sm" data-act="em-compose" data-id="${esc(r.lead)}" data-reply="${esc(r.id)}">Reply</button>` : ''}
+      ${r.threadId ? `<a class="btn sm ghost" href="${esc(gmailThread(r.threadId))}" target="_blank" rel="noopener">Open in Gmail</a>` : ''}</div>
   </div></div>`;
+}
+// Whether the engine may email a lead on its own (start a campaign like Check back, read its website for an
+// email). Never your clients, partners or warm contacts from your own list; anyone else you can switch off.
+function autoLine(l) {
+  const why = l.type === 'Client' ? 'a client' : l.type === 'Partner' ? 'a partner' : l.type === 'Warm' && !l.source ? 'a warm contact from your own list' : '';
+  if (why) return `<div class="meta autoline">Never emailed automatically: ${why}. What you write with Email still goes.</div>`;
+  const on = !l.noAuto;
+  return `<div class="btnrow autoline"><button type="button" class="ck ${on ? 'on' : ''}" data-act="lead-auto" data-id="${esc(l.id)}" aria-pressed="${on}" aria-label="Automatic emails"></button><span>Automatic emails <span class="meta">· ${on ? 'campaigns can start for them on their own' : 'off: only what you send yourself'}</span></span></div>`;
 }
 function leadSheet() {
   const id = S.modal.id, l = (S.data.leads || {})[id];
@@ -2744,10 +2859,11 @@ function leadSheet() {
         ${q && q.status === 'hold' ? `<button class="btn sm primary" data-act="em-status" data-id="${esc(id)}" data-op="queue">Queue it</button>` : ''}
         ${q && ['queued','active'].includes(q.status) ? `<button class="btn sm" data-act="em-status" data-id="${esc(id)}" data-op="pause">Pause emails</button>` : ''}
         ${q && q.status === 'paused' ? `<button class="btn sm primary" data-act="em-status" data-id="${esc(id)}" data-op="resume">Resume emails</button>` : ''}
-        ${!live && !l.emailBad && camps.length ? `<select class="in sel" id="ls-camp" data-draft aria-label="Campaign">${camps.map(x => `<option value="${esc(x.id)}" ${draft('ls-camp', l.segment && ['services','dental'].includes(l.segment) ? 'front-desk' : 'home-screen') === x.id ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select><button class="btn sm" data-act="lead-enroll" data-id="${esc(id)}">Start this campaign</button>` : ''}
+        ${!live && !l.emailBad && camps.length && autoOk(l) ? `<select class="in sel" id="ls-camp" data-draft aria-label="Campaign">${camps.map(x => `<option value="${esc(x.id)}" ${draft('ls-camp', l.segment && ['services','dental'].includes(l.segment) ? 'front-desk' : 'home-screen') === x.id ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}</select><button class="btn sm" data-act="lead-enroll" data-id="${esc(id)}">Start this campaign</button>` : ''}
         ${q && q.threadId ? `<a class="btn sm ghost" href="${esc(gmailThread(q.threadId))}" target="_blank" rel="noopener">Open in Gmail</a>` : ''}
         <button class="btn sm ghost" data-act="em-status" data-id="${esc(id)}" data-op="block">Do not contact</button>
-      </div>`;
+      </div>
+      ${autoLine({...l, id})}`;
   const tlHtml = tl.map(x => {
     if (x.kind === 'reply') return emReplyItem(x.r);
     if (x.kind === 'sent') { const cc = (S.data.campaigns || {})[x.x.campaign] || {}; return `<div class="tli"><i></i><div class="min0"><div><b>${esc(cc.name || 'Email')}: ${esc(emStepName(x.x.step, (cc.steps || []).length).toLowerCase())} sent</b> <span class="meta">${esc(emWhen(x.at))}</span></div>${cc.steps && x.x.step < cc.steps.length ? `<details><summary>Show it</summary>${emMailHtml(l, cc, x.x.step)}<div class="meta">As the template reads now.</div></details>` : ''}</div></div>`; }
@@ -2759,7 +2875,7 @@ function leadSheet() {
     <div class="stagechips" role="group" aria-label="Stage">${STAGES.map(s => `<button type="button" class="${s === stage ? 'on' : ''} ${s === 'Won' ? 'won' : s === 'Lost' ? 'lost' : ''}" data-act="lead-stage" data-id="${esc(id)}" data-s="${esc(s)}" aria-pressed="${s === stage}">${esc(s)}</button>`).join('')}</div>
     <div class="btnrow quickacts">
       ${tel ? `<a class="btn sm primary" href="tel:${esc(tel)}">Call</a><a class="btn sm" href="sms:${esc(tel)}">Text</a>` : ''}
-      ${l.email ? `<a class="btn sm" href="${esc(gmailCompose(l.email))}" target="_blank" rel="noopener">Email</a>` : ''}
+      ${canEmail(l) ? `<button class="btn sm" data-act="em-compose" data-id="${esc(id)}">Email</button>` : ''}
       ${l.website ? `<a class="btn sm ghost" href="${esc(emHref(l.website))}" target="_blank" rel="noopener">Website</a>` : ''}
       <button class="btn sm ghost" data-act="lead-edit" data-id="${esc(id)}">Edit</button>
     </div>
@@ -2783,6 +2899,124 @@ function leadSheet() {
       ${num(l.deal) || num(l.monthly) ? `<div><span>Deal</span>${num(l.deal) ? money(l.deal) : ''}${num(l.monthly) ? ` · ${money(l.monthly)}/mo` : ''}</div>` : ''}
       ${l.region ? `<div><span>Call block</span>${esc(regionName(l.region))}</div>` : ''}
     </div>`;
+}
+
+/* ----- write an email to one lead ----- */
+// The first name to greet them by: the one saved for emails, the contact's, or for someone from your own
+// list (a warm contact, client or partner) the first word of their name.
+function firstNameOf(l) {
+  const word = x => String(x || '').trim().split(/[\s/:(,]+/)[0].replace(/[^A-Za-z'’-]/g, '');
+  const f = word(l.firstName) || word(l.contact);
+  if (f.length > 1 && !/^(dr|mr|mrs|ms|mx)$/i.test(f)) return f;
+  return ['Warm','Client','Partner'].includes(l.type) && !l.source ? word(l.name) : '';
+}
+// The subject that keeps you in your conversation with them: the reply you're answering, the campaign's
+// first email, the last email you wrote them, or any reply of theirs; otherwise a fresh one.
+function cmSubject(l, reply) {
+  const re = x => 'Re: ' + String(x).replace(/^((re|fwd?|aw):\s*)+/i, '').trim();
+  if (reply && reply.subject) return re(reply.subject);
+  const q = l.seq || {}, c = (S.data.campaigns || {})[q.campaign];
+  if (q.threadId && Number(q.step) > 0 && c) { const m = composeEmail(l, c, emSettings(), 0); if (m && m.subject) return re(m.subject); }
+  const mine = (l.sentLog || []).filter(x => x && x.campaign === 'manual' && x.subject).slice(-1)[0];
+  if (mine) return re(mine.subject);
+  const r = emReplies().find(x => x.lead === l.id && x.subject);
+  return r ? re(r.subject) : 'Following up';
+}
+const cmBody = l => `Hi ${firstNameOf(l) || 'there'},\n\n\n\nLogan`;
+// One tap writes a common line into the message, between the greeting and your name.
+const CM_STARTERS = [
+  ['check', 'Check in', 'Wanted to check in. Do you have 10 minutes this week to talk?'],
+  ['call', 'After a call', 'Thanks for taking the time to talk today.'],
+  ['proposal', 'The proposal', 'Wanted to make sure the proposal came through. Happy to walk you through it or answer any questions.'],
+  ['time', 'Pick a time', 'Would Tuesday or Wednesday afternoon work for a quick call?'],
+];
+function cmInsert(body, text) {
+  const m = String(body || '').match(/^(Hi[^\n]*,\n\n)([\s\S]*?)(\n*\n\nLogan\s*)?$/);
+  if (!m) return String(body || '').replace(/\s*$/, '') + (String(body || '').trim() ? '\n\n' : '') + text;
+  const mid = m[2].trim();
+  return m[1] + (mid ? mid + '\n\n' : '') + text + (m[3] ? '\n\nLogan' : '');
+}
+// Something written besides the greeting and your name.
+const cmWritten = text => !!String(text || '').replace(/^Hi[^\n]*,/, '').replace(/\n*Logan\s*$/, '').trim();
+// The next follow-up the sheet offers: the date already set when it's still ahead, else three days out
+// (the next working day after that).
+function cmNext(l) {
+  const t = todayISO();
+  if (l.nextDate && l.nextDate > t) return {date:l.nextDate, step:l.nextStep || 'Follow up'};
+  let d = addDays(t, 3); for (let i = 0; i < 7 && isRestDay(d); i++) d = addDays(d, 1);
+  return {date:d, step:'Follow up'};
+}
+function emComposeSheet() {
+  const m = S.modal, raw = (S.data.leads || {})[m.id];
+  if (!raw) return closeOnly('Email');
+  const l = {...raw, id:m.id};
+  const reply = m.reply ? (S.data.replies || {})[m.reply] : null, ready = emCanSend(), next = cmNext(l);
+  const hasThread = !!((l.seq && l.seq.threadId) || (l.threads || []).length);
+  const thread = S.drafts['cm-thread'] !== undefined ? !!S.drafts['cm-thread'] : true;
+  const cold = ['New lead','Contacted'].includes(l.stage || 'New lead') && (l.type || 'Cold') === 'Cold' && !!String(emSettings().address || '').trim();
+  const v = S.outEng && S.outEng.fn === 'ok' ? S.outEng.version || 1 : emState().version || 0;
+  return `<div class="card-h"><div class="min0"><h2>${reply ? 'Reply to' : 'Email'} ${esc(l.name || l.email)}</h2><div class="meta">To ${esc(l.email)}${emGmail() ? ` · from ${esc(emGmail())}` : ''}</div></div><button class="btn sm ghost" data-act="cm-close">${m.back ? 'Back' : 'Close'}</button></div>
+    ${!canEmail(l) ? `<div class="warnbox">${l.dnc ? 'They asked not to be emailed. Call or text instead.' : l.emailBad ? 'The last email to this address bounced. Fix it with Edit first.' : 'This address is on your do-not-contact list.'}</div>` : ''}
+    ${reply ? `<div class="cm-quote"><div class="meta">They wrote ${esc(emAgo(reply.at))}:</div><div class="quote full">${esc(reply.text || reply.snippet || '')}</div></div>` : ''}
+    ${!ready ? `<div class="warnbox">${emEngineOk() && v && v < 10 ? 'To send from here, update the engine first (Engine setup, step 5: copy the code and deploy it). Until then, Open in Gmail fills in this same email.' : 'Sending from here needs the email engine (Email tab, Engine setup). Until then, Open in Gmail fills in this same email.'}</div>` : ''}
+    <form class="stack" data-form="em-compose" novalidate>
+      <div class="fld"><label for="cm-subject">Subject</label><input class="in" id="cm-subject" data-draft value="${esc(draft('cm-subject', cmSubject(l, reply)))}"></div>
+      <div class="fld"><label for="cm-body">Message</label><textarea class="in mailin" id="cm-body" rows="9" data-draft>${esc(draft('cm-body', cmBody(l)))}</textarea>
+        <div class="chips cm-starters">${CM_STARTERS.map(([k, label]) => `<button type="button" class="chip" data-act="cm-starter" data-k="${k}">+ ${esc(label)}</button>`).join('')}</div>
+        ${cold ? '<span class="meta">They are new to you, so your name, website, mailing address and a way to opt out go at the bottom, like every sales email.</span>' : ''}</div>
+      ${hasThread ? toggleRow('cm-thread', thread, 'Send it in your last conversation with them') : ''}
+      <div class="fld"><label for="cm-step">Next follow-up</label><div class="nextrow"><input class="in" id="cm-step" data-draft value="${esc(draft('cm-step', next.step))}" placeholder="Follow up"><input class="in" type="date" id="cm-date" data-draft value="${esc(draft('cm-date', next.date))}" aria-label="Next follow-up date"></div>
+        <span class="meta">Saved on the lead once it's sent. Clear the date for none.</span></div>
+      <div class="btnrow emfoot">
+        ${ready ? `<button class="btn primary" type="submit" ${S.emSendBusy || !canEmail(l) ? 'disabled' : ''}>${S.emSendBusy ? 'Sending…' : 'Send'}</button>` : `<button class="btn primary" type="submit" ${!canEmail(l) ? 'disabled' : ''}>Open in Gmail</button>`}
+        <button class="btn ghost" type="button" data-act="cm-close">Cancel</button>
+        ${ready ? '<button class="btn ghost" type="button" data-act="cm-gmail">Write it in Gmail instead</button>' : ''}
+      </div>
+      ${ready ? `<span class="meta">It goes out from your Gmail right away, shows on their history, and ${l.seq && ['queued','active','hold'].includes(l.seq.status) ? 'stops their automatic emails, since you took over' : 'counts as a touch'}.</span>` : ''}
+    </form>`;
+}
+// The next step and its date from the sheet, on the lead.
+function cmFollow(id, date, step) {
+  const l = (S.data.leads || {})[id]; if (!l) return;
+  const patch = {};
+  if (date !== (l.nextDate || '')) patch.nextDate = date;
+  if (date && (step || 'Follow up') !== (l.nextStep || '')) patch.nextStep = step || 'Follow up';
+  if (Object.keys(patch).length) patchDoc('leads', id, {...patch, updatedAt:Date.now()});
+}
+async function emSendMail() {
+  const m = S.modal; if (!m || m.type !== 'em-compose' || S.emSendBusy) return;
+  const l = (S.data.leads || {})[m.id]; if (!l) { toast('That lead was removed.'); return; }
+  const subject = String(fval('cm-subject')).replace(/\s+/g, ' ').trim(), text = String(fval('cm-body')).replace(/\r\n/g, '\n').trim();
+  const date = String(fval('cm-date')).trim(), step = String(fval('cm-step')).trim();
+  const thread = S.drafts['cm-thread'] !== undefined ? !!S.drafts['cm-thread'] : true;
+  if (!subject) { toast('Add a subject.'); return; }
+  if (!cmWritten(text)) { toast('Write your message first.'); return; }
+  if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) { toast('Pick a date for the next follow-up, or clear it.'); return; }
+  if (!emCanSend()) {
+    window.open(gmailCompose(l.email, subject, text), '_blank', 'noopener');
+    cmFollow(m.id, date, step); clearDrafts('cm-'); S.cmFor = null; S.modal = m.back ? {...m.back} : null;
+    toast(`Opened in Gmail. Send it there.${date ? ` Your next follow-up is ${dayWord(date)}.` : ''}`); render(); return;
+  }
+  S.emSendBusy = true; render();
+  try {
+    if (!outreachUrl()) throw new Error('Connect your Supabase project first.');
+    await emSettle(['leads/' + m.id]);
+    const {data} = await supabase.auth.getSession();
+    const token = data && data.session && data.session.access_token;
+    if (!token) throw new Error('Sign out and back in, then try again.');
+    const r = await fetch(outreachUrl() + '?send=1', {method:'POST', headers:{'Authorization':'Bearer ' + token, 'Content-Type':'application/json'}, body:JSON.stringify({lead:m.id, subject, text, thread})});
+    if (r.status === 404) throw new Error("The email engine isn't set up yet. Open Engine setup on the Email tab.");
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) throw new Error(j.error || `The engine answered ${r.status}.`);
+    cmFollow(m.id, date, step);
+    const rep = m.reply && (S.data.replies || {})[m.reply];
+    if (rep && !rep.handled) patchDoc('replies', m.reply, {handled:true, handledAt:Date.now()});
+    clearDrafts('cm-'); S.cmFor = null;
+    if (S.modal && S.modal.type === 'em-compose' && S.modal.id === m.id) S.modal = m.back ? {...m.back} : null;
+    toast(`Sent to ${j.to || l.email}.${date ? ` Next follow-up ${dayWord(date)}.` : ''}`);
+    if (db) db.refresh().catch(() => {});
+  } catch (e) { toast((e && e.message) || "Couldn't send it. Try again."); }
+  S.emSendBusy = false; render();
 }
 
 /* ----- the finder's settings ----- */
@@ -2867,6 +3101,9 @@ function emSettingsSheet() {
     <div class="btnrow"><button class="btn sm" type="button" data-act="em-senders">Send more: add an address</button><span class="meta">${emSenders().length ? plural(emSenders().length, 'extra address', 'extra addresses') : 'One address sends about 50 a day at most.'}</span></div>
     <div class="grid2"><div class="fld"><label for="es-gap">Minutes between emails, at least</label><input class="in" type="number" min="3" max="120" inputmode="numeric" id="es-gap" data-draft value="${esc(v('gap', s.gap))}"></div>
       <div class="fld"><label for="es-tz">Your time zone</label><select class="in" id="es-tz" data-draft>${EM_TZS.map(([z, l]) => `<option value="${z}" ${v('tz', s.tz) === z ? 'selected' : ''}>${l}</option>`).join('')}</select><span class="meta">When the day's count starts over.</span></div></div>
+    <h3>Spending on Claude</h3>
+    <div class="fld"><label for="es-spendCap">Most a month, in dollars</label><input class="in" type="number" min="1" max="2000" step="1" inputmode="numeric" id="es-spendCap" data-draft value="${esc(v('spendCap', spendCapOf(s)))}" style="max-width:160px">
+      <span class="meta">The finder, Claude's reply sorting and Ask together. When they reach it they stop until the 1st; sending emails is free and never stops for it. So far this month: ${dollars(emSpend().total)}.</span></div>
     <div class="btnrow"><button class="btn primary" type="submit">Save</button><button class="btn ghost" type="button" data-act="modal-close">Cancel</button><button class="btn ghost" type="button" data-act="em-setup">Engine setup</button></div>
   </form>`;
 }
@@ -3052,6 +3289,8 @@ function enrollLeads(ids, cid, acc) {
   ids.forEach(id => {
     const l = (S.data.leads || {})[id];
     if (!l || !isEmail(l.email) || l.dnc || l.emailBad || sup.has(String(l.email).toLowerCase())) return;
+    // Never your clients, partners, warm contacts from your own list or anyone you switched off (autoOk).
+    if (!autoOk(l)) return;
     if (l.seq && (LIVE_SEQ.includes(l.seq.status) || l.seq.sendingStep != null)) return;
     if (!c.trigger && !['New lead','Contacted'].includes(l.stage || 'New lead')) return;
     const patch = {...enrollPatch(l, cid, t, false), segment:l.segment || segmentOf(l.kind || l.business)};
@@ -3138,7 +3377,7 @@ function renderModal() {
   const old = el.querySelector('.sheet'), top = old && el.dataset.sig === sig ? old.scrollTop : 0;
   const ty = S.modal.type;
   el.hidden = false;
-  el.innerHTML = `<div class="sheet ${old ? 'still' : ''} ${ty === 'sched' || ty === 'build' || ty === 'lead-view' || ty.startsWith('em-') ? 'wide' : ty === 'week' ? 'wide week' : ''}" role="dialog" aria-modal="true">${ty === 'em-campaign' ? emCampaignSheet() : ty === 'em-settings' ? emSettingsSheet() : ty === 'em-senders' ? emSendersSheet() : ty === 'em-import' ? emImportSheet() : ty === 'em-finder' ? emFinderSheet() : ty === 'em-launch' ? emLaunchSheet() : ty === 'lead-view' ? leadSheet() : ty === 'em-setup' ? emSetupSheet() : ty === 'session' ? sessionForm() : ty === 'fresh' ? freshForm() : ty === 'block' ? blockSheet(S.modal.key, S.modal.date) : ty === 'task' ? taskSheet(S.modal.id) : ty === 'mile' ? mileSheet(S.modal.id) : ty === 'stat' ? statSheet(S.modal.id) : ty === 'notif' ? notifSheet() : ty === 'call' ? callSheet() : ty === 'event' ? eventForm() : ty === 'chat' ? chatSheet() : ty === 'assist' ? assistantSheet() : ty === 'claude' ? claudeSheet() : ty === 'sched' ? schedSheet() : ty === 'add' ? addForm() : ty === 'blockedit' ? blockEditForm() : ty === 'catchup' ? catchupSheet() : ty === 'quick' ? quickSheet() : ty === 'build' ? buildSheet() : ty === 'week' ? weekSheet() : leadEditForm()}</div>`;
+  el.innerHTML = `<div class="sheet ${old ? 'still' : ''} ${ty === 'sched' || ty === 'build' || ty === 'lead-view' || ty.startsWith('em-') ? 'wide' : ty === 'week' ? 'wide week' : ''}" role="dialog" aria-modal="true">${ty === 'em-campaign' ? emCampaignSheet() : ty === 'em-compose' ? emComposeSheet() : ty === 'em-settings' ? emSettingsSheet() : ty === 'em-senders' ? emSendersSheet() : ty === 'em-import' ? emImportSheet() : ty === 'em-finder' ? emFinderSheet() : ty === 'em-launch' ? emLaunchSheet() : ty === 'lead-view' ? leadSheet() : ty === 'em-setup' ? emSetupSheet() : ty === 'session' ? sessionForm() : ty === 'fresh' ? freshForm() : ty === 'block' ? blockSheet(S.modal.key, S.modal.date) : ty === 'task' ? taskSheet(S.modal.id) : ty === 'mile' ? mileSheet(S.modal.id) : ty === 'stat' ? statSheet(S.modal.id) : ty === 'notif' ? notifSheet() : ty === 'call' ? callSheet() : ty === 'event' ? eventForm() : ty === 'chat' ? chatSheet() : ty === 'assist' ? assistantSheet() : ty === 'claude' ? claudeSheet() : ty === 'sched' ? schedSheet() : ty === 'add' ? addForm() : ty === 'blockedit' ? blockEditForm() : ty === 'catchup' ? catchupSheet() : ty === 'quick' ? quickSheet() : ty === 'build' ? buildSheet() : ty === 'week' ? weekSheet() : leadEditForm()}</div>`;
   el.dataset.sig = sig;
   if (top) el.querySelector('.sheet').scrollTop = top;
   if (keep) { const n = document.getElementById(keep.id); if (n) { n.focus({preventScroll:true}); try { if (keep.s != null) n.setSelectionRange(keep.s, keep.e); } catch(e) {} } }
@@ -3404,7 +3643,7 @@ function handle(act, el, ev) {
         const cid = String(fval('pb-camp')), c = S.data.campaigns[cid]; if (!c) { toast('Pick a campaign first.'); break; }
         if (ids.length > 25 && !confirm(`Start ${c.name} for up to ${ids.length} leads?`)) break;
         const r = enrollLeads(ids, cid); n = r.n;
-        msg = n ? `${plural(n, 'lead')} started ${c.name}.${r.skipped ? ` ${r.skipped} skipped (no email, do not contact, already in a campaign${c.trigger ? '' : ' or already talking to you'}).` : ''}${liveCampaign(c) ? '' : ' Nothing goes out until you approve it.'}` : `Nobody here can start ${c.name}.`;
+        msg = n ? `${plural(n, 'lead')} started ${c.name}.${r.skipped ? ` ${r.skipped} skipped: no email, do not contact, already in a campaign, someone you only email yourself${c.trigger ? '' : ' or already talking to you'}.` : ''}${liveCampaign(c) ? '' : ' Nothing goes out until you approve it.'}` : `Nobody here can start ${c.name}.`;
         S.pipeLimit = 50; toast(msg, !!n); render(); break;
       } else if (d.op === 'calls-on' || d.op === 'calls-off') {
         const on = d.op === 'calls-on';
@@ -3652,6 +3891,41 @@ function handle(act, el, ev) {
       patchDoc('replies', d.id, {handled:true, handledAt:Date.now()}); S.lastUndo = {type:'restore', ops:[{patch:['replies', d.id, {handled:false}]}]};
       toast('Off your hot list.', true); render(); break;
     }
+    /* writing an email to one lead */
+    case 'em-compose': {
+      const l = (S.data.leads || {})[d.id]; if (!l) { toast('That lead was removed.'); break; }
+      if (!canEmail(l)) { toast(!isEmail(l.email) ? 'Add an email address with Edit first.' : l.dnc ? `${l.name || 'They'} asked not to be emailed. Call or text instead.` : l.emailBad ? 'The last email to this address bounced. Fix it with Edit first.' : 'This address is on your do-not-contact list.'); break; }
+      const cur = S.modal, back = cur && cur.type === 'lead-view' ? {type:'lead-view', id:cur.id, back:cur.back || null} : null, key = d.id + '|' + (d.reply || '');
+      // A draft you closed by mistake is still there when you open the same email again.
+      if (S.cmFor !== key) { clearDrafts('cm-'); S.cmFor = key; }
+      S.confirm = null; S.openItem = null; S.modal = {type:'em-compose', id:d.id, reply:d.reply || null, back};
+      if (!S.outEng && outreachUrl()) outreachCheck(true);
+      render();
+      if (!coarsePointer()) setTimeout(() => { const ta = document.getElementById('cm-body'); if (!ta) return; ta.focus(); const at = ta.value.indexOf('\n\n'); if (at >= 0) ta.setSelectionRange(at + 2, at + 2); }, 60);
+      break;
+    }
+    case 'cm-close': { const m = S.modal; S.confirm = null; S.modal = m && m.back ? {...m.back} : null; render(); break; }
+    case 'cm-starter': {
+      const m = S.modal, st = CM_STARTERS.find(x => x[0] === d.k); if (!m || m.type !== 'em-compose' || !st) break;
+      const l = (S.data.leads || {})[m.id]; if (!l) break;
+      const box = document.getElementById('cm-body');
+      S.drafts['cm-body'] = cmInsert(box ? box.value : draft('cm-body', cmBody(l)), st[2]);
+      render(); break;
+    }
+    case 'cm-gmail': {
+      const m = S.modal, l = m && (S.data.leads || {})[m.id]; if (!l) break;
+      window.open(gmailCompose(l.email, String(fval('cm-subject')).trim(), String(fval('cm-body')).trim()), '_blank', 'noopener'); break;
+    }
+    // Automatic emails for one lead: off also pauses a campaign that is sending to them.
+    case 'lead-auto': {
+      const l = S.data.leads[d.id]; if (!l) break;
+      const off = !l.noAuto, q = l.seq, live = off && q && ['queued','active'].includes(q.status) && q.sendingStep == null, nm = l.name || l.email;
+      const patch = {noAuto:off, ...(live ? {seq:{status:'paused', pausedWhy:'you'}} : {})};
+      S.lastUndo = {type:'restore', ops:[{patch:['leads', d.id, {noAuto:l.noAuto ?? null, ...(live ? {seq:{status:q.status, pausedWhy:q.pausedWhy ?? null}} : {})}]}]};
+      patchDoc('leads', d.id, {...patch, updatedAt:Date.now()});
+      toast(off ? `No automatic emails to ${nm}.${live ? ' Their campaign is paused.' : ''} What you write with Email still goes.` : `Automatic emails are on for ${nm}.${q && q.status === 'paused' ? ' Resume their campaign to send it again.' : ''}`, true); render(); break;
+    }
+    case 'spend-show': { const c = document.getElementById('spend-card'); if (c) c.scrollIntoView({behavior:'smooth', block:'start'}); break; }
     case 'em-finder': clearDrafts('ef-'); S.confirm = null; S.modal = {type:'em-finder'}; render(); break;
     case 'em-finder-toggle': {
       const f = emSettings().finder, on = !f.enabled;
@@ -3691,6 +3965,7 @@ function handle(act, el, ev) {
 function submit(form) {
   const t = todayISO(), kind = form.dataset.form, v = id => (S.drafts[id] !== undefined ? S.drafts[id] : (document.getElementById(id) || {}).value || '');
   switch (kind) {
+    case 'em-compose': emSendMail(); break;
     case 'login': {
       const email = String(v('lg-email')).trim(), password = (document.getElementById('lg-pass') || {}).value || v('lg-pass') || '';
       if (!email || !password) { S.loginErr = 'Enter your email and password.'; render(); return; }
@@ -3926,7 +4201,8 @@ function submit(form) {
       const n = (id, lo, hi, def) => { const raw = String(v(id)).trim(), x = Math.round(Number(raw)); return raw !== '' && Number.isFinite(x) ? Math.max(lo, Math.min(hi, x)) : def; };
       const capMax = n('es-capMax', 1, 200, 50);
       const patch = {address, forwardTo:fwd, fromName:String(v('es-name')).trim() || 'Logan Newman', website:String(v('es-website')).trim(), days:WEEK_ORDER.filter(x => days.includes(x)), start, end,
-        capStart:Math.min(capMax, n('es-capStart', 1, 200, 20)), capStep:n('es-capStep', 0, 50, 5), capMax, gap:n('es-gap', 3, 120, 6), tz:EM_TZS.some(z => z[0] === v('es-tz')) ? v('es-tz') : 'America/Chicago'};
+        capStart:Math.min(capMax, n('es-capStart', 1, 200, 20)), capStep:n('es-capStep', 0, 50, 5), capMax, gap:n('es-gap', 3, 120, 6), tz:EM_TZS.some(z => z[0] === v('es-tz')) ? v('es-tz') : 'America/Chicago',
+        spendCap:n('es-spendCap', 1, 2000, spendCapOf(emSettings()))};
       const cur = emSettings(), back = {}; Object.keys(patch).forEach(k => { back[k] = cur[k]; });
       patchDoc('outreach', 'settings', {...patch, updatedAt:Date.now()});
       S.lastUndo = {type:'restore', ops:[{patch:['outreach', 'settings', back]}]};
@@ -3980,12 +4256,14 @@ document.addEventListener('click', ev => {
   }
   if (Date.now() - swipeEnded < 400 && ev.target.closest('.swipe') && !ev.target.closest('.swipe-acts')) { ev.preventDefault(); return; }
   if (ev.target.closest('.swipe-acts')) S.swipeKey = null;
+  const link = ev.target.closest('a[href]');
+  if (link && !link.dataset.act) return;
   const el = ev.target.closest('[data-act]');
   if (!el) { if (ev.target.id === 'modal') { closeModal(); render(); } return; }
   if (el.tagName === 'INPUT') return;
   ev.preventDefault();
   handle(el.dataset.act, el, ev);
-  if (!['goto','copy','view','undo','export','signout','retry','sync-now','install','update-app','disconnect','goto-settings','calendar','notif-check','notif-enable','notif-off','notif-test','copy-fn','copy-sql','event-ics','ask','chat-suggest','chat-mic','assistant-setup','assistant-check','copy-assistant','em-check','em-test','em-copy-fn','em-copy-sql','goto-email','lx-test','em-find-now'].includes(el.dataset.act)) render();
+  if (!['goto','copy','view','undo','export','signout','retry','sync-now','install','update-app','disconnect','goto-settings','calendar','notif-check','notif-enable','notif-off','notif-test','copy-fn','copy-sql','event-ics','ask','chat-suggest','chat-mic','assistant-setup','assistant-check','copy-assistant','em-check','em-test','em-copy-fn','em-copy-sql','goto-email','lx-test','em-find-now','cm-gmail','spend-show'].includes(el.dataset.act)) render();
 });
 /* ----- swipe a plan row (touch): left shows +30 min, Reschedule and Cancel; right marks it done ----- */
 let sw = null, swipeEnded = 0;
@@ -4072,6 +4350,8 @@ document.addEventListener('keydown', ev => {
   if (a && (ev.key === 'Enter' || ev.key === ' ') && a.getAttribute && a.getAttribute('role') === 'button' && a.tagName !== 'BUTTON' && a.dataset && a.dataset.act) { ev.preventDefault(); handle(a.dataset.act, a, ev); render(); return; }
   if (a && a.id === 'chat-in' && ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); askAssistant(a.value); return; }
   if (a && a.id === 'bd-in' && ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); const f = a.closest('form'); if (f) f.requestSubmit(); return; }
+  // Enter in an email's subject goes on to the message; only Send sends it.
+  if (a && ['cm-subject','cm-step','cm-date'].includes(a.id) && ev.key === 'Enter') { ev.preventDefault(); if (a.id === 'cm-subject') { const b = document.getElementById('cm-body'); if (b) b.focus(); } return; }
   const typing = a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT' || a.isContentEditable);
   if (typing || S.modal || S.dbState !== 'ok' || !allLoaded()) return;
   if (ev.key >= '1' && ev.key <= String(VIEWS.length)) { ev.preventDefault(); setView(VIEWS[+ev.key - 1][0]); }

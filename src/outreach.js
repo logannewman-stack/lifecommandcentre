@@ -19,7 +19,7 @@ export const FINDER_DEFAULTS = {
 };
 export const DEFAULT_SETTINGS = {
   enabled: false, autoStart: false, startOn: '', fromName: 'Logan Newman', website: 'logandnewman.com', address: '', forwardTo: '',
-  days: SEND_DAYS, start: '08:30', end: '16:30', tz: 'America/Chicago', capMax: 50, capStart: 20, capStep: 5, gap: 6,
+  days: SEND_DAYS, start: '08:30', end: '16:30', tz: 'America/Chicago', capMax: 50, capStart: 20, capStep: 5, gap: 6, spendCap: 100,
 };
 function finderWithDefaults(f) {
   const x = f && typeof f === 'object' ? f : {}, targets = {};
@@ -39,6 +39,21 @@ export function inLine(leads) {
   }
   return out;
 }
+// Leads the engine never emails on its own: clients, partners, warm contacts from your own list (no
+// source: the call list you started with) and anyone you switched off (noAuto). You can still start a
+// campaign for one yourself.
+export const autoOk = l => !!l && !l.noAuto && !['Client', 'Partner'].includes(l.type) && !(l.type === 'Warm' && !l.source);
+// What Claude cost this month, counted by each job that spends it so none writes over another: the finder
+// (outreach/finder), sorting replies (outreach/state.spend) and Ask, the in-app assistant (outreach/ask).
+export function monthSpend(outreach, month) {
+  const o = outreach || {}, f = o.finder || {}, st = o.state || {}, a = o.ask || {};
+  const finder = f.month && f.month.month === month ? Number(f.month.spent) || 0 : 0;
+  const replies = st.spend && st.spend.month === month ? Number(st.spend.replies) || 0 : 0;
+  const ask = a.month === month ? Number(a.spent) || 0 : 0;
+  return { finder, replies, ask, total: finder + replies + ask };
+}
+// The monthly limit on all of it (settings.spendCap, $100 unless you change it).
+export const spendCapOf = s => { const n = Number(s && s.spendCap); return Number.isFinite(n) && n > 0 ? n : 100; };
 const num = (v, d) => (v === '' || v === null || v === undefined || !Number.isFinite(Number(v)) ? d : Number(v));
 export const isEmail = e => /^[^\s@<>(),;:"]+@[^\s@<>(),;:"]+\.[a-z]{2,}$/i.test(String(e || '').trim());
 export const STATE_TZ = { AZ: 'America/Phoenix', IA: 'America/Chicago', IL: 'America/Chicago', MN: 'America/Chicago', WI: 'America/Chicago', MO: 'America/Chicago',
@@ -193,6 +208,14 @@ export function enrollPatch(l, cid, today, hold) {
   };
 }
 // ---- end shared rules ----
+// What Claude cost on one day, by the job that spent it (each keeps its own day: finder.today,
+// state.spend.today, ask.today). Only the app shows it, so it isn't in the engine.
+export function daySpend(outreach, date) {
+  const o = outreach || {}, f = o.finder || {}, sp = (o.state || {}).spend || {}, a = o.ask || {};
+  const pick = x => (x && x.date === date ? Number(x.spent) || 0 : 0);
+  const finder = pick(f.today), replies = pick(sp.today), ask = pick(a.today);
+  return { finder, replies, ask, total: finder + replies + ask };
+}
 
 export const SEQ_STATUS = { hold: 'Check first', queued: 'Up next', active: 'In sequence', done: 'Finished', replied: 'Replied', paused: 'Paused', stopped: 'Stopped', bounced: 'Bounced' };
 export const nextSendDay = (iso, days) => { let d = iso, guard = 0; while (!days.includes(dowD(d)) && guard++ < 8) d = addD(d, 1); return d; };
@@ -298,7 +321,7 @@ export function upNext(leads, campaigns, settings, now = new Date(), suppressed 
   const s = withDefaults(settings), out = [];
   for (const [id, l] of Object.entries(leads || {})) {
     const q = l && l.seq;
-    if (!q || !['queued', 'active'].includes(q.status) || q.sendingStep != null || l.dnc || l.emailBad) continue;
+    if (!q || !['queued', 'active'].includes(q.status) || q.sendingStep != null || l.dnc || l.emailBad || !autoOk(l)) continue;
     const c = (campaigns || {})[q.campaign]; if (!liveCampaign(c)) continue;
     const email = String(l.email || '').toLowerCase(); if (!isEmail(email) || suppressed.has(email)) continue;
     const step = Number(q.step) || 0; if (step >= c.steps.length) continue;

@@ -20,10 +20,13 @@
 //   POST                       → the send job: replies, pipeline, one email per address (the 10-minute cron job)
 //   POST ?job=find             → the email lookup, then the finder (the 15-minute cron job; a {"job":"find"} body works too)
 //   POST ?test=1&campaign=<id> → signed in: sends you a sample of a campaign's first email (&from=<address> sends it from that one)
-//   GET/POST ?u=<token>        → the unsubscribe link in each email's headers
+//   POST ?send=1               → signed in: sends an email you wrote in the app to one lead {lead, subject, text, thread}
+//   GET  ?u=<token>            → the unsubscribe page in each email's headers, with an Unsubscribe button
+//   POST ?u=<token>            → unsubscribes (Gmail's one-click button, or that page's button)
 //
 // Secrets (Edge Functions › Secrets): GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET and GMAIL_REFRESH_TOKEN, plus
-// ANTHROPIC_API_KEY for sorting replies and for the finder.
+// ANTHROPIC_API_KEY for sorting replies and for the finder. What Claude costs is counted each month, and the
+// finder and Claude's reply sorting stop at settings.spendCap ($100 unless you change it) until the 1st.
 // After an app update that changes this file, paste the new code over the old one and Deploy.
 // deno-lint-ignore-file no-explicit-any
 import { createClient } from "jsr:@supabase/supabase-js@2";
@@ -31,7 +34,7 @@ import * as webpush from "jsr:@negrel/webpush@0.5.0";
 import Anthropic from "npm:@anthropic-ai/sdk@0.131.0";
 
 // ---- pure logic (plain JavaScript; the tests import this section) ----
-export const FN_VERSION = 9;
+export const FN_VERSION = 10;
 export const MODEL = "claude-opus-5-5";
 export const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 export const SEND_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -48,7 +51,7 @@ export const FINDER_DEFAULTS: any = {
 };
 export const DEFAULT_SETTINGS: any = {
   enabled: false, autoStart: false, startOn: "", fromName: "Logan Newman", website: "logandnewman.com", address: "", forwardTo: "",
-  days: SEND_DAYS, start: "08:30", end: "16:30", tz: "America/Chicago", capMax: 50, capStart: 20, capStep: 5, gap: 6,
+  days: SEND_DAYS, start: "08:30", end: "16:30", tz: "America/Chicago", capMax: 50, capStart: 20, capStep: 5, gap: 6, spendCap: 100,
 };
 function finderWithDefaults(f: any) {
   const x = f && typeof f === "object" ? f : {}, targets: any = {};
@@ -68,6 +71,21 @@ export function inLine(leads: any) {
   }
   return out;
 }
+// Leads the engine never emails on its own: clients, partners, warm contacts from your own list (no
+// source: the call list you started with) and anyone you switched off (noAuto). You can still start a
+// campaign for one yourself.
+export const autoOk = (l: any) => !!l && !l.noAuto && !["Client", "Partner"].includes(l.type) && !(l.type === "Warm" && !l.source);
+// What Claude cost this month, counted by each job that spends it so none writes over another: the finder
+// (outreach/finder), sorting replies (outreach/state.spend) and Ask, the in-app assistant (outreach/ask).
+export function monthSpend(outreach: any, month: string) {
+  const o = outreach || {}, f = o.finder || {}, st = o.state || {}, a = o.ask || {};
+  const finder = f.month && f.month.month === month ? Number(f.month.spent) || 0 : 0;
+  const replies = st.spend && st.spend.month === month ? Number(st.spend.replies) || 0 : 0;
+  const ask = a.month === month ? Number(a.spent) || 0 : 0;
+  return { finder, replies, ask, total: finder + replies + ask };
+}
+// The monthly limit on all of it (settings.spendCap, $100 unless you change it).
+export const spendCapOf = (s: any) => { const n = Number(s && s.spendCap); return Number.isFinite(n) && n > 0 ? n : 100; };
 const num = (v: any, d: number) => (v === "" || v === null || v === undefined || !Number.isFinite(Number(v)) ? d : Number(v));
 export const isEmail = (e: any) => /^[^\s@<>(),;:"]+@[^\s@<>(),;:"]+\.[a-z]{2,}$/i.test(String(e || "").trim());
 export const STATE_TZ: any = {
@@ -284,7 +302,7 @@ export function pickNext({ leads, campaigns, settings, state, suppressed, now, s
   for (const [id, l] of Object.entries(leads || {}) as any) {
     if (taken && taken.has(id)) continue;
     const q = l && l.seq;
-    if (!q || !["queued", "active"].includes(q.status) || q.sendingStep != null || l.dnc || l.emailBad) continue;
+    if (!q || !["queued", "active"].includes(q.status) || q.sendingStep != null || l.dnc || l.emailBad || !autoOk(l)) continue;
     const c = (campaigns || {})[q.campaign]; if (!liveCampaign(c)) continue;
     const email = String(l.email || "").trim().toLowerCase();
     if (!isEmail(email) || (suppressed && suppressed.has(email))) continue;
@@ -325,7 +343,7 @@ export function dueEnrollments(leads: any, campaigns: any, now: any, suppressed:
   if (!trig.length) return [];
   const out: any[] = [], at = msOf(now);
   for (const [id, l] of Object.entries(leads || {}) as any) {
-    if (!l || l.dnc || l.emailBad || !isEmail(l.email) || (suppressed && suppressed.has(String(l.email).toLowerCase()))) continue;
+    if (!l || l.dnc || l.emailBad || !autoOk(l) || !isEmail(l.email) || (suppressed && suppressed.has(String(l.email).toLowerCase()))) continue;
     if (l.seq && (LIVE_SEQ.includes(l.seq.status) || l.seq.sendingStep != null)) continue;
     const since = Number(l.stageAt) || (l.lastTouch ? Date.parse(l.lastTouch + "T12:00:00Z") : 0) || Number(l.updatedAt) || 0;
     if (!since) continue;
@@ -536,7 +554,7 @@ export const leadIdFor = (email: any) => "e-" + String(email || "").trim().toLow
 // A lead whose email the lookup can find: a business (not a partner or client) early in the pipeline, with
 // its own website and no email yet, not looked up in the last 90 days.
 export function needsEmail(l: any, at: number) {
-  if (!l || l.email || l.dnc || l.emailBad || ["Partner", "Client"].includes(l.type) || !["New lead", "Contacted", "Not now"].includes(l.stage || "New lead")) return false;
+  if (!l || l.email || l.dnc || l.emailBad || !autoOk(l) || !["New lead", "Contacted", "Not now"].includes(l.stage || "New lead")) return false;
   const dm = domainOf(l.website);
   if (!dm || BLOCKED_SITES.test(dm)) return false;
   return !l.emailCheckedAt || at - Number(l.emailCheckedAt) > 90 * 86400000;
@@ -694,15 +712,56 @@ async function unsubUrl(owner: string, lid: string) {
   const token = `${b64url(owner)}.${b64url(lid)}.${await sign(owner + "|" + lid)}`;
   return `${String(Deno.env.get("SUPABASE_URL")).replace(/\/+$/, "")}/functions/v1/outreach?u=${token}`;
 }
-export async function unsubscribe(admin: any, token: string) {
+// A valid link's owner and lead, or null.
+export async function unsubTarget(token: string) {
   const [o, p, sig] = String(token || "").split(".");
   const owner = decodeB64Url(o), lid = decodeB64Url(p);
-  if (!owner || !lid || sig !== await sign(owner + "|" + lid)) return false;
-  const now = new Date();
-  const lead = await casUpdate(admin, owner, "leads", lid, (x) => x ? { ...x, ...replyPatch(x, "unsubscribe", { summary: "Unsubscribed from the link" }, now, now.toISOString().slice(0, 10)) } : null);
+  return owner && lid && sig === await sign(owner + "|" + lid) ? { owner, lid } : null;
+}
+// `how` says which way they unsubscribed: Gmail's one-click button ("one-click") or the page's button.
+export async function unsubscribe(admin: any, token: string, how = "page") {
+  const t = await unsubTarget(token);
+  if (!t) return false;
+  const now = new Date(), why = how === "one-click" ? "Unsubscribed with the button in their inbox" : "Unsubscribed from the link";
+  const lead = await casUpdate(admin, t.owner, "leads", t.lid, (x) => x ? { ...x, ...replyPatch(x, "unsubscribe", { summary: why }, now, now.toISOString().slice(0, 10)) } : null);
   const email = String((lead && lead.email) || "").toLowerCase();
-  if (email) await put(admin, owner, "suppress", email, { email, reason: "Unsubscribed from the link", at: now.toISOString() });
+  if (email) await put(admin, t.owner, "suppress", email, { email, reason: why, at: now.toISOString(), how });
   return true;
+}
+
+// An email you wrote in the app to one lead, from your Gmail: in the conversation you already have with them
+// (unless you start a new one), logged on the lead (its timeline, last touch, New lead to Contacted), and any
+// automatic sequence stops because you've taken over. A business you haven't talked with yet gets your
+// address and a way to opt out, like every sales email. Never to anyone who unsubscribed, bounced or is on
+// do-not-contact.
+export async function sendManual(admin: any, owner: string, d: any, token: string, me: string, input: any, now: Date) {
+  const s = withDefaults(d.outreach && d.outreach.settings), lid = String((input && input.lead) || ""), l = (d.leads || {})[lid];
+  if (!l) return { ok: false, error: "That lead isn't there anymore." };
+  const to = String(l.email || "").trim(), name = bizName(l) || to;
+  if (!isEmail(to)) return { ok: false, error: "This lead has no email address. Add one with Edit first." };
+  if (l.dnc || (d.suppress || {})[to.toLowerCase()]) return { ok: false, error: `${name} asked not to be emailed. Call or text instead.` };
+  if (l.emailBad) return { ok: false, error: "The last email to this address bounced. Fix the address with Edit first." };
+  const subject = String((input && input.subject) || "").replace(/[\r\n]+/g, " ").trim().slice(0, 200);
+  let text = String((input && input.text) || "").replace(/\r\n/g, "\n").trim().slice(0, 20000);
+  if (!subject || !text) return { ok: false, error: "Add a subject and a message." };
+  // Only a cold business early on gets the footer: your warm contacts, clients and partners get what you wrote.
+  const cold = ["New lead", "Contacted"].includes(l.stage || "New lead") && (l.type || "Cold") === "Cold", addr = String(s.address || "").trim();
+  if (cold && addr && !text.includes(addr)) text += `\n\n${[s.fromName, s.website, addr].filter(Boolean).join("\n")}\n\nNot interested? Reply "no thanks" and I won't email again.`;
+  const threads = Array.isArray(l.threads) ? l.threads : [], q = l.seq || {};
+  const threadId = input && input.thread === false ? "" : q.threadId || threads[threads.length - 1] || "";
+  const sent = await sendMail(token, buildMime({ from: `${s.fromName} <${me}>`, to, subject, text, inReplyTo: threadId && threadId === q.threadId ? q.rfcId || "" : "" }), threadId || undefined);
+  try { const labels = await ensureLabels(token, ((d.outreach && d.outreach.state) || {}).labels); await gm(token, `messages/${sent.id}/modify`, { method: "POST", body: JSON.stringify({ addLabelIds: [labels.outreach] }) }); } catch (e) { console.error("label", msgOf(e)); }
+  const at = now.toISOString(), today = localClock(s.tz, now).date;
+  const after = await casUpdate(admin, owner, "leads", lid, (x) => {
+    if (!x) return null;
+    const sq = x.seq, live = sq && ["queued", "active", "hold"].includes(sq.status);
+    return { ...x, ...((x.stage || "New lead") === "New lead" ? stagePatch(x, "Contacted", "you", now) : {}),
+      ...(live ? { seq: { ...sq, status: "stopped", stoppedWhy: "You emailed them yourself", nextOn: null } } : {}),
+      lastTouch: today, touches: (Number(x.touches) || 0) + 1, updatedAt: now.getTime(),
+      sentLog: [...(Array.isArray(x.sentLog) ? x.sentLog : []), { at, campaign: "manual", step: -1, id: sent.id, from: me, subject }].slice(-30),
+      threads: [...new Set([...(x.threads || []), sent.threadId].filter(Boolean))].slice(-10) };
+  });
+  return { ok: true, id: sent.id, threadId: sent.threadId, to, lead: after ? lid : null };
 }
 
 /* ---------- sorting replies with Claude ---------- */
@@ -726,7 +785,7 @@ async function classify(apiKey: string, offer: string, business: string, subject
   const t = (resp.content || []).filter((b: any) => b.type === "text").map((b: any) => b.text).join("");
   const out = JSON.parse(t);
   if (!LABELS.includes(out.label)) throw new Error("bad label");
-  return { label: out.label, summary: String(out.summary || "").slice(0, 200), next: String(out.next_step || "").slice(0, 160) };
+  return { label: out.label, summary: String(out.summary || "").slice(0, 200), next: String(out.next_step || "").slice(0, 160), cost: usageCost(MODEL, resp.usage) };
 }
 
 /* ---------- push to the phone ---------- */
@@ -753,7 +812,10 @@ async function notify(admin: any, push: any, note: any) {
 export async function runOwner(admin: any, owner: string, d: any, token: string, me: string, apiKey: string, now: Date, deadline = Date.now() + 100000) {
   const settings = withDefaults(d.outreach.settings), state: any = { ...(d.outreach.state || {}) };
   const report: any = { replies: 0, hot: 0, sent: 0, enrolled: 0, why: "" };
-  const today = localClock(settings.tz, now).date;
+  const today = localClock(settings.tz, now).date, month = today.slice(0, 7);
+  if (!state.spend || state.spend.month !== month) state.spend = { month, replies: 0, n: 0 };
+  // Claude sorts replies until this month's spending reaches your cap; simple rules sort them after that.
+  const underCap = () => monthSpend({ ...d.outreach, state }, month).total < spendCapOf(settings);
   try {
     state.labels = await ensureLabels(token, state.labels);
     const byThread: any = {}, byEmail: any = {};
@@ -790,7 +852,13 @@ export async function runOwner(admin: any, owner: string, d: any, token: string,
         const text = cleanReply(textOf(full.payload)).slice(0, 4000);
         let label = quickLabel({ from, subject, text, headers: H }), summary = "", next = "", by = "rules";
         if (!label) {
-          if (apiKey) { try { const r = await classify(apiKey, c.offer || c.name || "", bizName(cur), subject, text); label = r.label; summary = r.summary; next = r.next; by = "claude"; } catch (e) { console.error("classify", msgOf(e)); } }
+          if (apiKey && underCap()) {
+            try {
+              const r = await classify(apiKey, c.offer || c.name || "", bizName(cur), subject, text); label = r.label; summary = r.summary; next = r.next; by = "claude";
+              const day = state.spend.today && state.spend.today.date === today ? state.spend.today : { date: today, spent: 0 };
+              state.spend = { ...state.spend, replies: (Number(state.spend.replies) || 0) + (r.cost || 0), n: (Number(state.spend.n) || 0) + 1, today: { date: today, spent: (Number(day.spent) || 0) + (r.cost || 0) } };
+            } catch (e) { console.error("classify", msgOf(e)); }
+          }
           if (!label) label = heuristicLabel(text);
         }
         const at = new Date(Number(full.internalDate) || now.getTime()).toISOString();
@@ -1032,6 +1100,7 @@ export async function runFinder(admin: any, owner: string, d: any, apiKey: strin
   if (!apiKey) { st.lastError = "Add your Anthropic key (ANTHROPIC_API_KEY) under Edge Functions › Secrets so the finder can search."; return save("key"); }
   if (st.today.found >= num(f.perDay, 100)) return save("target");
   if (st.today.spent >= num(f.budget, 5)) return save("budget");
+  if (monthSpend({ ...d.outreach, finder: st }, month).total >= spendCapOf(s)) return save("cap");
   // Campaigns that already have their number of leads waiting sit this one out until emails go out.
   const waiting = inLine(d.leads), keep = num(f.keep, 300), full: any = {};
   for (const cid of Object.keys(f.targets || {})) if ((waiting[cid] || 0) >= keep) full[cid] = true;
@@ -1089,10 +1158,17 @@ Deno.serve(async (req: Request) => {
   const admin = createClient(supaUrl, service, { auth: { persistSession: false } });
   try {
     if (url.searchParams.has("u")) {
-      const ok = await unsubscribe(admin, url.searchParams.get("u") || "");
-      if (req.method === "POST") return new Response(ok ? "ok" : "invalid", { status: ok ? 200 : 400, headers: CORS });
-      const page = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Unsubscribed</title><body style="font:16px system-ui;margin:15vh auto;max-width:28rem;padding:0 1rem;color:#1d2433"><h1 style="font-size:1.4rem">${ok ? "You're unsubscribed." : "That link didn't work."}</h1><p>${ok ? "You won't get any more emails from Logan Newman." : "Reply to the email with “unsubscribe” and you'll be taken off the list."}</p></body>`;
-      return new Response(page, { status: ok ? 200 : 400, headers: { "Content-Type": "text/html; charset=utf-8" } });
+      // Opening the link only shows a button, so a mail filter that checks links can't unsubscribe anyone;
+      // Gmail's one-click button and the page's button both POST.
+      const token = url.searchParams.get("u") || "", page = (title: string, body: string, status = 200) => new Response(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><body style="font:16px system-ui;margin:15vh auto;max-width:28rem;padding:0 1rem;color:#1d2433"><h1 style="font-size:1.4rem">${title}</h1>${body}</body>`, { status, headers: { "Content-Type": "text/html; charset=utf-8" } });
+      if (req.method === "POST") {
+        const form = await req.text().catch(() => ""), oneClick = /List-Unsubscribe=One-Click/i.test(form);
+        const ok = await unsubscribe(admin, token, oneClick ? "one-click" : "page");
+        if (oneClick) return new Response(ok ? "ok" : "invalid", { status: ok ? 200 : 400, headers: CORS });
+        return ok ? page("You're unsubscribed.", "<p>You won't get any more emails from Logan Newman.</p>") : page("That link didn't work.", "<p>Reply to the email with “unsubscribe” and you'll be taken off the list.</p>", 400);
+      }
+      if (!(await unsubTarget(token))) return page("That link didn't work.", "<p>Reply to the email with “unsubscribe” and you'll be taken off the list.</p>", 400);
+      return page("Unsubscribe?", `<p>Tap the button and you won't get any more emails from Logan Newman.</p><form method="post"><input type="hidden" name="confirm" value="1"><button style="font:600 16px system-ui;padding:12px 20px;border-radius:10px;border:0;background:#1d4ed8;color:#fff;cursor:pointer">Unsubscribe</button></form>`);
     }
     if (url.searchParams.has("status")) {
       let gmail: any = { ok: false, email: "", error: "" }, sendAs: any = null, sendAsError = "";
@@ -1129,6 +1205,18 @@ Deno.serve(async (req: Request) => {
       }
       await sendMail(t, buildMime({ from: `${sender.name} <${sender.email}>`, to: me, subject: "[Test] " + mail.subject, text: `This is how ${bizName(sample)} would see it.\n\n----------\n\n${mail.text}` }));
       return json({ ok: true, to: me, from: sender.email, missing: mail.missing });
+    }
+
+    // An email you wrote in the app, from your Gmail.
+    if (url.searchParams.has("send")) {
+      const tokenIn = (req.headers.get("Authorization") || "").replace(/^Bearer\s+/i, "").trim();
+      const { data: u, error: uErr } = await createClient(supaUrl, Deno.env.get("SUPABASE_ANON_KEY")!).auth.getUser(tokenIn);
+      if (uErr || !u?.user) return json({ ok: false, error: "Sign in first." }, 401);
+      const all = await loadOwners(admin, ["outreach", "leads", "suppress"]), d = all[u.user.id];
+      if (!d || !d.outreach || !d.outreach.settings) return json({ ok: false, error: "Set up email first (Email tab)." }, 400);
+      const t = await gmailToken(), me = (await gm(t, "profile")).emailAddress;
+      const r = await sendManual(admin, u.user.id, d, t, me, body, new Date());
+      return json(r, r.ok ? 200 : 400);
     }
 
     // The email lookup for every account with email settings (free, about 25 seconds at most), then the
